@@ -103,7 +103,7 @@ jobs:
         run: cp "./target/${{ matrix.target }}/release/codex" "../${{ matrix.asset_name }}"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.asset_name }}
           path: ${{ matrix.asset_name }}
