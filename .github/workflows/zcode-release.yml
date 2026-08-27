@@ -90,6 +90,7 @@ jobs:
         with:
           workspaces: codex-rs
           key: zcode-release-${{ matrix.target }}
+          cache-on-failure: true
 
       - name: Build Codex CLI with ZCode integration
         run: cargo build --locked --release --target ${{ matrix.target }} -p codex-cli --bin codex
@@ -99,13 +100,13 @@ jobs:
 
       - name: Stage binary
         shell: bash
-        run: cp "./target/${{ matrix.target }}/release/codex" "./${{ matrix.asset_name }}"
+        run: cp "./target/${{ matrix.target }}/release/codex" "../${{ matrix.asset_name }}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset_name }}
-          path: ./${{ matrix.asset_name }}
+          path: ${{ matrix.asset_name }}
           if-no-files-found: error
 
   release:
