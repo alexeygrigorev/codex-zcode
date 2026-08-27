@@ -62,7 +62,11 @@ jobs:
           - name: linux-arm64
             os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            asset_name: codex-zcode-linux-arm64
+          asset_name: codex-zcode-linux-arm64
+
+    defaults:
+      run:
+        working-directory: codex-rs
 
     steps:
       - uses: actions/checkout@v4
