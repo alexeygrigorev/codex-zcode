@@ -49,7 +49,9 @@ jobs:
     name: Build ${{ matrix.name }}
     needs: test
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 90
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
     permissions:
       contents: read
     defaults:
@@ -68,16 +70,6 @@ jobs:
             os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             asset_name: codex-zcode-linux-arm64
-
-          - name: darwin-amd64
-            os: macos-15
-            target: x86_64-apple-darwin
-            asset_name: codex-zcode-darwin-amd64
-
-          - name: darwin-arm64
-            os: macos-15
-            target: aarch64-apple-darwin
-            asset_name: codex-zcode-darwin-arm64
 
     steps:
       - uses: actions/checkout@v4
