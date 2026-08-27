@@ -2302,6 +2302,7 @@ async fn run_debug_prompt_input_command(
                 .enabled(codex_features::Feature::SkillSearch),
         }
     });
+    codex_zcode::install(&mut extensions);
     let prompt_input = codex_core::build_prompt_input(
         config,
         input,

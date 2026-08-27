@@ -62,6 +62,7 @@ codex-plugin = { workspace = true }
 codex-shell-command = { workspace = true }
 codex-skills = { workspace = true }
 codex-skills-extension = { workspace = true }
+codex-zcode = { workspace = true }
 codex-utils-cli = { workspace = true }
 codex-utils-pty = { workspace = true }
 codex-backend-client = { workspace = true }

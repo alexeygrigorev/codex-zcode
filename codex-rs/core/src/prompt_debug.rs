@@ -93,9 +93,36 @@ pub(crate) async fn build_prompt_input_from_session(
         .await?;
 
     if !input.is_empty() {
-        let response_item = sess.response_item_from_user_input(input);
+        let response_item = sess.response_item_from_user_input(input.clone());
         sess.record_conversation_items(turn_context.as_ref(), std::slice::from_ref(&response_item))
             .await;
+    }
+
+    let zcode_turn_input = codex_extension_api::TurnInputContext {
+        turn_id: turn_context.sub_id.to_string(),
+        user_input: input.to_vec(),
+        environments: Vec::new(),
+    };
+    for contributor in sess.services.extensions.turn_input_contributors() {
+        let fragments = contributor
+            .contribute(
+                zcode_turn_input.clone(),
+                None,
+                &sess.services.session_extension_data,
+                &sess.services.thread_extension_data,
+                turn_context.extension_data.as_ref(),
+            )
+            .await;
+        let response_items = fragments
+            .into_iter()
+            .map(codex_context_fragments::ContextualUserFragment::into_boxed_response_item);
+        for response_item in response_items {
+            sess.record_conversation_items(
+                turn_context.as_ref(),
+                std::slice::from_ref(&response_item),
+            )
+            .await;
+        }
     }
 
     let prompt_input = sess
