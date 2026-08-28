@@ -1947,18 +1947,18 @@ impl ModelClientSession {
         }
     }
 
-    /// Streams model inference through ZCode's app-server subprocess.
+    /// Streams model inference through ZCode's headless CLI.
     ///
-    /// Spawns `node zcode.cjs app-server`, sends the prompt via JSON-RPC, and
-    /// maps ZCode's streaming events back into Codex's `ResponseEvent` stream.
+    /// Spawns `node zcode.cjs --prompt ... --json` as a one-shot subprocess.
+    /// This is fast (~8s) compared to the app-server approach.
     async fn stream_zcode(
         &self,
         prompt: &Prompt,
-        responses_metadata: &CodexResponsesMetadata,
-        inference_trace: &InferenceTraceContext,
+        _responses_metadata: &CodexResponsesMetadata,
+        _inference_trace: &InferenceTraceContext,
     ) -> Result<codex_api::ResponseStream> {
         use std::process::Stdio;
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::io::AsyncWriteExt;
         use tokio::process::Command;
         use tokio::sync::mpsc;
 
@@ -1969,350 +1969,93 @@ impl ModelClientSession {
             .unwrap_or_default()
             .to_string_lossy()
             .to_string();
-        let workspace_key = cwd
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-            .collect::<String>()
-            .to_lowercase();
 
         // Extract user prompt text from the Responses API input items.
         let user_text = prompt
             .input
             .iter()
             .filter_map(|item| match item {
-                codex_protocol::models::ResponseItem::Message { role, content, .. }
-                    if role == "user" =>
-                {
-                    Some(
-                        content
-                            .iter()
-                            .filter_map(|c| match c {
-                                codex_protocol::models::ContentItem::InputText { text } => {
-                                    Some(text.as_str())
-                                }
-                                _ => None,
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n"),
-                    )
-                }
+                ResponseItem::Message { role, content, .. } if role == "user" => Some(
+                    content
+                        .iter()
+                        .filter_map(|c| match c {
+                            codex_protocol::models::ContentItem::InputText { text } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ),
                 _ => None,
             })
             .collect::<Vec<_>>()
             .join("\n");
 
         let (tx, rx_event) =
-            mpsc::channel::<std::result::Result<ResponseEvent, ApiError>>(256);
-        let request_id = format!(
-            "zcode_{}",
-            responses_metadata.session_id
-        );
+            mpsc::channel::<std::result::Result<ResponseEvent, ApiError>>(64);
+        let request_id = format!("zcode_{}", uuid::Uuid::new_v4());
         let request_id_for_stream = request_id.clone();
 
         tokio::spawn(async move {
-            eprintln!("[zcode] spawning ZCode");
-            let mut child = match Command::new(&node)
+            let output = Command::new(&node)
                 .arg(&runtime)
-                .arg("app-server")
-                .stdin(Stdio::piped())
+                .arg("--prompt")
+                .arg(&user_text)
+                .args(["--json", "--mode", "yolo", "--cwd", &cwd])
+                .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
                 .kill_on_drop(true)
-                .spawn()
-            {
-                Ok(child) => child,
-                Err(e) => {
-                    let _ = tx
-                            .send(Err(ApiError::Stream(format!(
-                                "failed to spawn ZCode: {e}"
-                            ))))
-                        .await;
-                    return;
+                .output()
+                .await;
+
+            let result: std::result::Result<serde_json::Value, String> = match output {
+                Ok(output) if output.status.success() => {
+                    serde_json::from_slice(&output.stdout)
+                        .map_err(|e| format!("invalid ZCode JSON: {e}"))
                 }
+                Ok(output) => Err(format!(
+                    "ZCode failed ({}): {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr)
+                )),
+                Err(e) => Err(format!("could not launch ZCode: {e}")),
             };
 
-            let mut stdin = child.stdin.take().expect("ZCode stdin should be piped");
-            let stdout = child.stdout.take().expect("ZCode stdout should be piped");
-            let mut reader = BufReader::new(stdout).lines();
+            match result {
+                Ok(parsed) => {
+                    let response_text = parsed
+                        .get("response")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let session_id = parsed
+                        .get("sessionId")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
 
-            // Send handshake + session/create + subscribe + send
-            let rpc_id = 1u64;
-            let _ = stdin
-                .write_all(
-                    serde_json::json!({
-                        "id": rpc_id,
-                        "method": "session/create",
-                        "params": {
-                            "workspace": {
-                                "workspacePath": cwd,
-                                "workspaceKey": workspace_key
-                            }
-                        }
-                    })
-                    .to_string()
-                    .as_bytes(),
-                )
-                .await;
-            let _ = stdin.write_all(b"\n").await;
+                    let item = ResponseItem::Message {
+                        id: None,
+                        role: "assistant".to_string(),
+                        content: vec![codex_protocol::models::ContentItem::OutputText {
+                            text: response_text,
+                        }],
+                        phase: None,
+                        internal_chat_message_metadata_passthrough: None,
+                    };
+                    let _ = tx.send(Ok(ResponseEvent::OutputItemDone(item))).await;
 
-            let mut session_id = String::new();
-            let mut sent_prompt = false;
-            let mut zc_rpc_id = rpc_id;
-            let mut got_text = false;
-            let mut last_text_time: Option<std::time::Instant> = None;
-            let mut full_text = String::new();
-
-            loop {
-                if got_text
-                    && let Some(last_text) = last_text_time
-                    && last_text.elapsed() > std::time::Duration::from_secs(30)
-                {
-                    eprintln!("[zcode] 30s since last text_delta, completing turn");
-                    break;
-                }
-                let line = if got_text {
-                    // After receiving text, use a 30s timeout. If ZCode doesn't
-                    // send more events, the turn is complete.
-                    match tokio::time::timeout(
-                        std::time::Duration::from_secs(30),
-                        reader.next_line(),
-                    )
-                    .await
-                    {
-                        Ok(Ok(Some(line))) => line,
-                        _ => break,
-                    }
-                } else {
-                    match reader.next_line().await {
-                        Ok(Some(line)) => line,
-                        _ => break,
-                    }
-                };
-                let msg: serde_json::Value = match serde_json::from_str(&line) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-
-                // Handle RPC responses (session/create result, etc.)
-                if let Some(result) = msg.get("result") {
-                    eprintln!("[zcode] rpc_result");
-                    if let Some(session) = result.get("session") {
-                        if let Some(sid) = session.get("sessionId").and_then(|v| v.as_str()) {
-                            session_id = sid.to_string();
-                            // Subscribe
-                            zc_rpc_id += 1;
-                            let _ = stdin
-                                .write_all(
-                                    serde_json::json!({
-                                        "id": zc_rpc_id,
-                                        "method": "session/subscribe",
-                                        "params": {
-                                            "sessionId": session_id,
-                                            "deliveryKind": "desktop-continuous"
-                                        }
-                                    })
-                                    .to_string()
-                                    .as_bytes(),
-                                )
-                                .await;
-                            let _ = stdin.write_all(b"\n").await;
-
-                            // Send prompt
-                            zc_rpc_id += 1;
-                            let _ = stdin
-                                .write_all(
-                                    serde_json::json!({
-                                        "id": zc_rpc_id,
-                                        "method": "session/send",
-                                        "params": {
-                                            "sessionId": session_id,
-                                            "content": user_text
-                                        }
-                                    })
-                                    .to_string()
-                                    .as_bytes(),
-                                )
-                                .await;
-                            let _ = stdin.write_all(b"\n").await;
-                            sent_prompt = true;
-                        }
-                    }
-                    continue;
-                }
-
-                // Handle notifications (streaming events)
-                let method = msg.get("method").and_then(|v| v.as_str()).unwrap_or("");
-                let params = msg.get("params").cloned().unwrap_or_default();
-
-                // Server-to-client request: session/requestRuntimePreferences
-                // Must respond with the same "id" the server used (e.g. "server-1")
-                if method == "session/requestRuntimePreferences" {
-                    let server_request_id = msg.get("id").cloned().unwrap_or_default();
-                    let _ = stdin
-                        .write_all(
-                            serde_json::json!({
-                                "id": server_request_id,
-                                "result": {
-                                    "nativeSearchEnhancementsEnabled": false
-                                }
-                            })
-                            .to_string()
-                            .as_bytes(),
-                        )
+                    let _ = tx
+                        .send(Ok(ResponseEvent::Completed {
+                            response_id: request_id_for_stream,
+                            token_usage: None,
+                            end_turn: Some(true),
+                        }))
                         .await;
-                    let _ = stdin.write_all(b"\n").await;
-                    continue;
                 }
-
-                if method == "session/event" {
-                    let evt_kind = params.get("payload").and_then(|p| p.get("kind")).and_then(|v| v.as_str()).unwrap_or("(none)");
-                    let evt_keys: Vec<String> = params.get("payload").and_then(|p| p.as_object()).map(|o| o.keys().cloned().collect()).unwrap_or_default();
-                    eprintln!("[zcode] session_event kind={} keys={:?}", evt_kind, evt_keys);
-                    let payload = params.get("payload").cloned().unwrap_or_default();
-                    let kind = payload.get("kind").and_then(|v| v.as_str()).unwrap_or("");
-
-                    match kind {
-                        "text_delta" => {
-                            got_text = true;
-                            last_text_time = Some(std::time::Instant::now());
-                            let delta = payload
-                                .get("delta")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or_default();
-                            full_text.push_str(delta);
-                            if tx.send(Ok(ResponseEvent::OutputTextDelta(delta.to_string())))
-                                .await
-                                .is_err()
-                            {
-                                break;
-                            }
-                        }
-                        "reasoning_delta" => {
-                            let delta = payload
-                                .get("delta")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or_default();
-                            if tx
-                                .send(Ok(ResponseEvent::ReasoningContentDelta {
-                                    delta: delta.to_string(),
-                                    content_index: 0,
-                                }))
-                                .await
-                                .is_err()
-                            {
-                                break;
-                            }
-                        }
-                        "result" => {
-                            // Tool call completed — emit as OutputItemDone so Codex's
-                            // native tool dispatcher handles it
-                            if let Some(tool_call_id) = payload.get("toolCallId") {
-                                let item = ResponseItem::Message {
-                                    id: None,
-                                    role: "assistant".to_string(),
-                                    content: vec![codex_protocol::models::ContentItem::OutputText {
-                                        text: serde_json::to_string(&payload).unwrap_or_default(),
-                                    }],
-                                    phase: None,
-                                    internal_chat_message_metadata_passthrough: None,
-                                };
-                                if tx
-                                    .send(Ok(ResponseEvent::OutputItemDone(item)))
-                                    .await
-                                    .is_err()
-                                {
-                                    break;
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-
-                    // Turn completion: session/event with response + usage, no kind
-                    if payload.get("response").is_some()
-                        && payload.get("usage").is_some()
-                    {
-                        let item = ResponseItem::Message {
-                            id: None,
-                            role: "assistant".to_string(),
-                            content: vec![codex_protocol::models::ContentItem::OutputText {
-                                text: full_text.clone(),
-                            }],
-                            phase: None,
-                            internal_chat_message_metadata_passthrough: None,
-                        };
-                        let _ = tx.send(Ok(ResponseEvent::OutputItemDone(item))).await;
-                        let _ = tx
-                            .send(Ok(ResponseEvent::Completed {
-                                response_id: request_id_for_stream.clone(),
-                                token_usage: None,
-                                end_turn: Some(true),
-                            }))
-                            .await;
-                        break;
-                    }
-                } else if method == "state.updated" {
-                    eprintln!("[zcode] state_updated");
-                    let status_val = params
-                        .get("patch")
-                        .and_then(|p| p.get("status"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    let status = params
-                        .get("patch")
-                        .and_then(|p| p.get("status"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    if status == "idle" && sent_prompt {
-                        // Turn complete
-                        let item = ResponseItem::Message {
-                            id: None,
-                            role: "assistant".to_string(),
-                            content: vec![codex_protocol::models::ContentItem::OutputText {
-                                text: full_text.clone(),
-                            }],
-                            phase: None,
-                            internal_chat_message_metadata_passthrough: None,
-                        };
-                        let _ = tx.send(Ok(ResponseEvent::OutputItemDone(item))).await;
-                        let _ = tx
-                            .send(Ok(ResponseEvent::Completed {
-                                response_id: request_id_for_stream.clone(),
-                                token_usage: None,
-                                end_turn: Some(true),
-                            }))
-                            .await;
-                        break;
-                    }
+                Err(e) => {
+                    let _ = tx.send(Err(ApiError::Stream(e))).await;
                 }
-            }
-
-            // ZCode may exit without sending state.updated: idle.
-            // If we received text, the turn completed successfully.
-            if got_text && sent_prompt {
-                let item = ResponseItem::Message {
-                    id: None,
-                    role: "assistant".to_string(),
-                    content: vec![codex_protocol::models::ContentItem::OutputText {
-                        text: full_text.clone(),
-                    }],
-                    phase: None,
-                    internal_chat_message_metadata_passthrough: None,
-                };
-                let _ = tx.send(Ok(ResponseEvent::OutputItemDone(item))).await;
-                let _ = tx
-                    .send(Ok(ResponseEvent::Completed {
-                        response_id: request_id_for_stream.clone(),
-                        token_usage: None,
-                        end_turn: Some(true),
-                    }))
-                    .await;
-            } else if sent_prompt {
-                let _ = tx
-                    .send(Err(ApiError::Stream(
-                        "ZCode stream ended without generating a response".to_string(),
-                    )))
-                    .await;
             }
         });
 
@@ -2322,12 +2065,6 @@ impl ModelClientSession {
         })
     }
 
-    /// Permanently disables WebSockets for this Codex session and resets WebSocket state.
-    ///
-    /// This is used after exhausting the provider retry budget, to force subsequent requests onto
-    /// the HTTP transport.
-    ///
-    /// Returns `true` if this call activated fallback, or `false` if fallback was already active.
     pub(crate) fn try_switch_fallback_transport(
         &mut self,
         session_telemetry: &SessionTelemetry,
