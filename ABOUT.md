@@ -1,14 +1,22 @@
 # Codex ZCode
 
-This repository is a lightweight distribution of Codex CLI with a native
-ZCode integration. It adds two tools to Codex's normal tool loop:
+This repository is a fork of Codex CLI that uses ZCode as its native model
+backend. Codex provides the terminal UI, tool dispatch, and sandboxing. ZCode
+handles model inference, web search, and its own internal tool execution.
 
-- `zcode_prompt`: run one task through ZCode's non-Electron headless agent.
-- `zai_search`: search the web through Z.AI Search Prime.
+## Architecture
 
-The integration is intentionally native to Codex. ZCode and Z.AI are invoked as
-tools from Codex's regular agent loop, rather than replacing Codex with a
-separate UI or wrapping it behind an HTTP compatibility layer.
+```text
+Codex TUI (terminal, tools, sandbox)
+    ↓ ModelClientSession::stream()
+ZCode app-server (node zcode.cjs, spawned as subprocess)
+    ↓ ZCode Protocol (stdio JSON-RPC)
+Z.AI API (model inference)
+```
+
+There is no HTTP proxy and no tool indirection. Codex's model provider layer
+has a `WireApi::Zcode` backend that spawns ZCode's app-server directly and
+maps its streaming events to Codex's `ResponseEvent` stream.
 
 ## What You Need
 
@@ -20,9 +28,7 @@ You need:
 1. The `codex-zcode` release binary from GitHub Releases.
 2. ZCode Desktop 3.9.2 or newer, which provides:
    `/opt/ZCode/resources/glm/zcode.cjs`
-3. A running local Z.AI proxy, normally on:
-   `http://127.0.0.1:18765/zai/v1/responses`
-4. ZCode CLI credentials, normally under `~/.zcode`.
+3. ZCode CLI credentials, normally under `~/.zcode/cli/config.json`.
 
 ZCode's headless runtime is part of the ZCode Desktop package. It is not bundled
 with this project.
@@ -92,10 +98,18 @@ ZCode runtime discovery:
 Optional overrides:
 
 - `ZCODE_NODE=/path/to/node`
-- `ZAI_SEARCH_URL=http://127.0.0.1:18765/zai/v1/responses`
 
-ZCode sessions are independent by default. Pass a prior `session_id` to
-`zcode_prompt` explicitly when you want to resume one.
+Configure `~/.codex/config.toml`:
+
+```toml
+model = "GLM-5.2"
+model_provider = "zcode"
+
+[model_providers.zcode]
+name = "ZCode"
+base_url = ""
+wire_api = "zcode"
+```
 
 ## Upstream Synchronization
 
