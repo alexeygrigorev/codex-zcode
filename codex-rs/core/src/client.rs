@@ -2010,7 +2010,7 @@ impl ModelClientSession {
         let request_id_for_stream = request_id.clone();
 
         tokio::spawn(async move {
-            eprintln!("[zcode] spawning ZCode app-server: {} {}", node, runtime);
+            eprintln!("[zcode] spawning ZCode");
             let mut child = match Command::new(&node)
                 .arg(&runtime)
                 .arg("app-server")
@@ -2022,7 +2022,6 @@ impl ModelClientSession {
             {
                 Ok(child) => child,
                 Err(e) => {
-                    eprintln!("[zcode] spawn failed: {e}");
                     let _ = tx
                             .send(Err(ApiError::Stream(format!(
                                 "failed to spawn ZCode: {e}"
@@ -2035,7 +2034,6 @@ impl ModelClientSession {
             let mut stdin = child.stdin.take().expect("ZCode stdin should be piped");
             let stdout = child.stdout.take().expect("ZCode stdout should be piped");
             let mut reader = BufReader::new(stdout).lines();
-            eprintln!("[zcode] sending session/create");
 
             // Send handshake + session/create + subscribe + send
             let rpc_id = 1u64;
@@ -2061,9 +2059,35 @@ impl ModelClientSession {
             let mut sent_prompt = false;
             let mut zc_rpc_id = rpc_id;
             let mut got_text = false;
+            let mut last_text_time: Option<std::time::Instant> = None;
+            let mut full_text = String::new();
 
-            while let Ok(Some(line)) = reader.next_line().await {
-                eprintln!("[zcode] RAW: {}", &line[..line.len().min(200)]);
+            loop {
+                if got_text
+                    && let Some(last_text) = last_text_time
+                    && last_text.elapsed() > std::time::Duration::from_secs(30)
+                {
+                    eprintln!("[zcode] 30s since last text_delta, completing turn");
+                    break;
+                }
+                let line = if got_text {
+                    // After receiving text, use a 30s timeout. If ZCode doesn't
+                    // send more events, the turn is complete.
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(30),
+                        reader.next_line(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(Some(line))) => line,
+                        _ => break,
+                    }
+                } else {
+                    match reader.next_line().await {
+                        Ok(Some(line)) => line,
+                        _ => break,
+                    }
+                };
                 let msg: serde_json::Value = match serde_json::from_str(&line) {
                     Ok(v) => v,
                     Err(_) => continue,
@@ -2071,11 +2095,10 @@ impl ModelClientSession {
 
                 // Handle RPC responses (session/create result, etc.)
                 if let Some(result) = msg.get("result") {
-                    eprintln!("[zcode] got RPC result");
+                    eprintln!("[zcode] rpc_result");
                     if let Some(session) = result.get("session") {
                         if let Some(sid) = session.get("sessionId").and_then(|v| v.as_str()) {
                             session_id = sid.to_string();
-                            eprintln!("[zcode] session created: {}", session_id);
                             // Subscribe
                             zc_rpc_id += 1;
                             let _ = stdin
@@ -2124,7 +2147,6 @@ impl ModelClientSession {
                 // Server-to-client request: session/requestRuntimePreferences
                 // Must respond with the same "id" the server used (e.g. "server-1")
                 if method == "session/requestRuntimePreferences" {
-                    eprintln!("[zcode] responding to runtime prefs");
                     let server_request_id = msg.get("id").cloned().unwrap_or_default();
                     let _ = stdin
                         .write_all(
@@ -2143,17 +2165,21 @@ impl ModelClientSession {
                 }
 
                 if method == "session/event" {
+                    let evt_kind = params.get("payload").and_then(|p| p.get("kind")).and_then(|v| v.as_str()).unwrap_or("(none)");
+                    let evt_keys: Vec<String> = params.get("payload").and_then(|p| p.as_object()).map(|o| o.keys().cloned().collect()).unwrap_or_default();
+                    eprintln!("[zcode] session_event kind={} keys={:?}", evt_kind, evt_keys);
                     let payload = params.get("payload").cloned().unwrap_or_default();
                     let kind = payload.get("kind").and_then(|v| v.as_str()).unwrap_or("");
 
                     match kind {
                         "text_delta" => {
                             got_text = true;
+                            last_text_time = Some(std::time::Instant::now());
                             let delta = payload
                                 .get("delta")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or_default();
-                            eprintln!("[zcode] text_delta: {delta}");
+                            full_text.push_str(delta);
                             if tx.send(Ok(ResponseEvent::OutputTextDelta(delta.to_string())))
                                 .await
                                 .is_err()
@@ -2201,13 +2227,37 @@ impl ModelClientSession {
                         }
                         _ => {}
                     }
+
+                    // Turn completion: session/event with response + usage, no kind
+                    if payload.get("response").is_some()
+                        && payload.get("usage").is_some()
+                    {
+                        let item = ResponseItem::Message {
+                            id: None,
+                            role: "assistant".to_string(),
+                            content: vec![codex_protocol::models::ContentItem::OutputText {
+                                text: full_text.clone(),
+                            }],
+                            phase: None,
+                            internal_chat_message_metadata_passthrough: None,
+                        };
+                        let _ = tx.send(Ok(ResponseEvent::OutputItemDone(item))).await;
+                        let _ = tx
+                            .send(Ok(ResponseEvent::Completed {
+                                response_id: request_id_for_stream.clone(),
+                                token_usage: None,
+                                end_turn: Some(true),
+                            }))
+                            .await;
+                        break;
+                    }
                 } else if method == "state.updated" {
+                    eprintln!("[zcode] state_updated");
                     let status_val = params
                         .get("patch")
                         .and_then(|p| p.get("status"))
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
-                    eprintln!("[zcode] state.updated: {status_val}");
                     let status = params
                         .get("patch")
                         .and_then(|p| p.get("status"))
@@ -2215,6 +2265,16 @@ impl ModelClientSession {
                         .unwrap_or("");
                     if status == "idle" && sent_prompt {
                         // Turn complete
+                        let item = ResponseItem::Message {
+                            id: None,
+                            role: "assistant".to_string(),
+                            content: vec![codex_protocol::models::ContentItem::OutputText {
+                                text: full_text.clone(),
+                            }],
+                            phase: None,
+                            internal_chat_message_metadata_passthrough: None,
+                        };
+                        let _ = tx.send(Ok(ResponseEvent::OutputItemDone(item))).await;
                         let _ = tx
                             .send(Ok(ResponseEvent::Completed {
                                 response_id: request_id_for_stream.clone(),
@@ -2230,7 +2290,16 @@ impl ModelClientSession {
             // ZCode may exit without sending state.updated: idle.
             // If we received text, the turn completed successfully.
             if got_text && sent_prompt {
-                eprintln!("[zcode] stream ended, sending Completed");
+                let item = ResponseItem::Message {
+                    id: None,
+                    role: "assistant".to_string(),
+                    content: vec![codex_protocol::models::ContentItem::OutputText {
+                        text: full_text.clone(),
+                    }],
+                    phase: None,
+                    internal_chat_message_metadata_passthrough: None,
+                };
+                let _ = tx.send(Ok(ResponseEvent::OutputItemDone(item))).await;
                 let _ = tx
                     .send(Ok(ResponseEvent::Completed {
                         response_id: request_id_for_stream.clone(),
@@ -2239,7 +2308,6 @@ impl ModelClientSession {
                     }))
                     .await;
             } else if sent_prompt {
-                eprintln!("[zcode] stream ended without text, sending error");
                 let _ = tx
                     .send(Err(ApiError::Stream(
                         "ZCode stream ended without generating a response".to_string(),
