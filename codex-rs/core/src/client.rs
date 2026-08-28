@@ -2060,8 +2060,10 @@ impl ModelClientSession {
             let mut session_id = String::new();
             let mut sent_prompt = false;
             let mut zc_rpc_id = rpc_id;
+            let mut got_text = false;
 
             while let Ok(Some(line)) = reader.next_line().await {
+                eprintln!("[zcode] RAW: {}", &line[..line.len().min(200)]);
                 let msg: serde_json::Value = match serde_json::from_str(&line) {
                     Ok(v) => v,
                     Err(_) => continue,
@@ -2146,6 +2148,7 @@ impl ModelClientSession {
 
                     match kind {
                         "text_delta" => {
+                            got_text = true;
                             let delta = payload
                                 .get("delta")
                                 .and_then(|v| v.as_str())
@@ -2222,6 +2225,26 @@ impl ModelClientSession {
                         break;
                     }
                 }
+            }
+
+            // ZCode may exit without sending state.updated: idle.
+            // If we received text, the turn completed successfully.
+            if got_text && sent_prompt {
+                eprintln!("[zcode] stream ended, sending Completed");
+                let _ = tx
+                    .send(Ok(ResponseEvent::Completed {
+                        response_id: request_id_for_stream.clone(),
+                        token_usage: None,
+                        end_turn: Some(true),
+                    }))
+                    .await;
+            } else if sent_prompt {
+                eprintln!("[zcode] stream ended without text, sending error");
+                let _ = tx
+                    .send(Err(ApiError::Stream(
+                        "ZCode stream ended without generating a response".to_string(),
+                    )))
+                    .await;
             }
         });
 
