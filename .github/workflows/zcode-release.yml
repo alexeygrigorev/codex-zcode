@@ -108,6 +108,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Add project documentation
+        run: cp ABOUT.md release/ABOUT.md
+
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
@@ -131,5 +134,6 @@ jobs:
           files: |
             release/codex-zcode-linux-amd64
             release/codex-zcode-linux-arm64
+            release/ABOUT.md
             release/VERSION
             release/SHA256SUMS
