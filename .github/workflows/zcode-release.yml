@@ -108,6 +108,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Prepare release directory
+        run: mkdir -p release
+
       - name: Add project documentation
         run: cp ABOUT.md release/ABOUT.md
 
