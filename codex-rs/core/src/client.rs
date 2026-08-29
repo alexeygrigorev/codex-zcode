@@ -229,6 +229,7 @@ fn normalize_zcode_tool_arguments(name: &str, input: &serde_json::Value) -> serd
             .map(str::to_string);
         let target = object
             .get("target")
+            .or_else(|| object.get("to"))
             .or_else(|| object.get("task_name"))
             .or_else(|| object.get("agentId"))
             .or_else(|| object.get("agent_id"))
@@ -2248,6 +2249,24 @@ impl ModelClientSession {
                         call_id.as_deref().unwrap_or("call"),
                         result_text
                     ));
+                }
+                ResponseItem::AgentMessage {
+                    author, content, ..
+                } => {
+                    let text = content
+                        .iter()
+                        .filter_map(|part| match part {
+                            codex_protocol::models::AgentMessageInputContent::InputText {
+                                text,
+                            } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if !text.is_empty() {
+                        user_text
+                            .push_str(&format!("[inter-agent message from {author}] {text}\n"));
+                    }
                 }
                 _ => {}
             }
