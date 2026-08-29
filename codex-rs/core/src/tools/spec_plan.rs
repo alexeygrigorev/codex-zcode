@@ -603,6 +603,7 @@ fn collab_tools_enabled(turn_context: &TurnContext) -> bool {
         MultiAgentVersion::V2 => {
             turn_context.session_source.get_agent_path().is_none()
                 || turn_context.model_info.multi_agent_version == Some(MultiAgentVersion::V2)
+                || turn_context.provider.info().wire_api == codex_model_provider_info::WireApi::Zcode
         }
     }
 }
