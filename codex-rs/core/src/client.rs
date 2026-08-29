@@ -186,6 +186,53 @@ fn reasoning_effort_for_request(effort: ReasoningEffortConfig) -> ReasoningEffor
 
 const ZCODE_PROVIDER_ID: &str = "zai";
 
+struct PendingZcodeTool {
+    zcode_name: String,
+    name: String,
+    arguments: String,
+    call_id: String,
+}
+
+fn normalize_zcode_tool_name(name: &str) -> String {
+    match name {
+        "Agent" | "Task" => "spawn_agent".to_string(),
+        "Bash" | "Shell" | "shell" => "exec_command".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn normalize_zcode_tool_arguments(name: &str, input: &serde_json::Value) -> serde_json::Value {
+    if !matches!(name, "Bash" | "Shell" | "shell") {
+        return input.clone();
+    }
+    let object = match input.as_object() {
+        Some(object) => object,
+        None => return serde_json::json!({ "cmd": input.to_string() }),
+    };
+    let mut normalized = object.clone();
+    if let Some(command) = object
+        .get("command")
+        .or_else(|| object.get("cmd"))
+        .and_then(|value| value.as_str())
+    {
+        normalized.insert(
+            "cmd".to_string(),
+            serde_json::Value::String(command.to_string()),
+        );
+    }
+    if let Some(cwd) = object
+        .get("cwd")
+        .or_else(|| object.get("workdir"))
+        .and_then(|value| value.as_str())
+    {
+        normalized.insert(
+            "workdir".to_string(),
+            serde_json::Value::String(cwd.to_string()),
+        );
+    }
+    serde_json::Value::Object(normalized)
+}
+
 fn prepare_zcode_home(model_slug: &str) -> std::io::Result<PathBuf> {
     let Some(real_home) = dirs::home_dir() else {
         return Err(std::io::Error::other("HOME is not set"));
@@ -2042,27 +2089,63 @@ impl ModelClientSession {
             .to_string_lossy()
             .to_string();
 
-        // Extract user prompt text from the Responses API input items.
-        let user_text = prompt
-            .input
-            .iter()
-            .filter_map(|item| match item {
-                ResponseItem::Message { role, content, .. } if role == "user" => Some(
-                    content
+        // Flatten the full conversation into a transcript. ZCode needs prior
+        // tool calls and outputs on follow-up turns; sending only user text
+        // makes it repeat the same tool call forever.
+        let mut user_text = String::new();
+        for item in &prompt.input {
+            match item {
+                ResponseItem::Message { role, content, .. } => {
+                    let text = content
                         .iter()
                         .filter_map(|c| match c {
-                            codex_protocol::models::ContentItem::InputText { text } => {
+                            codex_protocol::models::ContentItem::InputText { text }
+                            | codex_protocol::models::ContentItem::OutputText { text } => {
                                 Some(text.as_str())
                             }
                             _ => None,
                         })
                         .collect::<Vec<_>>()
-                        .join("\n"),
-                ),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+                        .join("\n");
+                    if !text.is_empty() {
+                        user_text.push_str(&format!("{role}: {text}\n"));
+                    }
+                }
+                ResponseItem::FunctionCall {
+                    name, arguments, ..
+                } => {
+                    user_text.push_str(&format!("[tool call {name}] {arguments}\n"));
+                }
+                ResponseItem::FunctionCallOutput {
+                    call_id, output, ..
+                } => {
+                    let result_text = output
+                        .text_content()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| {
+                            output
+                                .content_items()
+                                .map(|items| {
+                                    items
+                                        .iter()
+                                        .filter_map(|item| match item {
+                                            codex_protocol::models::FunctionCallOutputContentItem::InputText { text } => Some(text.clone()),
+                                            _ => None,
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join("\n")
+                                })
+                                .unwrap_or_default()
+                        });
+                    user_text.push_str(&format!(
+                        "[tool result for {}] {}\n",
+                        call_id.as_deref().unwrap_or("call"),
+                        result_text
+                    ));
+                }
+                _ => {}
+            }
+        }
 
         let (tx, rx_event) = mpsc::channel::<std::result::Result<ResponseEvent, ApiError>>(64);
         let request_id = format!("zcode_{}", uuid::Uuid::new_v4());
@@ -2125,6 +2208,10 @@ impl ModelClientSession {
             let mut failed: Option<String> = None;
             let mut started_output = false;
             let mut result_response: Option<String> = None;
+            let mut pending_tools: HashMap<String, PendingZcodeTool> = HashMap::new();
+            let mut emitted_tool_calls: usize = 0;
+            let mut completed_tool_ids: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
 
             while let Ok(Some(line)) = lines.next_line().await {
                 if line.trim().is_empty() {
@@ -2152,6 +2239,21 @@ impl ModelClientSession {
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
                     let is_text = event_kind == "text_delta";
+                    let is_tool_input_start = event_kind == "tool_input_start";
+                    let is_tool_input_delta = event_kind == "tool_input_delta";
+                    let is_tool_input_end = event_kind == "tool_input_end";
+                    let is_tool_call = event_kind == "tool_call";
+
+                    if (is_text || is_tool_input_start || is_tool_input_delta || is_tool_call)
+                        && started_output
+                        && (is_tool_input_start || is_tool_call)
+                    {
+                        // A completed assistant message cannot stay active
+                        // across a tool item; leave the prior message item
+                        // open only while its own deltas are arriving.
+                        started_output = false;
+                    }
+
                     if is_text && !started_output {
                         let item = ResponseItem::Message {
                             id: None,
@@ -2179,6 +2281,150 @@ impl ModelClientSession {
                             break;
                         }
                     }
+                    if is_tool_input_start {
+                        let tool_call_id = payload
+                            .and_then(|p| p.get("toolCallId"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default();
+                        let tool_name = payload
+                            .and_then(|p| p.get("toolName"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default();
+                        if !tool_call_id.is_empty() && !completed_tool_ids.contains(tool_call_id) {
+                            let call_id = format!("zcode_tool_{tool_call_id}");
+                            let mapped_name = normalize_zcode_tool_name(tool_name);
+                            pending_tools.insert(
+                                tool_call_id.to_string(),
+                                PendingZcodeTool {
+                                    zcode_name: tool_name.to_string(),
+                                    name: mapped_name.clone(),
+                                    arguments: String::new(),
+                                    call_id: call_id.clone(),
+                                },
+                            );
+                            let item = ResponseItem::FunctionCall {
+                                id: None,
+                                name: mapped_name,
+                                namespace: None,
+                                arguments: String::new(),
+                                encrypted_function_args: None,
+                                call_id,
+                                internal_chat_message_metadata_passthrough: None,
+                            };
+                            if tx
+                                .send(Ok(ResponseEvent::OutputItemAdded(item)))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                    if is_tool_input_delta {
+                        let tool_call_id = payload
+                            .and_then(|p| p.get("toolCallId"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default();
+                        let delta = payload
+                            .and_then(|p| p.get("delta"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default();
+                        if let Some(pending) = pending_tools.get_mut(tool_call_id) {
+                            pending.arguments.push_str(delta);
+                            if tx
+                                .send(Ok(ResponseEvent::ToolCallInputDelta {
+                                    item_id: pending.call_id.clone(),
+                                    call_id: Some(pending.call_id.clone()),
+                                    delta: delta.to_string(),
+                                }))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                    if is_tool_call {
+                        let tool_call_id = payload
+                            .and_then(|p| p.get("toolCallId"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default();
+                        if let Some(pending) = pending_tools.remove(tool_call_id) {
+                            let authoritative = payload
+                                .and_then(|p| p.get("input"))
+                                .map(|input| {
+                                    serde_json::to_string(&normalize_zcode_tool_arguments(
+                                        &pending.zcode_name,
+                                        input,
+                                    ))
+                                    .unwrap_or_else(|_| "{}".to_string())
+                                })
+                                .unwrap_or_else(|| {
+                                    if pending.arguments.is_empty() {
+                                        "{}".to_string()
+                                    } else {
+                                        pending.arguments.clone()
+                                    }
+                                });
+                            let item = ResponseItem::FunctionCall {
+                                id: None,
+                                name: pending.name,
+                                namespace: None,
+                                arguments: authoritative,
+                                encrypted_function_args: None,
+                                call_id: pending.call_id,
+                                internal_chat_message_metadata_passthrough: None,
+                            };
+                            if tx
+                                .send(Ok(ResponseEvent::OutputItemDone(item)))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                            emitted_tool_calls += 1;
+                            completed_tool_ids.insert(tool_call_id.to_string());
+                        }
+                    }
+                    if is_tool_input_end {
+                        let tool_call_id = payload
+                            .and_then(|p| p.get("toolCallId"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default();
+                        if let Some(pending) = pending_tools.remove(tool_call_id) {
+                            let arguments = if pending.arguments.is_empty() {
+                                "{}".to_string()
+                            } else {
+                                serde_json::from_str::<serde_json::Value>(&pending.arguments)
+                                    .map(|value| {
+                                        serde_json::to_string(&normalize_zcode_tool_arguments(
+                                            &pending.zcode_name,
+                                            &value,
+                                        ))
+                                        .unwrap_or_else(|_| pending.arguments.clone())
+                                    })
+                                    .unwrap_or_else(|_| pending.arguments.clone())
+                            };
+                            let item = ResponseItem::FunctionCall {
+                                id: None,
+                                name: pending.name,
+                                namespace: None,
+                                arguments,
+                                encrypted_function_args: None,
+                                call_id: pending.call_id,
+                                internal_chat_message_metadata_passthrough: None,
+                            };
+                            if tx
+                                .send(Ok(ResponseEvent::OutputItemDone(item)))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                            emitted_tool_calls += 1;
+                            completed_tool_ids.insert(tool_call_id.to_string());
+                        }
+                    }
                 }
                 if kind == "session.error" {
                     failed = Some(
@@ -2199,19 +2445,30 @@ impl ModelClientSession {
             let status = child.wait().await;
             match (status, failed) {
                 (Ok(status), None) if status.success() => {
-                    if let Some(final_text) = result_response {
-                        response_text = final_text;
+                    if emitted_tool_calls == 0 {
+                        // If deltas already streamed to the client, emitting a
+                        // second completed message would duplicate the answer.
+                        if response_text.is_empty() {
+                            if let Some(final_text) = result_response {
+                                response_text = final_text;
+                            }
+                            let item = ResponseItem::Message {
+                                id: None,
+                                role: "assistant".to_string(),
+                                content: vec![codex_protocol::models::ContentItem::OutputText {
+                                    text: response_text,
+                                }],
+                                phase: None,
+                                internal_chat_message_metadata_passthrough: None,
+                            };
+                            let _ = tx.send(Ok(ResponseEvent::OutputItemDone(item))).await;
+                        }
+                    } else {
+                        // ZCode completed one or more tool calls. Codex will
+                        // execute them and start a follow-up model turn; a
+                        // final message here would describe work that has not
+                        // happened yet.
                     }
-                    let item = ResponseItem::Message {
-                        id: None,
-                        role: "assistant".to_string(),
-                        content: vec![codex_protocol::models::ContentItem::OutputText {
-                            text: response_text,
-                        }],
-                        phase: None,
-                        internal_chat_message_metadata_passthrough: None,
-                    };
-                    let _ = tx.send(Ok(ResponseEvent::OutputItemDone(item))).await;
                     let _ = tx
                         .send(Ok(ResponseEvent::Completed {
                             response_id: request_id_for_stream,

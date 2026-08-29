@@ -444,7 +444,7 @@ fn zcode_static_models_catalog(config: &Config) -> ModelsResponse {
             auto_review_model_override: None,
             model_specialty: None,
             tool_mode: None,
-            multi_agent_version: None,
+            multi_agent_version: Some(MultiAgentVersion::V2),
         }],
     }
 }
