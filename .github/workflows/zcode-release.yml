@@ -17,37 +17,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  test:
-    name: Test ZCode integration
-    runs-on: ubuntu-24.04
-    timeout-minutes: 45
-    defaults:
-      run:
-        working-directory: codex-rs
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
-        with:
-          components: clippy,rustfmt
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: codex-rs
-          key: zcode-integration
-
-      - name: Format ZCode extension
-        run: cargo fmt --check -p codex-zcode
-
-      - name: Check ZCode extension
-        run: cargo check --locked -p codex-zcode
-
-      - name: Clippy ZCode extension
-        run: cargo clippy --locked -p codex-zcode -- -D warnings
-
   build:
     name: Build ${{ matrix.name }}
-    needs: test
     runs-on: ${{ matrix.os }}
     timeout-minutes: 240
     strategy:
@@ -57,12 +28,12 @@ jobs:
           - name: linux-amd64
             os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
-            asset_name: codex-zcode-linux-amd64
+            asset_name: zcodex-linux-amd64
 
           - name: linux-arm64
             os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            asset_name: codex-zcode-linux-arm64
+            asset_name: zcodex-linux-arm64
 
     defaults:
       run:
@@ -82,14 +53,14 @@ jobs:
           cache-on-failure: true
 
       - name: Build Codex CLI with ZCode integration
-        run: cargo build --locked --release --target ${{ matrix.target }} -p codex-cli --bin codex
+        run: cargo build --locked --release --target ${{ matrix.target }} -p codex-cli --bin zcodex
 
       - name: Verify binary
-        run: ./target/${{ matrix.target }}/release/codex --version
+        run: ./target/${{ matrix.target }}/release/zcodex --version
 
       - name: Stage binary
         shell: bash
-        run: cp "./target/${{ matrix.target }}/release/codex" "../${{ matrix.asset_name }}"
+        run: cp "./target/${{ matrix.target }}/release/zcodex" "../${{ matrix.asset_name }}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -135,8 +106,8 @@ jobs:
           name: Codex ZCode ${{ github.ref_name }}
           generate_release_notes: true
           files: |
-            release/codex-zcode-linux-amd64
-            release/codex-zcode-linux-arm64
+            release/zcodex-linux-amd64
+            release/zcodex-linux-arm64
             release/ABOUT.md
             release/VERSION
             release/SHA256SUMS

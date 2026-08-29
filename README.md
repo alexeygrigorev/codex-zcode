@@ -9,6 +9,13 @@ If you want Codex in your code editor (VS Code, Cursor, Windsurf), <a href="http
 
 ---
 
+**Note:** This repository builds `zcodex`, a separate Codex CLI fork that uses
+ZCode as its native model backend. Its configuration lives in `~/.zcodex`, so it
+does not conflict with a normal Codex installation. See
+[ABOUT.md](ABOUT.md) for project-specific setup and release details.
+
+---
+
 ## Quickstart
 
 ### Installing and running Codex CLI

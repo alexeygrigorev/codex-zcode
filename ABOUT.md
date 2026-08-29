@@ -1,22 +1,24 @@
 # Codex ZCode
 
 This repository is a fork of Codex CLI that uses ZCode as its native model
-backend. Codex provides the terminal UI, tool dispatch, and sandboxing. ZCode
-handles model inference, web search, and its own internal tool execution.
+backend. The executable is `zcodex`, and its configuration lives in
+`~/.zcodex`, so it does not conflict with ordinary Codex or `~/.codex`.
 
 ## Architecture
 
 ```text
-Codex TUI (terminal, tools, sandbox)
-    ↓ ModelClientSession::stream()
-ZCode app-server (node zcode.cjs, spawned as subprocess)
-    ↓ ZCode Protocol (stdio JSON-RPC)
-Z.AI API (model inference)
+zcodex TUI / exec (terminal UI, approval flow, sandbox)
+    | ModelClient WireApi::Zcode
+    v
+node zcode.cjs --prompt <text> --json --mode yolo --cwd <dir>
+    |
+    v
+ZCode headless agent (model, web search, internal tools)
 ```
 
-There is no HTTP proxy and no tool indirection. Codex's model provider layer
-has a `WireApi::Zcode` backend that spawns ZCode's app-server directly and
-maps its streaming events to Codex's `ResponseEvent` stream.
+There is no HTTP proxy and no tool indirection. `WireApi::Zcode` spawns the
+ZCode headless CLI for each model turn and maps its JSON result into Codex's
+normal response stream.
 
 ## What You Need
 
@@ -25,7 +27,7 @@ ZCode's runtime or credentials.
 
 You need:
 
-1. The `codex-zcode` release binary from GitHub Releases.
+1. The `zcodex` release binary from GitHub Releases.
 2. ZCode Desktop 3.9.2 or newer, which provides:
    `/opt/ZCode/resources/glm/zcode.cjs`
 3. ZCode CLI credentials, normally under `~/.zcode/cli/config.json`.
@@ -43,18 +45,18 @@ Linux AMD64 example:
 
 ```bash
 curl -fL \
-  https://github.com/alexeygrigorev/codex-zcode/releases/download/zcode-v0.1.0/codex-zcode-linux-amd64 \
-  -o ~/.local/bin/codex-zcode
-chmod +x ~/.local/bin/codex-zcode
+  https://github.com/alexeygrigorev/codex-zcode/releases/download/zcode-v0.1.0/zcodex-linux-amd64 \
+  -o ~/.local/bin/zcodex
+chmod +x ~/.local/bin/zcodex
 ```
 
 Linux ARM64:
 
 ```bash
 curl -fL \
-  https://github.com/alexeygrigorev/codex-zcode/releases/download/zcode-v0.1.0/codex-zcode-linux-arm64 \
-  -o ~/.local/bin/codex-zcode
-chmod +x ~/.local/bin/codex-zcode
+  https://github.com/alexeygrigorev/codex-zcode/releases/download/zcode-v0.1.0/zcodex-linux-arm64 \
+  -o ~/.local/bin/zcodex
+chmod +x ~/.local/bin/zcodex
 ```
 
 Verify the downloaded file against `SHA256SUMS` from the same release.
@@ -66,8 +68,8 @@ fast local profile and does not create a release.
 
 ```bash
 cd codex-rs
-cargo build --profile dev-small -p codex-cli --bin codex
-./target/dev-small/codex
+cargo build --profile dev-small -p codex-cli --bin zcodex
+./target/dev-small/zcodex
 ```
 
 Typical timings:
@@ -99,7 +101,7 @@ Optional overrides:
 
 - `ZCODE_NODE=/path/to/node`
 
-Configure `~/.codex/config.toml`:
+Configure `~/.zcodex/config.toml`:
 
 ```toml
 model = "GLM-5.2"

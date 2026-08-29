@@ -1,0 +1,7 @@
+model = "GLM-5.2"
+model_provider = "zcode"
+
+[model_providers.zcode]
+name = "ZCode"
+base_url = ""
+wire_api = "zcode"
