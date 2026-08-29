@@ -1958,7 +1958,6 @@ impl ModelClientSession {
         _inference_trace: &InferenceTraceContext,
     ) -> Result<codex_api::ResponseStream> {
         use std::process::Stdio;
-        use tokio::io::AsyncWriteExt;
         use tokio::process::Command;
         use tokio::sync::mpsc;
 
@@ -2028,12 +2027,6 @@ impl ModelClientSession {
                         .and_then(|v| v.as_str())
                         .unwrap_or_default()
                         .to_string();
-                    let session_id = parsed
-                        .get("sessionId")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string();
-
                     let item = ResponseItem::Message {
                         id: None,
                         role: "assistant".to_string(),

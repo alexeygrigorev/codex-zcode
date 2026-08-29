@@ -1,4 +1,5 @@
 # Codex ZCode
+model_reasoning_effort = "max"
 
 This repository is a fork of Codex CLI that uses ZCode as its native model
 backend. The executable is `zcodex`, and its configuration lives in
@@ -104,7 +105,7 @@ Optional overrides:
 Configure `~/.zcodex/config.toml`:
 
 ```toml
-model = "GLM-5.2"
+model = "glm-5.3-flash"
 model_provider = "zcode"
 
 [model_providers.zcode]

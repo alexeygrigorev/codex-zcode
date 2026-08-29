@@ -53,6 +53,7 @@ use codex_protocol::error::Result as CodexResult;
 use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::mcp::OPENAI_STANDARD_FORM_INPUT_EXTENSION_ID;
 use codex_protocol::openai_models::ModelPreset;
+use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::MultiAgentVersion;
@@ -364,10 +365,90 @@ pub fn build_models_manager(
     auth_manager: Arc<AuthManager>,
 ) -> SharedModelsManager {
     let provider = create_model_provider(config.model_provider.clone(), Some(auth_manager));
+    let model_catalog = if config.model_provider.wire_api == codex_model_provider_info::WireApi::Zcode {
+        Some(zcode_static_models_catalog(config))
+    } else {
+        config.model_catalog.clone()
+    };
     provider.models_manager(
         config.codex_home.to_path_buf(),
-        config.model_catalog.clone(),
+        model_catalog,
     )
+}
+
+/// Zcode exposes no browsable `/models` endpoint through Codex's normal
+/// discovery path. Surface the configured model as the complete catalog so
+/// `/models` reflects the active provider configuration.
+fn zcode_static_models_catalog(config: &Config) -> ModelsResponse {
+    use codex_protocol::config_types::ReasoningSummary;
+    use codex_protocol::openai_models::ConfigShellToolType;
+    use codex_protocol::openai_models::ModelInfo;
+    use codex_protocol::openai_models::ModelVisibility;
+    use codex_protocol::openai_models::ReasoningEffort;
+    use codex_protocol::openai_models::ReasoningEffortPreset;
+    use codex_protocol::openai_models::TruncationPolicyConfig;
+    use codex_protocol::openai_models::WebSearchToolType;
+
+    let slug = config
+        .model
+        .clone()
+        .unwrap_or_else(|| "glm-5.3-flash".to_string());
+    let display_name = slug.clone();
+    ModelsResponse {
+        models: vec![ModelInfo {
+            slug,
+            display_name,
+            description: Some("ZCode headless agent model".to_string()),
+            default_reasoning_level: Some(ReasoningEffort::Max),
+            supported_reasoning_levels: vec![
+                ReasoningEffortPreset {
+                    effort: ReasoningEffort::None,
+                    description: "No explicit reasoning".to_string(),
+                },
+                ReasoningEffortPreset {
+                    effort: ReasoningEffort::Max,
+                    description: "Deep reasoning".to_string(),
+                },
+            ],
+            shell_type: ConfigShellToolType::UnifiedExec,
+            visibility: ModelVisibility::List,
+            supported_in_api: true,
+            priority: 0,
+            additional_speed_tiers: Vec::new(),
+            service_tiers: Vec::new(),
+            default_service_tier: None,
+            availability_nux: None,
+            upgrade: None,
+            model_messages: None,
+            include_skills_usage_instructions: false,
+            include_plugin_usage_instructions: false,
+            include_apps_usage_instructions: false,
+            supports_reasoning_summary_parameter: false,
+            default_reasoning_summary: ReasoningSummary::None,
+            support_verbosity: false,
+            default_verbosity: None,
+            apply_patch_tool_type: None,
+            web_search_tool_type: WebSearchToolType::Text,
+            truncation_policy: TruncationPolicyConfig::tokens(200_000),
+            supports_image_detail_original: false,
+            context_window: None,
+            max_context_window: None,
+            auto_compact_token_limit: None,
+            comp_hash: None,
+            effective_context_window_percent: 95,
+            experimental_supported_tools: Vec::new(),
+            input_modalities: codex_protocol::openai_models::default_input_modalities(),
+            used_fallback_model_metadata: false,
+            supports_search_tool: true,
+            use_responses_lite: false,
+            node_repl_auto_review_required: false,
+            node_repl_disabled: false,
+            auto_review_model_override: None,
+            model_specialty: None,
+            tool_mode: None,
+            multi_agent_version: None,
+        }],
+    }
 }
 
 pub fn thread_store_from_config(
