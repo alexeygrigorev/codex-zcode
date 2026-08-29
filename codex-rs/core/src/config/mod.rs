@@ -3050,10 +3050,9 @@ fn validate_multi_agent_v2_tool_namespace(namespace: Option<&str>) -> std::io::R
         return Ok(());
     };
     if namespace.is_empty() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("{LABEL} must not be empty"),
-        ));
+        // An empty namespace keeps multi-agent v2 tools in the default
+        // function namespace, which some providers require.
+        return Ok(());
     }
     if namespace.trim() != namespace {
         return Err(std::io::Error::new(

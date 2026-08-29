@@ -196,12 +196,86 @@ struct PendingZcodeTool {
 fn normalize_zcode_tool_name(name: &str) -> String {
     match name {
         "Agent" | "Task" => "spawn_agent".to_string(),
+        "SendMessage" | "TaskMessage" => "send_message".to_string(),
+        "TaskOutput" | "WaitAgent" => "wait_agent".to_string(),
         "Bash" | "Shell" | "shell" => "exec_command".to_string(),
         other => other.to_string(),
     }
 }
 
 fn normalize_zcode_tool_arguments(name: &str, input: &serde_json::Value) -> serde_json::Value {
+    if matches!(name, "TaskOutput" | "WaitAgent") {
+        let object = match input.as_object() {
+            Some(object) => object.clone(),
+            None => serde_json::Map::new(),
+        };
+        // wait_agent only takes timeout_ms; drop ZCode-specific target fields.
+        let mut normalized = serde_json::Map::new();
+        if let Some(timeout_ms) = object.get("timeout_ms").or_else(|| object.get("timeout")) {
+            normalized.insert("timeout_ms".to_string(), timeout_ms.clone());
+        }
+        return serde_json::Value::Object(normalized);
+    }
+
+    if matches!(name, "SendMessage" | "TaskMessage") {
+        let object = match input.as_object() {
+            Some(object) => object,
+            None => return input.clone(),
+        };
+        let message = object
+            .get("message")
+            .or_else(|| object.get("content"))
+            .and_then(|value| value.as_str())
+            .map(str::to_string);
+        let target = object
+            .get("target")
+            .or_else(|| object.get("task_name"))
+            .or_else(|| object.get("agentId"))
+            .or_else(|| object.get("agent_id"))
+            .and_then(|value| value.as_str())
+            .map(str::to_string);
+        if let (Some(target), Some(mut message)) = (target, message) {
+            if let Some(summary) = object
+                .get("summary")
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.trim().is_empty())
+            {
+                message = format!("{message}\n\nSummary: {summary}");
+            }
+            return serde_json::json!({ "target": target, "message": message });
+        }
+        return input.clone();
+    }
+
+    if matches!(name, "Agent" | "Task") {
+        let object = match input.as_object() {
+            Some(object) => object,
+            None => return input.clone(),
+        };
+        let message = object
+            .get("message")
+            .or_else(|| object.get("prompt"))
+            .and_then(|value| value.as_str())
+            .map(str::to_string);
+        let task_name = object
+            .get("task_name")
+            .or_else(|| object.get("description"))
+            .and_then(|value| value.as_str())
+            .map(zcodex_task_name_from_description);
+        let mut normalized = object.clone();
+        match (task_name, message) {
+            (Some(task_name), Some(message)) => {
+                normalized.insert("task_name".to_string(), serde_json::json!(task_name));
+                normalized.insert("message".to_string(), serde_json::json!(message));
+            }
+            _ => return input.clone(),
+        }
+        normalized.remove("prompt");
+        normalized.remove("description");
+        normalized.remove("subagent_type");
+        return serde_json::Value::Object(normalized);
+    }
+
     if !matches!(name, "Bash" | "Shell" | "shell") {
         return input.clone();
     }
@@ -231,6 +305,38 @@ fn normalize_zcode_tool_arguments(name: &str, input: &serde_json::Value) -> serd
         );
     }
     serde_json::Value::Object(normalized)
+}
+
+fn zcodex_task_name_from_description(description: &str) -> String {
+    let slug: String = description
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let mut task_name = String::new();
+    let mut last_was_underscore = false;
+    for character in slug.chars() {
+        if character == '_' {
+            if !last_was_underscore && !task_name.is_empty() {
+                task_name.push('_');
+            }
+            last_was_underscore = true;
+        } else {
+            task_name.push(character);
+            last_was_underscore = false;
+        }
+    }
+    let task_name = task_name.trim_matches('_').to_string();
+    if task_name.is_empty() {
+        "agent".to_string()
+    } else {
+        task_name
+    }
 }
 
 fn prepare_zcode_home(model_slug: &str) -> std::io::Result<PathBuf> {
@@ -2150,6 +2256,10 @@ impl ModelClientSession {
         let (tx, rx_event) = mpsc::channel::<std::result::Result<ResponseEvent, ApiError>>(64);
         let request_id = format!("zcode_{}", uuid::Uuid::new_v4());
         let request_id_for_stream = request_id.clone();
+        if std::env::var("ZCODE_DEBUG_TOOLS").as_deref() == Ok("1") {
+            eprintln!("[zcodex] request tools: {:?}", prompt.tools);
+        }
+        let _ = std::env::var("ZCODE_DEBUG_TOOLS");
         let zcode_home = prepare_zcode_home(&model_slug);
         if let Err(message) = &zcode_home {
             warn!("ZCode model override unavailable: {message}");
