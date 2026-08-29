@@ -2043,6 +2043,7 @@ impl ModelClientSession {
             let mut session_id = String::new();
             let mut failed: Option<String> = None;
             let mut started_output = false;
+            let mut result_response: Option<String> = None;
 
             while let Ok(Some(line)) = lines.next_line().await {
                 if line.trim().is_empty() {
@@ -2050,9 +2051,11 @@ impl ModelClientSession {
                 }
                 let parsed: serde_json::Value = match serde_json::from_str(&line) {
                     Ok(value) => value,
-                    Err(e) => {
-                        failed = Some(format!("invalid ZCode stream JSON: {e}"));
-                        break;
+                    Err(_) => {
+                        // ZCode can emit non-JSON lines on stdout from nested
+                        // subprocesses; ignore them and keep consuming the
+                        // event stream.
+                        continue;
                     }
                 };
                 let payload = parsed.get("payload");
@@ -2104,11 +2107,20 @@ impl ModelClientSession {
                     );
                     break;
                 }
+                if kind == "result" {
+                    result_response = parsed
+                        .get("response")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                }
             }
 
             let status = child.wait().await;
             match (status, failed) {
                 (Ok(status), None) if status.success() => {
+                    if let Some(final_text) = result_response {
+                        response_text = final_text;
+                    }
                     let item = ResponseItem::Message {
                         id: None,
                         role: "assistant".to_string(),
