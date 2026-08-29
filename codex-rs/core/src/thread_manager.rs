@@ -365,15 +365,13 @@ pub fn build_models_manager(
     auth_manager: Arc<AuthManager>,
 ) -> SharedModelsManager {
     let provider = create_model_provider(config.model_provider.clone(), Some(auth_manager));
-    let model_catalog = if config.model_provider.wire_api == codex_model_provider_info::WireApi::Zcode {
-        Some(zcode_static_models_catalog(config))
-    } else {
-        config.model_catalog.clone()
-    };
-    provider.models_manager(
-        config.codex_home.to_path_buf(),
-        model_catalog,
-    )
+    let model_catalog =
+        if config.model_provider.wire_api == codex_model_provider_info::WireApi::Zcode {
+            Some(zcode_static_models_catalog(config))
+        } else {
+            config.model_catalog.clone()
+        };
+    provider.models_manager(config.codex_home.to_path_buf(), model_catalog)
 }
 
 /// Zcode exposes no browsable `/models` endpoint through Codex's normal

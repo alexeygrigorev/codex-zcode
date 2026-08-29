@@ -1949,7 +1949,8 @@ impl ModelClientSession {
 
     /// Streams model inference through ZCode's headless CLI.
     ///
-    /// Spawns `node zcode.cjs --prompt ... --json` as a one-shot subprocess.
+    /// Spawns `node zcode.cjs --prompt ... --output-format stream-json` and
+    /// maps NDJSON streaming events to Codex response events.
     /// This is fast (~8s) compared to the app-server approach.
     async fn stream_zcode(
         &self,
@@ -1978,7 +1979,9 @@ impl ModelClientSession {
                     content
                         .iter()
                         .filter_map(|c| match c {
-                            codex_protocol::models::ContentItem::InputText { text } => Some(text.as_str()),
+                            codex_protocol::models::ContentItem::InputText { text } => {
+                                Some(text.as_str())
+                            }
                             _ => None,
                         })
                         .collect::<Vec<_>>()
@@ -1989,44 +1992,123 @@ impl ModelClientSession {
             .collect::<Vec<_>>()
             .join("\n");
 
-        let (tx, rx_event) =
-            mpsc::channel::<std::result::Result<ResponseEvent, ApiError>>(64);
+        let (tx, rx_event) = mpsc::channel::<std::result::Result<ResponseEvent, ApiError>>(64);
         let request_id = format!("zcode_{}", uuid::Uuid::new_v4());
         let request_id_for_stream = request_id.clone();
 
         tokio::spawn(async move {
-            let output = Command::new(&node)
+            let child = Command::new(&node)
                 .arg(&runtime)
                 .arg("--prompt")
                 .arg(&user_text)
-                .args(["--json", "--mode", "yolo", "--cwd", &cwd])
+                .args([
+                    "--output-format",
+                    "stream-json",
+                    "--mode",
+                    "yolo",
+                    "--cwd",
+                    &cwd,
+                ])
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
                 .kill_on_drop(true)
-                .output()
-                .await;
+                .spawn();
 
-            let result: std::result::Result<serde_json::Value, String> = match output {
-                Ok(output) if output.status.success() => {
-                    serde_json::from_slice(&output.stdout)
-                        .map_err(|e| format!("invalid ZCode JSON: {e}"))
+            let mut child = match child {
+                Ok(child) => child,
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(ApiError::Stream(format!(
+                            "could not launch ZCode: {e}"
+                        ))))
+                        .await;
+                    return;
                 }
-                Ok(output) => Err(format!(
-                    "ZCode failed ({}): {}",
-                    output.status,
-                    String::from_utf8_lossy(&output.stderr)
-                )),
-                Err(e) => Err(format!("could not launch ZCode: {e}")),
             };
 
-            match result {
-                Ok(parsed) => {
-                    let response_text = parsed
-                        .get("response")
+            let Some(stdout) = child.stdout.take() else {
+                let _ = tx
+                    .send(Err(ApiError::Stream(
+                        "ZCode did not expose stdout".to_string(),
+                    )))
+                    .await;
+                return;
+            };
+
+            use tokio::io::{AsyncBufReadExt, BufReader};
+            let reader = BufReader::new(stdout);
+            let mut lines = reader.lines();
+            let mut response_text = String::new();
+            let mut session_id = String::new();
+            let mut failed: Option<String> = None;
+            let mut started_output = false;
+
+            while let Ok(Some(line)) = lines.next_line().await {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let parsed: serde_json::Value = match serde_json::from_str(&line) {
+                    Ok(value) => value,
+                    Err(e) => {
+                        failed = Some(format!("invalid ZCode stream JSON: {e}"));
+                        break;
+                    }
+                };
+                let payload = parsed.get("payload");
+                let kind = parsed.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                if kind == "session.updated" {
+                    if let Some(id) = parsed.get("sessionId").and_then(|v| v.as_str()) {
+                        session_id = id.to_string();
+                    }
+                }
+                if kind == "model.streaming" {
+                    let event_kind = payload
+                        .and_then(|p| p.get("kind"))
                         .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string();
+                        .unwrap_or("");
+                    let is_text = event_kind == "text_delta";
+                    if is_text && !started_output {
+                        let item = ResponseItem::Message {
+                            id: None,
+                            role: "assistant".to_string(),
+                            content: vec![codex_protocol::models::ContentItem::OutputText {
+                                text: String::new(),
+                            }],
+                            phase: None,
+                            internal_chat_message_metadata_passthrough: None,
+                        };
+                        let _ = tx.send(Ok(ResponseEvent::OutputItemAdded(item))).await;
+                        started_output = true;
+                    }
+                    let delta = payload
+                        .and_then(|p| p.get("delta"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if is_text && !delta.is_empty() {
+                        response_text.push_str(delta);
+                        if tx
+                            .send(Ok(ResponseEvent::OutputTextDelta(delta.to_string())))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+                if kind == "session.error" {
+                    failed = Some(
+                        payload
+                            .and_then(|p| serde_json::to_string(p).ok())
+                            .unwrap_or_else(|| "unknown ZCode error".to_string()),
+                    );
+                    break;
+                }
+            }
+
+            let status = child.wait().await;
+            match (status, failed) {
+                (Ok(status), None) if status.success() => {
                     let item = ResponseItem::Message {
                         id: None,
                         role: "assistant".to_string(),
@@ -2037,7 +2119,6 @@ impl ModelClientSession {
                         internal_chat_message_metadata_passthrough: None,
                     };
                     let _ = tx.send(Ok(ResponseEvent::OutputItemDone(item))).await;
-
                     let _ = tx
                         .send(Ok(ResponseEvent::Completed {
                             response_id: request_id_for_stream,
@@ -2046,10 +2127,21 @@ impl ModelClientSession {
                         }))
                         .await;
                 }
-                Err(e) => {
-                    let _ = tx.send(Err(ApiError::Stream(e))).await;
+                (Ok(status), None) => {
+                    let _ = tx
+                        .send(Err(ApiError::Stream(format!("ZCode failed ({status})"))))
+                        .await;
+                }
+                (_, Some(message)) => {
+                    let _ = tx.send(Err(ApiError::Stream(message))).await;
+                }
+                (Err(e), None) => {
+                    let _ = tx
+                        .send(Err(ApiError::Stream(format!("ZCode wait failed: {e}"))))
+                        .await;
                 }
             }
+            let _ = session_id;
         });
 
         Ok(codex_api::ResponseStream {
