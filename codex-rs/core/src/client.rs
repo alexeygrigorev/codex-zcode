@@ -24,6 +24,7 @@
 //! fails, normal stream retry/fallback logic handles recovery on the same turn.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
@@ -181,6 +182,71 @@ fn reasoning_effort_for_request(effort: ReasoningEffortConfig) -> ReasoningEffor
         ReasoningEffortConfig::Ultra => ReasoningEffortConfig::Max,
         effort => effort,
     }
+}
+
+const ZCODE_PROVIDER_ID: &str = "zai";
+
+fn prepare_zcode_home(model_slug: &str) -> std::io::Result<PathBuf> {
+    let Some(real_home) = dirs::home_dir() else {
+        return Err(std::io::Error::other("HOME is not set"));
+    };
+    let isolated_home = std::env::temp_dir().join(format!(
+        "zcodex-zcode-home-{}",
+        std::env::var("UID")
+            .ok()
+            .filter(|uid| !uid.is_empty())
+            .unwrap_or_else(|| whoami::username())
+    ));
+    std::fs::create_dir_all(&isolated_home)?;
+
+    let cli_dir = isolated_home.join(".zcode").join("cli");
+    let config_path = cli_dir.join("config.json");
+    let needs_copy = match std::fs::metadata(&config_path) {
+        Ok(metadata) => !metadata.is_file(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(error) => return Err(error),
+    };
+    if needs_copy {
+        std::fs::create_dir_all(&cli_dir)?;
+        std::fs::copy(
+            real_home.join(".zcode").join("cli").join("config.json"),
+            &config_path,
+        )?;
+    }
+
+    let mut config: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&config_path)?)?;
+    let config = config
+        .as_object_mut()
+        .ok_or_else(|| std::io::Error::other("ZCode config is not an object"))?;
+    let provider = config
+        .entry("provider")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let provider = provider
+        .as_object_mut()
+        .ok_or_else(|| std::io::Error::other("ZCode provider config is not an object"))?;
+    let provider_config = provider
+        .entry(ZCODE_PROVIDER_ID)
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let provider_config = provider_config
+        .as_object_mut()
+        .ok_or_else(|| std::io::Error::other("ZCode provider entry is not an object"))?;
+    let models = provider_config
+        .entry("models")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let models = models
+        .as_object_mut()
+        .ok_or_else(|| std::io::Error::other("ZCode provider models are not an object"))?;
+    models.insert(
+        model_slug.to_string(),
+        serde_json::json!({ "name": model_slug }),
+    );
+    config.insert(
+        "model".to_string(),
+        serde_json::Value::String(format!("{ZCODE_PROVIDER_ID}/{model_slug}")),
+    );
+    std::fs::write(&config_path, serde_json::to_string(&config)?)?;
+    Ok(isolated_home)
 }
 
 fn session_telemetry_for_request(
@@ -1934,7 +2000,12 @@ impl ModelClientSession {
             WireApi::Zcode => {
                 let inference_trace_attempt = inference_trace.start_attempt();
                 let api_stream = self
-                    .stream_zcode(prompt, responses_metadata, inference_trace)
+                    .stream_zcode(
+                        model_info.slug.clone(),
+                        prompt,
+                        responses_metadata,
+                        inference_trace,
+                    )
                     .await?;
                 let (stream, _) = map_response_stream(
                     api_stream,
@@ -1954,6 +2025,7 @@ impl ModelClientSession {
     /// This is fast (~8s) compared to the app-server approach.
     async fn stream_zcode(
         &self,
+        model_slug: String,
         prompt: &Prompt,
         _responses_metadata: &CodexResponsesMetadata,
         _inference_trace: &InferenceTraceContext,
@@ -1995,9 +2067,15 @@ impl ModelClientSession {
         let (tx, rx_event) = mpsc::channel::<std::result::Result<ResponseEvent, ApiError>>(64);
         let request_id = format!("zcode_{}", uuid::Uuid::new_v4());
         let request_id_for_stream = request_id.clone();
+        let zcode_home = prepare_zcode_home(&model_slug);
+        if let Err(message) = &zcode_home {
+            warn!("ZCode model override unavailable: {message}");
+        }
+        let zcode_home = zcode_home.ok();
 
         tokio::spawn(async move {
-            let child = Command::new(&node)
+            let mut command = Command::new(&node);
+            command
                 .arg(&runtime)
                 .arg("--prompt")
                 .arg(&user_text)
@@ -2012,8 +2090,11 @@ impl ModelClientSession {
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
-                .kill_on_drop(true)
-                .spawn();
+                .kill_on_drop(true);
+            if let Some(home) = &zcode_home {
+                command.env("HOME", home);
+            }
+            let child = command.spawn();
 
             let mut child = match child {
                 Ok(child) => child,
