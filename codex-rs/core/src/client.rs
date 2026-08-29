@@ -2458,23 +2458,19 @@ impl ModelClientSession {
             match (status, failed) {
                 (Ok(status), None) if status.success() => {
                     if emitted_tool_calls == 0 {
-                        // If deltas already streamed to the client, emitting a
-                        // second completed message would duplicate the answer.
-                        if response_text.is_empty() {
-                            if let Some(final_text) = result_response {
-                                response_text = final_text;
-                            }
-                            let item = ResponseItem::Message {
-                                id: None,
-                                role: "assistant".to_string(),
-                                content: vec![codex_protocol::models::ContentItem::OutputText {
-                                    text: response_text,
-                                }],
-                                phase: None,
-                                internal_chat_message_metadata_passthrough: None,
-                            };
-                            let _ = tx.send(Ok(ResponseEvent::OutputItemDone(item))).await;
+                        if let Some(final_text) = result_response {
+                            response_text = final_text;
                         }
+                        let item = ResponseItem::Message {
+                            id: None,
+                            role: "assistant".to_string(),
+                            content: vec![codex_protocol::models::ContentItem::OutputText {
+                                text: response_text,
+                            }],
+                            phase: None,
+                            internal_chat_message_metadata_passthrough: None,
+                        };
+                        let _ = tx.send(Ok(ResponseEvent::OutputItemDone(item))).await;
                     } else {
                         // ZCode completed one or more tool calls. Codex will
                         // execute them and start a follow-up model turn; a
