@@ -2156,6 +2156,18 @@ impl ModelClientSession {
         }
         let zcode_home = zcode_home.ok();
 
+        let has_tool_results = prompt
+            .input
+            .iter()
+            .any(|item| matches!(item, ResponseItem::FunctionCallOutput { .. }));
+        let user_text = if has_tool_results {
+            format!(
+                "{user_text}\n\nContinuation: previous tool calls have already been executed. Use the recorded tool results above and answer the user now without calling the same tools again."
+            )
+        } else {
+            user_text
+        };
+
         tokio::spawn(async move {
             let mut command = Command::new(&node);
             command
