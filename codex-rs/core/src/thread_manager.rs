@@ -88,6 +88,8 @@ use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::fs;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -374,10 +376,27 @@ pub fn build_models_manager(
     provider.models_manager(config.codex_home.to_path_buf(), model_catalog)
 }
 
-/// Zcode exposes no browsable `/models` endpoint through Codex's normal
-/// discovery path. Surface the configured model as the complete catalog so
-/// `/models` reflects the active provider configuration.
+/// Zcode exposes no browsable `/models` endpoint through Codex's normal discovery path. Build the
+/// catalog from local ZCode configuration, retaining the configured model as a guaranteed entry.
 fn zcode_static_models_catalog(config: &Config) -> ModelsResponse {
+    let cli_config = dirs::home_dir()
+        .map(|home| home.join(".zcode/cli/config.json"))
+        .and_then(|path| read_json_config(&path));
+    let v2_config = dirs::home_dir()
+        .map(|home| home.join(".zcode/v2/config.json"))
+        .and_then(|path| read_json_config(&path));
+    zcode_models_catalog(
+        config.model.as_deref(),
+        cli_config.as_ref(),
+        v2_config.as_ref(),
+    )
+}
+
+fn zcode_models_catalog(
+    configured_model: Option<&str>,
+    cli_config: Option<&serde_json::Value>,
+    v2_config: Option<&serde_json::Value>,
+) -> ModelsResponse {
     use codex_protocol::config_types::ReasoningSummary;
     use codex_protocol::openai_models::ConfigShellToolType;
     use codex_protocol::openai_models::ModelInfo;
@@ -387,66 +406,166 @@ fn zcode_static_models_catalog(config: &Config) -> ModelsResponse {
     use codex_protocol::openai_models::TruncationPolicyConfig;
     use codex_protocol::openai_models::WebSearchToolType;
 
-    let slug = config
-        .model
-        .clone()
-        .unwrap_or_else(|| "glm-5.3-flash".to_string());
-    let display_name = slug.clone();
-    ModelsResponse {
-        models: vec![ModelInfo {
-            slug,
-            display_name,
-            description: Some("ZCode headless agent model".to_string()),
-            default_reasoning_level: Some(ReasoningEffort::Max),
-            supported_reasoning_levels: vec![
-                ReasoningEffortPreset {
-                    effort: ReasoningEffort::None,
-                    description: "No explicit reasoning".to_string(),
-                },
-                ReasoningEffortPreset {
-                    effort: ReasoningEffort::Max,
-                    description: "Deep reasoning".to_string(),
-                },
-            ],
-            shell_type: ConfigShellToolType::UnifiedExec,
-            visibility: ModelVisibility::List,
-            supported_in_api: true,
-            priority: 0,
-            additional_speed_tiers: Vec::new(),
-            service_tiers: Vec::new(),
-            default_service_tier: None,
-            availability_nux: None,
-            upgrade: None,
-            model_messages: None,
-            include_skills_usage_instructions: false,
-            include_plugin_usage_instructions: false,
-            include_apps_usage_instructions: false,
-            supports_reasoning_summary_parameter: false,
-            default_reasoning_summary: ReasoningSummary::None,
-            support_verbosity: false,
-            default_verbosity: None,
-            apply_patch_tool_type: None,
-            web_search_tool_type: WebSearchToolType::Text,
-            truncation_policy: TruncationPolicyConfig::tokens(200_000),
-            supports_image_detail_original: false,
-            context_window: None,
-            max_context_window: None,
-            auto_compact_token_limit: None,
-            comp_hash: None,
-            effective_context_window_percent: 95,
-            experimental_supported_tools: Vec::new(),
-            input_modalities: codex_protocol::openai_models::default_input_modalities(),
-            used_fallback_model_metadata: false,
-            supports_search_tool: true,
-            use_responses_lite: false,
-            node_repl_auto_review_required: false,
-            node_repl_disabled: false,
-            auto_review_model_override: None,
-            model_specialty: None,
-            tool_mode: None,
-            multi_agent_version: Some(MultiAgentVersion::V2),
-        }],
+    let configured_model = configured_model.unwrap_or("glm-5.3-flash");
+    let mut models = Vec::new();
+    let mut seen_models = HashSet::new();
+    let mut add_models = |source: Vec<(String, Option<i64>)>| {
+        for (slug, context_window) in source {
+            let key = slug.to_lowercase();
+            if let Some(existing) = models
+                .iter_mut()
+                .find(|model: &&mut (String, Option<i64>)| model.0.to_lowercase() == key)
+            {
+                if existing.1.is_none() {
+                    existing.1 = context_window;
+                }
+            } else {
+                seen_models.insert(key);
+                models.push((slug, context_window));
+            }
+        }
+    };
+
+    if let Some(cli_models) = zcode_models_from_cli_config(cli_config) {
+        add_models(cli_models);
     }
+    if let Some(v2_models) = zcode_models_from_v2_config(v2_config) {
+        add_models(v2_models);
+    }
+    if !seen_models.contains(&configured_model.to_lowercase()) {
+        models.push((configured_model.to_string(), None));
+    }
+
+    ModelsResponse {
+        models: models
+            .into_iter()
+            .map(|(slug, context_window)| ModelInfo {
+                slug: slug.clone(),
+                display_name: slug,
+                description: Some("ZCode headless agent model".to_string()),
+                default_reasoning_level: Some(ReasoningEffort::Max),
+                supported_reasoning_levels: vec![
+                    ReasoningEffortPreset {
+                        effort: ReasoningEffort::None,
+                        description: "No explicit reasoning".to_string(),
+                    },
+                    ReasoningEffortPreset {
+                        effort: ReasoningEffort::Minimal,
+                        description: "Minimal reasoning".to_string(),
+                    },
+                    ReasoningEffortPreset {
+                        effort: ReasoningEffort::Low,
+                        description: "Low reasoning".to_string(),
+                    },
+                    ReasoningEffortPreset {
+                        effort: ReasoningEffort::Medium,
+                        description: "Medium reasoning".to_string(),
+                    },
+                    ReasoningEffortPreset {
+                        effort: ReasoningEffort::High,
+                        description: "High reasoning".to_string(),
+                    },
+                    ReasoningEffortPreset {
+                        effort: ReasoningEffort::XHigh,
+                        description: "Extra high reasoning".to_string(),
+                    },
+                    ReasoningEffortPreset {
+                        effort: ReasoningEffort::Max,
+                        description: "Deep reasoning".to_string(),
+                    },
+                ],
+                shell_type: ConfigShellToolType::UnifiedExec,
+                visibility: ModelVisibility::List,
+                supported_in_api: true,
+                priority: 0,
+                additional_speed_tiers: Vec::new(),
+                service_tiers: Vec::new(),
+                default_service_tier: None,
+                availability_nux: None,
+                upgrade: None,
+                model_messages: None,
+                include_skills_usage_instructions: false,
+                include_plugin_usage_instructions: false,
+                include_apps_usage_instructions: false,
+                supports_reasoning_summary_parameter: false,
+                default_reasoning_summary: ReasoningSummary::None,
+                support_verbosity: false,
+                default_verbosity: None,
+                apply_patch_tool_type: None,
+                web_search_tool_type: WebSearchToolType::Text,
+                truncation_policy: TruncationPolicyConfig::tokens(200_000),
+                supports_image_detail_original: false,
+                context_window,
+                max_context_window: None,
+                auto_compact_token_limit: None,
+                comp_hash: None,
+                effective_context_window_percent: 95,
+                experimental_supported_tools: Vec::new(),
+                input_modalities: codex_protocol::openai_models::default_input_modalities(),
+                used_fallback_model_metadata: false,
+                supports_search_tool: true,
+                use_responses_lite: false,
+                node_repl_auto_review_required: false,
+                node_repl_disabled: false,
+                auto_review_model_override: None,
+                model_specialty: None,
+                tool_mode: None,
+                multi_agent_version: Some(MultiAgentVersion::V2),
+            })
+            .collect(),
+    }
+}
+
+fn read_json_config(path: &Path) -> Option<serde_json::Value> {
+    let contents = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&contents).ok()
+}
+
+fn zcode_models_from_cli_config(
+    config: Option<&serde_json::Value>,
+) -> Option<Vec<(String, Option<i64>)>> {
+    let models = config?
+        .get("provider")?
+        .get("zai")?
+        .get("models")?
+        .as_object()?;
+    Some(
+        models
+            .keys()
+            .map(|slug| (slug.clone(), None))
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn zcode_models_from_v2_config(
+    config: Option<&serde_json::Value>,
+) -> Option<Vec<(String, Option<i64>)>> {
+    let providers = config?.get("provider")?.as_object()?;
+    let mut models = Vec::new();
+
+    for (provider_id, provider) in providers {
+        if !provider_id.to_lowercase().contains("zai") {
+            continue;
+        }
+        if provider.get("enabled").and_then(serde_json::Value::as_bool) == Some(false) {
+            continue;
+        }
+        let Some(provider_models) = provider
+            .get("models")
+            .and_then(serde_json::Value::as_object)
+        else {
+            continue;
+        };
+        for (slug, model) in provider_models {
+            let context_window = model
+                .get("limit")
+                .and_then(|limit| limit.get("context"))
+                .and_then(serde_json::Value::as_i64);
+            models.push((slug.clone(), context_window));
+        }
+    }
+
+    Some(models)
 }
 
 pub fn thread_store_from_config(

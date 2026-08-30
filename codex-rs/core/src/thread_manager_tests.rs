@@ -46,11 +46,97 @@ use core_test_support::PathExt;
 use core_test_support::responses::mount_models_once;
 use core_test_support::responses::strip_response_item_ids_from_json;
 use pretty_assertions::assert_eq;
+use std::collections::HashSet;
 use std::time::Duration;
 use tempfile::tempdir;
 use wiremock::MockServer;
 
 const TEST_INSTALLATION_ID: &str = "11111111-1111-4111-8111-111111111111";
+
+#[test]
+fn zcode_catalog_merges_sources_and_supports_full_reasoning_range() {
+    let cli_config = serde_json::json!({
+        "provider": {
+            "zai": {
+                "models": {
+                    "GLM-5.2": { "name": "GLM-5.2" }
+                }
+            }
+        }
+    });
+    let v2_config = serde_json::json!({
+        "provider": {
+            "builtin:zai-coding-plan": {
+                "enabled": true,
+                "models": {
+                    "GLM-5.2": { "limit": { "context": 1000000 } },
+                    "GLM-5-Turbo": { "limit": { "context": 200000 } }
+                }
+            },
+            "builtin:other": {
+                "enabled": true,
+                "models": { "Not-ZCode": { "limit": { "context": 1000 } } }
+            },
+            "builtin:zai-disabled": {
+                "enabled": false,
+                "models": { "Disabled": {} }
+            }
+        }
+    });
+
+    let catalog = zcode_models_catalog(Some("glm-5.3-flash"), Some(&cli_config), Some(&v2_config));
+
+    let slugs = catalog
+        .models
+        .iter()
+        .map(|model| model.slug.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(slugs, vec!["GLM-5.2", "GLM-5-Turbo", "glm-5.3-flash"]);
+    assert_eq!(catalog.models.len(), 3);
+    assert_eq!(
+        catalog
+            .models
+            .iter()
+            .map(|model| model.context_window)
+            .collect::<Vec<_>>(),
+        vec![Some(1_000_000), Some(200_000), None]
+    );
+
+    let expected_levels = [
+        codex_protocol::openai_models::ReasoningEffort::None,
+        codex_protocol::openai_models::ReasoningEffort::Minimal,
+        codex_protocol::openai_models::ReasoningEffort::Low,
+        codex_protocol::openai_models::ReasoningEffort::Medium,
+        codex_protocol::openai_models::ReasoningEffort::High,
+        codex_protocol::openai_models::ReasoningEffort::XHigh,
+        codex_protocol::openai_models::ReasoningEffort::Max,
+    ];
+    for model in &catalog.models {
+        let levels = model
+            .supported_reasoning_levels
+            .iter()
+            .map(|preset| preset.effort.clone())
+            .collect::<HashSet<_>>();
+        assert!(levels.len() >= 5);
+        for expected in &expected_levels {
+            assert!(levels.contains(expected));
+        }
+        assert_eq!(
+            model.default_reasoning_level,
+            Some(codex_protocol::openai_models::ReasoningEffort::Max)
+        );
+    }
+}
+
+#[test]
+fn zcode_catalog_falls_back_when_json_sources_are_invalid() {
+    let invalid_json = serde_json::Value::String("not a config object".to_string());
+
+    let catalog = zcode_models_catalog(Some("Configured"), Some(&invalid_json), None);
+
+    assert_eq!(catalog.models.len(), 1);
+    assert_eq!(catalog.models[0].slug, "Configured");
+}
 
 /// Controls without a custom allocation policy still produce distinct thread identifiers.
 #[test]
