@@ -88,7 +88,14 @@ impl EventProcessorWithHumanOutput {
                 eprintln!("{}", "apply patch".style(self.bold));
             }
             ThreadItem::CollabAgentToolCall { tool, .. } => {
-                eprintln!("{} {:?}", "collab:".style(self.bold), tool);
+                eprintln!("{} {tool:?} started", "collab:".style(self.bold));
+            }
+            ThreadItem::SubAgentActivity {
+                kind,
+                agent_path,
+                ..
+            } => {
+                eprintln!("{} {kind:?} {agent_path}", "subagent:".style(self.bold));
             }
             _ => {}
         }
@@ -201,6 +208,36 @@ impl EventProcessorWithHumanOutput {
             }
             ThreadItem::ContextCompaction { .. } => {
                 eprintln!("{}", "context compacted".style(self.dimmed));
+            }
+            ThreadItem::CollabAgentToolCall {
+                tool,
+                prompt,
+                receiver_thread_ids,
+                ..
+            } => {
+                let targets = receiver_thread_ids.join(", ");
+                match &prompt {
+                    Some(prompt) if !prompt.trim().is_empty() => {
+                        eprintln!(
+                            "{} {tool:?} completed for {targets}\n{}",
+                            "collab:".style(self.bold),
+                            prompt.style(self.dimmed)
+                        );
+                    }
+                    _ => {
+                        eprintln!(
+                            "{} {tool:?} completed for {targets}",
+                            "collab:".style(self.bold)
+                        );
+                    }
+                }
+            }
+            ThreadItem::SubAgentActivity {
+                kind,
+                agent_path,
+                ..
+            } => {
+                eprintln!("{} {kind:?} {agent_path}", "subagent:".style(self.bold));
             }
             _ => {}
         }
