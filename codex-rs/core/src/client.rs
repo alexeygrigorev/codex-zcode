@@ -2448,7 +2448,7 @@ impl ModelClientSession {
                                 name: mapped_name,
                                 namespace: None,
                                 arguments: String::new(),
-                                encrypted_function_args: None,
+                                encrypted_function_args: Some(Vec::new()),
                                 call_id,
                                 internal_chat_message_metadata_passthrough: None,
                             };
@@ -2512,7 +2512,7 @@ impl ModelClientSession {
                                 name: pending.name,
                                 namespace: None,
                                 arguments: authoritative,
-                                encrypted_function_args: None,
+                                encrypted_function_args: Some(Vec::new()),
                                 call_id: pending.call_id,
                                 internal_chat_message_metadata_passthrough: None,
                             };
@@ -2551,7 +2551,7 @@ impl ModelClientSession {
                                 name: pending.name,
                                 namespace: None,
                                 arguments,
-                                encrypted_function_args: None,
+                                encrypted_function_args: Some(Vec::new()),
                                 call_id: pending.call_id,
                                 internal_chat_message_metadata_passthrough: None,
                             };
@@ -2615,8 +2615,11 @@ impl ModelClientSession {
                         .await;
                 }
                 (Ok(status), None) => {
+                    warn!("ZCode exited unsuccessfully ({status}); will retry");
                     let _ = tx
-                        .send(Err(ApiError::Stream(format!("ZCode failed ({status})"))))
+                        .send(Err(ApiError::Stream(format!(
+                            "ZCode exited unsuccessfully ({status})"
+                        ))))
                         .await;
                 }
                 (_, Some(message)) => {
