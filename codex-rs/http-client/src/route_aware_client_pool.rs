@@ -101,6 +101,20 @@ pub enum RouteAwareRequestError {
     Timeout,
 }
 
+/// Native TLS is optional; when the feature is off, rustls-backed clients can
+/// never surface a native-tls error, so classification returns false.
+fn probe_native_tls_error(error: &(dyn std::error::Error + 'static)) -> bool {
+    #[cfg(feature = "native-tls-probe")]
+    {
+        error.downcast_ref::<native_tls::Error>().is_some()
+    }
+    #[cfg(not(feature = "native-tls-probe"))]
+    {
+        let _ = error;
+        false
+    }
+}
+
 impl RouteAwareRequestError {
     /// Classifies transport, proxy, and certificate failures without exposing request details.
     pub fn failure_class(&self) -> Option<RouteFailureClass> {
@@ -119,9 +133,7 @@ impl RouteAwareRequestError {
 
         let mut source: Option<&(dyn std::error::Error + 'static)> = Some(self);
         while let Some(error) = source {
-            if error.downcast_ref::<rustls::Error>().is_some()
-                || error.downcast_ref::<native_tls::Error>().is_some()
-            {
+            if error.downcast_ref::<rustls::Error>().is_some() || probe_native_tls_error(error) {
                 return Some(RouteFailureClass::TlsError);
             }
             if error.to_string() == "tunnel error: proxy authorization required" {

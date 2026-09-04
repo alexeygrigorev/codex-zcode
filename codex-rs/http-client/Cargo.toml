@@ -4,12 +4,17 @@ license.workspace = true
 name = "codex-http-client"
 version.workspace = true
 
+[features]
+# Enables native_tls::Error classification in the route-aware pool. Off by
+# default so Linux builds without OpenSSL development files still compile.
+native-tls-probe = ["dep:native-tls"]
+
 [dependencies]
 bytes = { workspace = true }
 codex-utils-rustls-provider = { workspace = true }
 futures = { workspace = true }
 http = { workspace = true }
-native-tls = "0.2"
+native-tls = { version = "0.2", optional = true }
 opentelemetry = { workspace = true }
 reqwest = { workspace = true, features = ["json", "rustls-tls-native-roots", "stream"] }
 rustls = { workspace = true }
