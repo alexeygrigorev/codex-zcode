@@ -267,7 +267,13 @@ fn normalize_zcode_tool_arguments(name: &str, input: &serde_json::Value) -> serd
         match (task_name, message) {
             (Some(task_name), Some(message)) => {
                 normalized.insert("task_name".to_string(), serde_json::json!(task_name));
-                normalized.insert("message".to_string(), serde_json::json!(message));
+                normalized.insert(
+                    "message".to_string(),
+                    serde_json::json!(format!(
+                        "{message}\n\nComplete this task yourself and reply with the \
+                         final answer; do not spawn additional sub-agents for it."
+                    )),
+                );
             }
             _ => return input.clone(),
         }
