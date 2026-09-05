@@ -29,7 +29,7 @@ ZCode's runtime or credentials.
 You need:
 
 1. The `zcodex` release binary from GitHub Releases.
-2. ZCode Desktop 3.9.2 or newer, which provides:
+2. ZCode Desktop 3.11.2 or newer, which provides:
    `/opt/ZCode/resources/glm/zcode.cjs`
 3. ZCode CLI credentials, normally under `~/.zcode/cli/config.json`.
 
@@ -38,15 +38,15 @@ with this project.
 
 ## Download Release
 
-Download the matching binary from:
+Download the matching binary from the latest GitHub Release, for example:
 
-https://github.com/alexeygrigorev/codex-zcode/releases/tag/zcode-v0.1.0
+https://github.com/alexeygrigorev/codex-zcode/releases/tag/zcode-3.11.2-codex-0.153.4
 
-Linux AMD64 example:
+Linux AMD64 example (replace the tag with the release you want):
 
 ```bash
 curl -fL \
-  https://github.com/alexeygrigorev/codex-zcode/releases/download/zcode-v0.1.0/zcodex-linux-amd64 \
+  https://github.com/alexeygrigorev/codex-zcode/releases/download/zcode-3.11.2-codex-0.153.4/zcodex-linux-amd64 \
   -o ~/.local/bin/zcodex
 chmod +x ~/.local/bin/zcodex
 ```
@@ -55,7 +55,7 @@ Linux ARM64:
 
 ```bash
 curl -fL \
-  https://github.com/alexeygrigorev/codex-zcode/releases/download/zcode-v0.1.0/zcodex-linux-arm64 \
+  https://github.com/alexeygrigorev/codex-zcode/releases/download/zcode-3.11.2-codex-0.153.4/zcodex-linux-arm64 \
   -o ~/.local/bin/zcodex
 chmod +x ~/.local/bin/zcodex
 ```
@@ -84,8 +84,8 @@ Typical timings:
 Use GitHub Actions for distributable release binaries.
 
 ```bash
-git tag zcode-v0.2.0
-git push origin zcode-v0.2.0
+git tag zcode-3.11.2-codex-0.153.4
+git push origin zcode-3.11.2-codex-0.153.4
 ```
 
 The workflow checks the Zcode extension, builds Linux AMD64 and ARM64 release
@@ -117,7 +117,8 @@ Supporting scripts:
   from the desktop OAuth configuration after Desktop updates migrate it away
 - `scripts/install-zcodex.sh` — binary-only install from GitHub Releases
 - `tests/zcodex-integration.test.mjs` — end-to-end suite (exec, tool loop,
-  model control, native subagent spawn); `node --test tests/` from the repo
+  model control, native subagent spawn);
+  `node --test tests/zcodex-integration.test.mjs` from the repo
   root on a machine with credentials
 
 ## Environment
@@ -145,4 +146,63 @@ wire_api = "zcode"
 ## Upstream Synchronization
 
 Upstream's `README.md` is intentionally unchanged. This project documents itself
-in `ABOUT.md` so upstream README changes can be merged without conflict.
+in `ABOUT.md` so upstream README changes can merge without conflict.
+
+The fork tracks upstream with a remote:
+
+```bash
+git remote add upstream https://github.com/openai/codex.git
+```
+
+Sync process (run from `main` with a clean tree):
+
+1. `git fetch upstream main` (add `--tags` when you need release versions).
+2. Check drift: `git log --oneline <fork-point>..upstream/main | wc -l`.
+3. Preview collisions with fork-touched files:
+   `comm -12 <(git diff <fork-point>..upstream/main --name-only | sort) \
+     <(git diff <fork-point>..HEAD --name-only | sort)`.
+4. `git merge upstream/main --no-commit`.
+5. Triage conflicts. Known recurring resolutions:
+   - `codex-rs/Cargo.toml` reqwest/sentry: keep the fork's rustls-only
+     (`default-features = false`) options, take upstream version bumps.
+   - `codex-rs/Cargo.lock`: take upstream's (`git checkout --theirs`),
+     then rebuild once so Cargo re-registers the `codex-zcode` member
+     and fetches any new upstream dependencies.
+   - Fork behavior additions (Zcode wire checks, model presets): rebase
+     them onto renamed upstream symbols (e.g. new function parameters).
+   - Upstream API changes (e.g. lifetime-parameterized `ToolCall`): migrate
+     `codex-rs/ext/zcode` following an upstream in-tree extension such as
+     `ext/web-search`.
+   - New upstream `.github/workflows/*` files arrive live; move them to
+     `.github/workflows.disabled/` (renamed `.disabled`) to keep the
+     no-upstream-CI invariant. Edits to disabled workflows merge into the
+     renamed copies harmlessly.
+6. Rebuild: `cargo build --profile dev-small -p codex-cli --bin zcodex`
+   (drop `--offline` if upstream added dependencies missing from the cache),
+   then verify `--locked` builds for release CI.
+7. Compile-check tests: `cargo check --profile dev-small --tests
+   -p codex-core -p codex-zcode` (plus any crate with merge fallout).
+8. Smoke test: `zcodex --version` and `zcodex "hello" < /dev/null`
+   (expect `stdin is not a terminal`, same as stock `zcodex`).
+9. Commit the merge, then commit any post-merge fixes separately.
+
+## Versioning
+
+Releases are tagged `zcode-<ZCODE>-codex-<CODEX>` combining both sides,
+for example `zcode-3.11.2-codex-0.153.4`:
+
+- `<ZCODE>` is the ZCode Desktop stable version the release was tested
+  against (`scripts/download-zcode-release.sh` prints it; the bundle name
+  embeds it too).
+- `<CODEX>` is the latest upstream Codex release (`rust-vX.Y.Z` tag)
+  contained in the merge.
+
+The `VERSION` file in each GitHub Release holds `<ZCODE>-codex-<CODEX>`
+(the tag minus the leading `zcode-`). The workflow
+(`.github/workflows/zcode-release.yml`) triggers on `zcode-*-codex-*`.
+
+`Cargo.toml` workspace version intentionally stays `0.0.0`: that marks
+every build as a source build, which keeps the upstream self-update
+checks permanently disabled. Do not stamp the combined version into
+Cargo — a parseable version would re-enable update prompts pointing at
+OpenAI releases.
