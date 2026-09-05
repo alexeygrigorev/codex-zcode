@@ -27,6 +27,36 @@ pub fn install<C: Sync>(registry: &mut ExtensionRegistryBuilder<C>) {
     registry.tool_contributor(Arc::new(ZCodeExtension));
 }
 
+/// Loads the ZCode prompt from a temp file and requires the runtime.
+///
+/// Keeps large prompts off `execve` argv so long tasks cannot fail with
+/// `E2BIG` ("Argument list too long"); ZCode sees the same `--prompt` value.
+const ZCODE_PROMPT_LOADER: &str = r#"const fs=require("fs");const r=process.argv[1];const f=process.argv[2];const p=fs.readFileSync(f,"utf8");process.argv=[process.argv[0],r,"--prompt",p,...process.argv.slice(3)];require(r);"#;
+
+fn write_zcode_prompt_file(prompt: &str) -> std::io::Result<std::path::PathBuf> {
+    use std::io::Write as _;
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let count = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let path = std::env::temp_dir().join(format!(
+        "zcode-prompt-{}-{count}-{nanos}.txt",
+        std::process::id()
+    ));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path)?;
+    file.write_all(prompt.as_bytes())?;
+    Ok(path)
+}
+
 const ZCODE_PROMPT_TOOL_NAME: &str = "zcode_prompt";
 
 #[derive(Debug, Default)]
@@ -137,11 +167,17 @@ impl ToolExecutor<ToolCall> for ZCodePromptTool {
             let runtime = std::env::var("ZCODE_CJS")
                 .unwrap_or_else(|_| "/opt/ZCode/resources/glm/zcode.cjs".to_string());
             let node = std::env::var("ZCODE_NODE").unwrap_or_else(|_| "node".to_string());
+            let prompt_file = write_zcode_prompt_file(&args.prompt).map_err(|error| {
+                codex_extension_api::FunctionCallError::RespondToModel(format!(
+                    "could not write ZCode prompt file: {error}"
+                ))
+            })?;
             let mut command = Command::new(node);
             command
+                .arg("-e")
+                .arg(ZCODE_PROMPT_LOADER)
                 .arg(&runtime)
-                .arg("--prompt")
-                .arg(&args.prompt)
+                .arg(&prompt_file)
                 .args(["--json", "--mode", &mode, "--cwd", &cwd]);
             if let Some(session_id) = requested_session.as_deref() {
                 command.args(["--resume", session_id]);
@@ -157,8 +193,9 @@ impl ToolExecutor<ToolCall> for ZCodePromptTool {
                 .kill_on_drop(true);
 
             const ZCODE_PROMPT_TIMEOUT: Duration = Duration::from_secs(20 * 60);
-            let output = timeout(ZCODE_PROMPT_TIMEOUT, command.output())
-                .await
+            let output = timeout(ZCODE_PROMPT_TIMEOUT, command.output()).await;
+            let _ = std::fs::remove_file(&prompt_file);
+            let output = output
                 .map_err(|_| {
                     codex_extension_api::FunctionCallError::RespondToModel(
                         "ZCode timed out after 20 minutes".to_string(),
