@@ -214,7 +214,8 @@ enum Subcommand {
     Fork(ForkCommand),
 
     /// [EXPERIMENTAL] Browse tasks from Codex Cloud and apply changes locally.
-    #[clap(name = "cloud", alias = "cloud-tasks")]
+    /// Hidden for zcodex: TUI-only workflow, no Cloud tasks backend.
+    #[clap(name = "cloud", alias = "cloud-tasks", hide = true)]
     Cloud(CloudTasksCli),
 
     /// Internal: run the responses API proxy.
