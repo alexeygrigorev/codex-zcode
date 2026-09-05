@@ -55,8 +55,8 @@ case "${channel,,}" in
 esac
 
 case "$(uname -s)-$(uname -m)" in
-  Linux-x86_64) platform="linux-x86_64"; asset_platform="linux-x64" ;;
-  Linux-aarch64) platform="linux-aarch64"; asset_platform="linux-arm64" ;;
+  Linux-x86_64) platform="linux-x86_64" ;;
+  Linux-aarch64) platform="linux-aarch64" ;;
   *) echo "unsupported platform: $(uname -s)-$(uname -m)" >&2; exit 1 ;;
 esac
 
@@ -74,7 +74,15 @@ declared_size=""
 expected_b64=""
 asset_url=""
 entry="$(python3 - "$manifest_path" "$asset" <<'PY'
-import sys, yaml
+import sys
+
+try:
+    import yaml
+except ImportError:
+    raise SystemExit(
+        "PyYAML is required to parse the release manifest "
+        "(python3 -m pip install pyyaml)"
+    )
 
 path, asset = sys.argv[1:]
 with open(path, encoding="utf-8") as f:
