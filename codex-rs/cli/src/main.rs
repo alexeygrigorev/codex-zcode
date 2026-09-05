@@ -170,6 +170,9 @@ enum Subcommand {
     Completion(CompletionCommand),
 
     /// Update Codex to the latest version.
+    /// Hidden for zcodex: the upstream installer would replace zcodex with
+    /// OpenAI's Codex. zcodex ships via its own GitHub releases instead.
+    #[clap(hide = true)]
     Update,
 
     /// Diagnose local Codex installation, config, auth, and runtime health.
