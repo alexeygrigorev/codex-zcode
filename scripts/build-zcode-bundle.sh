@@ -6,7 +6,7 @@
 # The result is a single tar.gz that runs on any linux-x64 devbox with node
 # >= 18 on PATH; no ZCode Desktop install required.
 #
-# Usage: scripts/build-zcode-bundle.sh [--out DIR] [--skip-build] [--keep-strip]
+# Usage: scripts/build-zcode-bundle.sh [--out DIR] [--skip-build]
 set -euo pipefail
 
 usage() {
@@ -56,7 +56,13 @@ fi
 stripped=""
 if command -v strip >/dev/null 2>&1; then
   stripped="$(mktemp)"
-  cp "$binary" "$stripped" && strip "$stripped" && binary="$stripped"
+  if cp "$binary" "$stripped" && strip "$stripped"; then
+    binary="$stripped"
+  else
+    echo "strip failed; shipping unstripped binary" >&2
+    rm -f "$stripped"
+    stripped=""
+  fi
 elif [[ -x "${HOME}/.local/opt/zig/zig" ]]; then
   stripped="$(mktemp -d)"
   if "${HOME}/.local/opt/zig/zig" objcopy --strip-all "$binary" "$stripped/zcodex" 2>/dev/null; then
