@@ -2839,6 +2839,7 @@ impl ModelClientSession {
                         .send(Ok(ResponseEvent::Completed {
                             response_id: request_id_for_stream,
                             token_usage: None,
+                            usage_metadata: None,
                             end_turn: Some(true),
                         }))
                         .await;

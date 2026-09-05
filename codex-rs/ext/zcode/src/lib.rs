@@ -80,7 +80,7 @@ impl ToolContributor for ZCodeExtension {
         &self,
         _session_store: &ExtensionData,
         _thread_store: &ExtensionData,
-    ) -> Vec<Arc<dyn ToolExecutor<ToolCall>>> {
+    ) -> Vec<Arc<dyn for<'call> ToolExecutor<ToolCall<'call>>>> {
         vec![Arc::new(ZCodePromptTool)]
     }
 }
@@ -88,7 +88,7 @@ impl ToolContributor for ZCodeExtension {
 #[derive(Debug, Default)]
 struct ZCodePromptTool;
 
-impl ToolExecutor<ToolCall> for ZCodePromptTool {
+impl<'call> ToolExecutor<ToolCall<'call>> for ZCodePromptTool {
     fn tool_name(&self) -> ToolName {
         ToolName::plain(ZCODE_PROMPT_TOOL_NAME)
     }
@@ -140,7 +140,13 @@ impl ToolExecutor<ToolCall> for ZCodePromptTool {
         false
     }
 
-    fn handle(&self, call: ToolCall) -> codex_extension_api::ToolExecutorFuture<'_> {
+    fn handle<'a>(
+        &'a self,
+        call: ToolCall<'call>,
+    ) -> codex_extension_api::ToolExecutorFuture<'a>
+    where
+        'call: 'a,
+    {
         Box::pin(async move {
             let args: ZCodePromptArgs =
                 serde_json::from_str(call.function_arguments()?).map_err(|error| {
@@ -255,7 +261,7 @@ struct ZaiSearchArgs {
     count: Option<u32>,
 }
 
-impl ToolExecutor<ToolCall> for ZaiSearchTool {
+impl<'call> ToolExecutor<ToolCall<'call>> for ZaiSearchTool {
     fn tool_name(&self) -> ToolName {
         ToolName::plain(ZAI_SEARCH_TOOL_NAME)
     }
@@ -292,7 +298,13 @@ impl ToolExecutor<ToolCall> for ZaiSearchTool {
         true
     }
 
-    fn handle(&self, call: ToolCall) -> codex_extension_api::ToolExecutorFuture<'_> {
+    fn handle<'a>(
+        &'a self,
+        call: ToolCall<'call>,
+    ) -> codex_extension_api::ToolExecutorFuture<'a>
+    where
+        'call: 'a,
+    {
         Box::pin(async move {
             let args: ZaiSearchArgs =
                 serde_json::from_str(call.function_arguments()?).map_err(|error| {
@@ -442,7 +454,7 @@ impl ToolContributor for ZaiSearchExtension {
         &self,
         _session_store: &ExtensionData,
         _thread_store: &ExtensionData,
-    ) -> Vec<Arc<dyn codex_extension_api::ToolExecutor<ToolCall>>> {
+    ) -> Vec<Arc<dyn for<'call> codex_extension_api::ToolExecutor<ToolCall<'call>>>> {
         vec![Arc::new(ZaiSearchTool)]
     }
 }

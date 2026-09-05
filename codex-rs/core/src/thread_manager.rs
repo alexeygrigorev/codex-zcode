@@ -493,6 +493,8 @@ fn zcode_models_catalog(
                 default_service_tier: None,
                 availability_nux: None,
                 upgrade: None,
+                guardian: None,
+                multi_agent_reasoning_effort: None,
                 model_messages: None,
                 include_skills_usage_instructions: false,
                 include_plugin_usage_instructions: false,
