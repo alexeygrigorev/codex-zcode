@@ -392,7 +392,6 @@ test("native subagent spawn", async () => {
     return dir;
   });
   const marker = `CHILD_OK_${process.pid}`;
-  const markerSlug = marker.toLowerCase().replace(/_/g, "");
 
   try {
     const result = await runProcess(
