@@ -409,6 +409,31 @@ fn prepare_zcode_home(model_slug: &str) -> std::io::Result<PathBuf> {
     Ok(isolated_home)
 }
 
+/// Loads the ZCode prompt from a temp file and requires the runtime.
+///
+/// Spawning `node zcode.cjs --prompt <text>` with the prompt inline hits
+/// `E2BIG` ("Argument list too long") once the flattened transcript exceeds
+/// `MAX_ARG_STRLEN` (~128 KiB). Passing only small argv entries (loader,
+/// runtime path, prompt file path) and rebuilding the real argv in-process
+/// avoids the `execve` limit without changing what ZCode sees.
+const ZCODE_PROMPT_LOADER: &str = r#"const fs=require("fs");const r=process.argv[1];const f=process.argv[2];const p=fs.readFileSync(f,"utf8");process.argv=[process.argv[0],r,"--prompt",p,...process.argv.slice(3)];require(r);"#;
+
+fn write_zcode_prompt_file(prompt: &str) -> std::io::Result<PathBuf> {
+    use std::io::Write as _;
+    let path =
+        std::env::temp_dir().join(format!("zcode-prompt-{}", uuid::Uuid::new_v4().as_simple()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path)?;
+    file.write_all(prompt.as_bytes())?;
+    Ok(path)
+}
+
 fn session_telemetry_for_request(
     session_telemetry: &SessionTelemetry,
     request: &ResponsesApiRequest,
@@ -2304,11 +2329,27 @@ impl ModelClientSession {
         };
 
         tokio::spawn(async move {
+            let prompt_file = match write_zcode_prompt_file(&user_text) {
+                Ok(path) => path,
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(ApiError::Stream(format!(
+                            "could not write ZCode prompt file: {e}"
+                        ))))
+                        .await;
+                    return;
+                }
+            };
+            drop(user_text);
+            // Prompt goes via a temp file and is re-injected into argv
+            // in-process by the loader, so long transcripts cannot hit
+            // execve E2BIG ("Argument list too long").
             let mut command = Command::new(&node);
             command
+                .arg("-e")
+                .arg(ZCODE_PROMPT_LOADER)
                 .arg(&runtime)
-                .arg("--prompt")
-                .arg(&user_text)
+                .arg(&prompt_file)
                 .args([
                     "--output-format",
                     "stream-json",
@@ -2329,6 +2370,7 @@ impl ModelClientSession {
             let mut child = match child {
                 Ok(child) => child,
                 Err(e) => {
+                    let _ = std::fs::remove_file(&prompt_file);
                     let _ = tx
                         .send(Err(ApiError::Stream(format!(
                             "could not launch ZCode: {e}"
@@ -2339,6 +2381,7 @@ impl ModelClientSession {
             };
 
             let Some(stdout) = child.stdout.take() else {
+                let _ = std::fs::remove_file(&prompt_file);
                 let _ = tx
                     .send(Err(ApiError::Stream(
                         "ZCode did not expose stdout".to_string(),
@@ -2347,7 +2390,8 @@ impl ModelClientSession {
                 return;
             };
 
-            use tokio::io::{AsyncBufReadExt, BufReader};
+            use tokio::io::AsyncBufReadExt;
+            use tokio::io::BufReader;
             let reader = BufReader::new(stdout);
             let mut lines = reader.lines();
             let mut response_text = String::new();
@@ -2637,6 +2681,7 @@ impl ModelClientSession {
                         .await;
                 }
             }
+            let _ = std::fs::remove_file(&prompt_file);
             let _ = session_id;
         });
 
