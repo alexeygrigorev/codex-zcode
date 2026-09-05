@@ -14,8 +14,13 @@ esac
 
 mkdir -p "$INSTALL_DIR" "$CONFIG_DIR"
 echo "Downloading $asset..."
-curl -fL "$REPO_URL/releases/latest/download/$asset" -o "$INSTALL_DIR/zcodex"
-chmod +x "$INSTALL_DIR/zcodex"
+# Download to a temp file first so a failed download never leaves a broken
+# binary at the install location.
+tmp="$(mktemp)"
+trap 'rm -f "$tmp"' EXIT
+curl -fL "$REPO_URL/releases/latest/download/$asset" -o "$tmp"
+chmod +x "$tmp"
+mv "$tmp" "$INSTALL_DIR/zcodex"
 
 if [[ ! -f "$CONFIG_DIR/config.toml" ]]; then
     echo "Writing default config to $CONFIG_DIR/config.toml..."
