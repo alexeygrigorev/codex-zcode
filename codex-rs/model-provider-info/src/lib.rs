@@ -85,12 +85,15 @@ impl<'de> Deserialize<'de> for WireApi {
         D: serde::Deserializer<'de>,
     {
         let value = String::deserialize(deserializer)?;
-            match value.as_str() {
-                "responses" => Ok(Self::Responses),
-                "zcode" => Ok(Self::Zcode),
-                "chat" => Err(serde::de::Error::custom(CHAT_WIRE_API_REMOVED_ERROR)),
-                _ => Err(serde::de::Error::unknown_variant(&value, &["responses", "zcode"])),
-            }
+        match value.as_str() {
+            "responses" => Ok(Self::Responses),
+            "zcode" => Ok(Self::Zcode),
+            "chat" => Err(serde::de::Error::custom(CHAT_WIRE_API_REMOVED_ERROR)),
+            _ => Err(serde::de::Error::unknown_variant(
+                &value,
+                &["responses", "zcode"],
+            )),
+        }
     }
 }
 

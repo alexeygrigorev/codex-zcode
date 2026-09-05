@@ -91,9 +91,7 @@ impl EventProcessorWithHumanOutput {
                 eprintln!("{} {tool:?} started", "collab:".style(self.bold));
             }
             ThreadItem::SubAgentActivity {
-                kind,
-                agent_path,
-                ..
+                kind, agent_path, ..
             } => {
                 eprintln!("{} {kind:?} {agent_path}", "subagent:".style(self.bold));
             }
@@ -233,9 +231,7 @@ impl EventProcessorWithHumanOutput {
                 }
             }
             ThreadItem::SubAgentActivity {
-                kind,
-                agent_path,
-                ..
+                kind, agent_path, ..
             } => {
                 eprintln!("{} {kind:?} {agent_path}", "subagent:".style(self.bold));
             }
