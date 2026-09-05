@@ -28,6 +28,11 @@ if [[ ! -f "${V2_CONFIG}" ]]; then
     exit 1
 fi
 
+[[ "${MODEL}" == */* ]] || {
+    echo "Error: model must be <provider>/<slug>, e.g. zai/glm-5.3-flash" >&2
+    exit 2
+}
+
 mkdir -p "${CLI_DIR}"
 
 MODEL="${MODEL}" V2_CONFIG="${V2_CONFIG}" CLI_CONFIG="${CLI_CONFIG}" python3 - <<'PY'
