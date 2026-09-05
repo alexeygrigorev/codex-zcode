@@ -148,7 +148,9 @@ wire_api = "zcode"
 Upstream's `README.md` is intentionally unchanged. This project documents itself
 in `ABOUT.md` so upstream README changes can merge without conflict.
 
-The fork tracks upstream with a remote:
+Sync is one-way: upstream (`openai/codex`) flows into this fork, never back.
+The fork tracks upstream with a remote (already configured in fresh clones;
+add once otherwise):
 
 ```bash
 git remote add upstream https://github.com/openai/codex.git
@@ -157,10 +159,16 @@ git remote add upstream https://github.com/openai/codex.git
 Sync process (run from `main` with a clean tree):
 
 1. `git fetch upstream main` (add `--tags` when you need release versions).
-2. Check drift: `git log --oneline <fork-point>..upstream/main | wc -l`.
+2. Find the fork point and check drift:
+   ```bash
+   fork_point="$(git merge-base HEAD upstream/main)"
+   git log --oneline "$fork_point"..upstream/main | wc -l
+   ```
 3. Preview collisions with fork-touched files:
-   `comm -12 <(git diff <fork-point>..upstream/main --name-only | sort) \
-     <(git diff <fork-point>..HEAD --name-only | sort)`.
+   ```bash
+   comm -12 <(git diff "$fork_point"..upstream/main --name-only | sort) \
+     <(git diff "$fork_point"..HEAD --name-only | sort)
+   ```
 4. `git merge upstream/main --no-commit`.
 5. Triage conflicts. Known recurring resolutions:
    - `codex-rs/Cargo.toml` reqwest/sentry: keep the fork's rustls-only
@@ -184,7 +192,18 @@ Sync process (run from `main` with a clean tree):
    -p codex-core -p codex-zcode` (plus any crate with merge fallout).
 8. Smoke test: `zcodex --version` and `zcodex "hello" < /dev/null`
    (expect `stdin is not a terminal`, same as stock `zcodex`).
-9. Commit the merge, then commit any post-merge fixes separately.
+9. Commit the merge. Pitfall: fixes you make after resolving conflicts are
+   unstaged worktree changes — run `git status` and stage everything you
+   intend (`git add` the post-merge fixes too) before committing, otherwise
+   the merge commit captures the pre-fix state. Prefer committing the merge
+   first, then post-merge fixes as a separate commit.
+10. Push to origin when ready: `git push origin main`.
+
+Release checklist after a sync: confirm the ZCode stable runtime
+(`scripts/download-zcode-release.sh` prints the manifest version; compare
+with the installed deb via `--verify-installed`), run the end-to-end suite
+(`node --test tests/zcodex-integration.test.mjs`), then cut a release tag
+following [Versioning](#versioning).
 
 ## Versioning
 
