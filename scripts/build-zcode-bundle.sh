@@ -50,6 +50,25 @@ if [[ "$skip_build" == false ]]; then
 fi
 [[ -f "$binary" ]] || { echo "binary missing: $binary" >&2; exit 1; }
 
+# The release profile keeps line tables (debug = "line-tables-only"), which
+# here account for ~1 GB. Strip them with zig when available (no binutils on
+# minimal devboxes); fall back to the unstripped binary with a warning.
+stripped=""
+if command -v strip >/dev/null 2>&1; then
+  stripped="$(mktemp)"
+  cp "$binary" "$stripped" && strip "$stripped" && binary="$stripped"
+elif [[ -x "${HOME}/.local/opt/zig/zig" ]]; then
+  stripped="$(mktemp -d)"
+  if "${HOME}/.local/opt/zig/zig" objcopy --strip-all "$binary" "$stripped/zcodex" 2>/dev/null; then
+    binary="$stripped/zcodex"
+  else
+    echo "zig objcopy failed; shipping unstripped binary" >&2
+    stripped=""
+  fi
+else
+  echo "no strip tool found; shipping unstripped binary" >&2
+fi
+
 # --------------------------------------------------------------- runtime ----
 echo "==> Downloading official ZCode deb (SHA-512 verified)"
 deb_out="$out_dir/zcode-deb"
@@ -161,7 +180,7 @@ DOCS
 echo "==> Packing"
 tarball="$out_dir/$bundle_name.tar.gz"
 tar -czf "$tarball" -C "$out_dir" "$bundle_name"
-rm -rf "$stage"
+rm -rf "$stage" "$stripped"
 
 echo "Bundle: $tarball ($(du -h "$tarball" | cut -f1))"
 echo "Unpack anywhere, then: ./$bundle_name/install.sh"
