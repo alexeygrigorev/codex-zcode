@@ -92,6 +92,34 @@ The workflow checks the Zcode extension, builds Linux AMD64 and ARM64 release
 binaries, verifies them, and publishes a GitHub Release with `SHA256SUMS`.
 Typical CI wall time is 40-45 minutes.
 
+## Self-Contained Bundle
+
+For a remote devbox, build one executable package that carries both the
+release-built `zcodex` binary and the official ZCode headless runtime
+(extracted from the SHA-512-verified desktop deb — the setup that keeps
+coding-plan OAuth discounts):
+
+```bash
+scripts/build-zcode-bundle.sh
+```
+
+The result under `dist/` is a tar.gz you can unpack anywhere (linux-x64,
+bash, node >= 18; no ZCode Desktop required) and install with
+`./install.sh`. The bundled launcher prefers a `/opt` desktop-installed
+runtime when present and falls back to the bundled copy; override with
+`ZCODE_CJS`. Rebuild the bundle to pick up a newer ZCode release.
+
+Supporting scripts:
+
+- `scripts/download-zcode-release.sh` — fetch and checksum-verify the
+  official deb; `--verify-installed` compares it against `/opt`
+- `scripts/ensure-zcode-cli-config.sh` — rebuild `~/.zcode/cli/config.json`
+  from the desktop OAuth configuration after Desktop updates migrate it away
+- `scripts/install-zcodex.sh` — binary-only install from GitHub Releases
+- `tests/zcodex-integration.test.mjs` — end-to-end suite (exec, tool loop,
+  model control, native subagent spawn); `node --test tests/` from the repo
+  root on a machine with credentials
+
 ## Environment
 
 ZCode runtime discovery:
