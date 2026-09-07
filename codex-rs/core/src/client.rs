@@ -2833,8 +2833,9 @@ impl ModelClientSession {
                         match stderr.read(&mut chunk).await {
                             Ok(0) | Err(_) => break,
                             Ok(read) => {
-                                let mut tail =
-                                    stderr_tail.lock().unwrap_or_else(|e| e.into_inner());
+                                let mut tail = stderr_tail
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                                 tail.extend_from_slice(&chunk[..read]);
                                 if tail.len() > ZCODE_STDERR_TAIL_CAP {
                                     let excess = tail.len() - ZCODE_STDERR_TAIL_CAP;
@@ -3180,10 +3181,13 @@ impl ModelClientSession {
             }
 
             let status = child.wait().await;
-            let stderr_text =
-                String::from_utf8_lossy(&stderr_tail.lock().unwrap_or_else(|e| e.into_inner()))
-                    .trim()
-                    .to_string();
+            let stderr_text = String::from_utf8_lossy(
+                &stderr_tail
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            )
+            .trim()
+            .to_string();
             match (status, failed) {
                 (Ok(status), None) if status.success() => {
                     if emitted_tool_calls == 0 {
