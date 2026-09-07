@@ -1650,3 +1650,29 @@ fn zcode_failure_message_skips_duplicate_code_suffix() {
         Some("request failed: rate_limited by provider".to_string())
     );
 }
+
+#[test]
+fn zcode_turn_failure_error_maps_output_limit_to_context_window() {
+    let error = super::zcode_turn_failure_error(
+        "The model's response exceeded the output token maximum. \
+         (model_output_limit_exceeded)",
+    );
+    assert!(matches!(error, ApiError::ContextWindowExceeded));
+
+    // The exit-status path folds the stderr tail into the message; the code
+    // must still be recognized there.
+    let error = super::zcode_turn_failure_error(
+        "ZCode exited unsuccessfully (exit status: 1); stderr: \
+         Error: model_output_limit_exceeded",
+    );
+    assert!(matches!(error, ApiError::ContextWindowExceeded));
+}
+
+#[test]
+fn zcode_turn_failure_error_keeps_other_failures_retryable() {
+    let error = super::zcode_turn_failure_error("provider unavailable (boom)");
+    match error {
+        ApiError::Stream(message) => assert_eq!(message, "provider unavailable (boom)"),
+        other => panic!("expected stream error, got {other:?}"),
+    }
+}

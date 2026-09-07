@@ -533,6 +533,27 @@ fn zcode_failure_message(payload: &serde_json::Value) -> Option<String> {
     }
 }
 
+/// Provider error code emitted when a single reply exceeds the model's
+/// output-token cap.
+const ZCODE_OUTPUT_LIMIT_CODE: &str = "model_output_limit_exceeded";
+
+/// Maps a ZCode turn failure to the API error Codex should act on.
+///
+/// A failure carrying `model_output_limit_exceeded` is deterministic: the
+/// provider killed the turn because one reply blew past the output cap
+/// (typically a repetition loop on a very long flattened transcript), so
+/// retrying the identical prompt would fail identically. Report it as a
+/// context-window error - non-retryable, and it marks the token state as
+/// full so the next turn compacts the transcript before sampling instead of
+/// repeating the same doomed attempt.
+fn zcode_turn_failure_error(message: &str) -> ApiError {
+    if message.contains(ZCODE_OUTPUT_LIMIT_CODE) {
+        ApiError::ContextWindowExceeded
+    } else {
+        ApiError::Stream(message.to_string())
+    }
+}
+
 /// Extracts the goal-status marker from a final ZCode reply.
 ///
 /// The marker must be the reply's last non-empty line so prose that merely
@@ -3250,14 +3271,29 @@ impl ModelClientSession {
                         message.push_str("; stderr: ");
                         message.push_str(&stderr_text);
                     }
-                    warn!("{message}; will retry");
-                    let _ = tx.send(Err(ApiError::Stream(message))).await;
+                    let error = zcode_turn_failure_error(&message);
+                    warn!(
+                        "{message}; mapped to {}",
+                        if matches!(error, ApiError::ContextWindowExceeded) {
+                            "context window exceeded (not retried; next turn compacts)"
+                        } else {
+                            "stream error (will retry)"
+                        }
+                    );
+                    let _ = tx.send(Err(error)).await;
                 }
                 (_, Some(message)) => {
                     if !stderr_text.is_empty() {
                         warn!("ZCode stderr: {stderr_text}");
                     }
-                    let _ = tx.send(Err(ApiError::Stream(message))).await;
+                    let error = zcode_turn_failure_error(&message);
+                    if matches!(error, ApiError::ContextWindowExceeded) {
+                        warn!(
+                            "ZCode turn hit the output limit; not retrying a deterministic \
+                             failure so the next turn compacts first: {message}"
+                        );
+                    }
+                    let _ = tx.send(Err(error)).await;
                 }
                 (Err(e), None) => {
                     let _ = tx
