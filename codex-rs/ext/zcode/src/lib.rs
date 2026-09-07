@@ -57,6 +57,17 @@ fn write_zcode_prompt_file(prompt: &str) -> std::io::Result<std::path::PathBuf> 
     Ok(path)
 }
 
+/// Removes a ZCode prompt temp file on drop, including task cancellation.
+struct ZcodePromptFileGuard {
+    path: std::path::PathBuf,
+}
+
+impl Drop for ZcodePromptFileGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 const ZCODE_PROMPT_TOOL_NAME: &str = "zcode_prompt";
 
 #[derive(Debug, Default)]
@@ -140,10 +151,7 @@ impl<'call> ToolExecutor<ToolCall<'call>> for ZCodePromptTool {
         false
     }
 
-    fn handle<'a>(
-        &'a self,
-        call: ToolCall<'call>,
-    ) -> codex_extension_api::ToolExecutorFuture<'a>
+    fn handle<'a>(&'a self, call: ToolCall<'call>) -> codex_extension_api::ToolExecutorFuture<'a>
     where
         'call: 'a,
     {
@@ -178,12 +186,14 @@ impl<'call> ToolExecutor<ToolCall<'call>> for ZCodePromptTool {
                     "could not write ZCode prompt file: {error}"
                 ))
             })?;
+            let prompt_guard = ZcodePromptFileGuard { path: prompt_file };
+            let prompt_file = &prompt_guard.path;
             let mut command = Command::new(node);
             command
                 .arg("-e")
                 .arg(ZCODE_PROMPT_LOADER)
                 .arg(&runtime)
-                .arg(&prompt_file)
+                .arg(prompt_file)
                 .args(["--json", "--mode", &mode, "--cwd", &cwd]);
             if let Some(session_id) = requested_session.as_deref() {
                 command.args(["--resume", session_id]);
@@ -200,7 +210,7 @@ impl<'call> ToolExecutor<ToolCall<'call>> for ZCodePromptTool {
 
             const ZCODE_PROMPT_TIMEOUT: Duration = Duration::from_secs(20 * 60);
             let output = timeout(ZCODE_PROMPT_TIMEOUT, command.output()).await;
-            let _ = std::fs::remove_file(&prompt_file);
+            drop(prompt_guard);
             let output = output
                 .map_err(|_| {
                     codex_extension_api::FunctionCallError::RespondToModel(
@@ -298,10 +308,7 @@ impl<'call> ToolExecutor<ToolCall<'call>> for ZaiSearchTool {
         true
     }
 
-    fn handle<'a>(
-        &'a self,
-        call: ToolCall<'call>,
-    ) -> codex_extension_api::ToolExecutorFuture<'a>
+    fn handle<'a>(&'a self, call: ToolCall<'call>) -> codex_extension_api::ToolExecutorFuture<'a>
     where
         'call: 'a,
     {
