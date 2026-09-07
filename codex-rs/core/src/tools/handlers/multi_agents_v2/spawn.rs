@@ -1,7 +1,6 @@
 use super::*;
 use crate::agent::control::SpawnAgentForkMode;
 use crate::agent::control::SpawnAgentOptions;
-use crate::agent::exceeds_thread_spawn_depth_limit;
 use crate::agent::next_thread_spawn_depth;
 use crate::agent::role::DEFAULT_ROLE_NAME;
 use crate::agent_communication::AgentCommunicationContext;
@@ -123,11 +122,6 @@ async fn handle_spawn_agent(
 
     let session_source = turn.session_source.clone();
     let child_depth = next_thread_spawn_depth(&session_source);
-    if exceeds_thread_spawn_depth_limit(child_depth, turn.config.agent_max_depth) {
-        return Err(FunctionCallError::RespondToModel(
-            "Agent depth limit reached. Solve the task yourself.".to_string(),
-        ));
-    }
     let mut config =
         build_agent_spawn_config(&session.get_base_instructions().await, turn.as_ref())?;
     let is_full_history_fork = matches!(fork_mode, Some(SpawnAgentForkMode::FullHistory));
@@ -175,6 +169,7 @@ async fn handle_spawn_agent(
         .session_source
         .get_agent_path()
         .unwrap_or_else(AgentPath::root);
+    let message_preview = sub_agent_message_preview(&message);
     let communication = communication_from_tool_message(
         author,
         new_agent_path.clone(),
@@ -252,6 +247,7 @@ async fn handle_spawn_agent(
             agent_thread_id: new_thread_id,
             agent_path: new_agent_path.clone(),
             kind: SubAgentActivityKind::Started,
+            message_preview,
         },
     )
     .await;
@@ -265,11 +261,15 @@ async fn handle_spawn_agent(
 
     let hide_agent_metadata = turn.config.multi_agent_v2.hide_spawn_agent_metadata;
     let output = if hide_agent_metadata {
-        SpawnAgentResult::HiddenMetadata { task_name }
+        SpawnAgentResult::HiddenMetadata {
+            task_name,
+            agent_thread_id: new_thread_id.to_string(),
+        }
     } else {
         SpawnAgentResult::WithNickname {
             task_name,
             nickname,
+            agent_thread_id: new_thread_id.to_string(),
         }
     };
     Ok((output, new_thread_id, agent_status, agent_snapshot))
@@ -336,9 +336,18 @@ pub(crate) enum SpawnAgentResult {
     WithNickname {
         task_name: String,
         nickname: Option<String>,
+        /// Thread ID the caller can use to address this agent from
+        /// `send_message`, `followup_task`, and `interrupt_agent`.
+        agent_thread_id: String,
     },
     HiddenMetadata {
         task_name: String,
+        /// Thread ID the caller can use to address this agent from
+        /// `send_message`, `followup_task`, and `interrupt_agent`.
+        ///
+        /// Exposed even in the hidden-metadata variant: without it callers
+        /// that address agents by ID have no real handle to target.
+        agent_thread_id: String,
     },
 }
 

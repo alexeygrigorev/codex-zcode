@@ -269,9 +269,16 @@ fn fallback_transcript_cell(item: &ThreadItem) -> Option<PlainHistoryCell> {
             vec![format!("agent tool: {tool:?} · {status:?}").dim().into()]
         }
         ThreadItem::SubAgentActivity {
-            kind, agent_path, ..
+            kind,
+            agent_path,
+            agent_thread_id,
+            ..
         } => {
-            vec![sub_agent_activity_summary(*kind, agent_path).dim().into()]
+            vec![
+                sub_agent_activity_summary(*kind, agent_path, agent_thread_id)
+                    .dim()
+                    .into(),
+            ]
         }
         ThreadItem::WebSearch(item) => {
             vec![vec!["web search: ".dim(), item.query.clone().into()].into()]

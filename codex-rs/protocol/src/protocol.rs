@@ -4303,6 +4303,10 @@ pub struct SubAgentActivityEvent {
     /// Canonical v2 path of the affected sub-agent.
     pub agent_path: AgentPath,
     pub kind: SubAgentActivityKind,
+    /// Bounded preview of the message that caused this activity, when any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub message_preview: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]

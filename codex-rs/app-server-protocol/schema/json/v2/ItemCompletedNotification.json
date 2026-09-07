@@ -1329,6 +1329,12 @@
             "kind": {
               "$ref": "#/definitions/SubAgentActivityKind"
             },
+            "messagePreview": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "type": {
               "enum": [
                 "subAgentActivity"

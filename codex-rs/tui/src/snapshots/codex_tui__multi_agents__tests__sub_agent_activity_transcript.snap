@@ -1,0 +1,12 @@
+---
+source: tui/src/multi_agents.rs
+assertion_line: 894
+expression: snapshot
+---
+• Started `/root/visual_probe` (01a07875-1bab-7211-adf5-88351b9f254b)
+
+• Sent message to `/root/visual_probe` (01a07875-1bab-7211-adf5-88351b9f254b)
+  └ The code word is BANANA. Please acknowledge it.
+
+• Completed `/root/visual_probe` (01a07875-1bab-7211-adf5-88351b9f254b)
+  └ VISUAL_PROBE_OK

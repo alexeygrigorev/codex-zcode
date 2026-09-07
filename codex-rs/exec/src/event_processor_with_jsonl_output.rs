@@ -10,6 +10,7 @@ use codex_app_server_protocol::McpToolCallStatus;
 use codex_app_server_protocol::PatchApplyStatus;
 use codex_app_server_protocol::PatchChangeKind;
 use codex_app_server_protocol::ServerNotification;
+use codex_app_server_protocol::SubAgentActivityKind;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadTokenUsage;
 use codex_app_server_protocol::TurnStatus;
@@ -42,6 +43,8 @@ use crate::exec_events::McpToolCallStatus as ExecMcpToolCallStatus;
 use crate::exec_events::PatchApplyStatus as ExecPatchApplyStatus;
 use crate::exec_events::PatchChangeKind as ExecPatchChangeKind;
 use crate::exec_events::ReasoningItem;
+use crate::exec_events::SubAgentActivityItem;
+use crate::exec_events::SubAgentActivityKind as ExecSubAgentActivityKind;
 use crate::exec_events::ThreadErrorEvent;
 use crate::exec_events::ThreadEvent;
 use crate::exec_events::ThreadItem as ExecThreadItem;
@@ -311,6 +314,28 @@ impl EventProcessorWithJsonOutput {
                         .unwrap_or(WebSearchAction::Other),
                         None => WebSearchAction::Other,
                     },
+                }),
+            }),
+            ThreadItem::SubAgentActivity {
+                kind,
+                agent_thread_id,
+                agent_path,
+                message_preview,
+                ..
+            } => Some(ExecThreadItem {
+                id: make_id(),
+                details: ThreadItemDetails::SubAgentActivity(SubAgentActivityItem {
+                    kind: match kind {
+                        SubAgentActivityKind::Started => ExecSubAgentActivityKind::Started,
+                        SubAgentActivityKind::Interacted => ExecSubAgentActivityKind::Interacted,
+                        SubAgentActivityKind::Interrupted => {
+                            ExecSubAgentActivityKind::Interrupted
+                        }
+                        SubAgentActivityKind::Completed => ExecSubAgentActivityKind::Completed,
+                    },
+                    agent_thread_id,
+                    agent_path,
+                    message_preview,
                 }),
             }),
             _ => None,

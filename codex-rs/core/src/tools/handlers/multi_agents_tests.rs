@@ -949,6 +949,7 @@ async fn multi_agent_v2_spawn_returns_path_and_send_message_accepts_relative_pat
     struct SpawnAgentResult {
         task_name: String,
         nickname: Option<String>,
+        agent_thread_id: String,
     }
 
     let (mut session, mut turn) = make_session_and_context().await;
@@ -992,6 +993,7 @@ async fn multi_agent_v2_spawn_returns_path_and_send_message_accepts_relative_pat
         .resolve_agent_reference(session.thread_id, &turn.session_source, "test_process")
         .await
         .expect("relative path should resolve");
+    assert_eq!(spawn_result.agent_thread_id, child_thread_id.to_string());
     let child_snapshot = manager
         .get_thread(child_thread_id)
         .await
@@ -1042,6 +1044,61 @@ async fn multi_agent_v2_spawn_returns_path_and_send_message_accepts_relative_pat
                         && !communication.trigger_turn
             )
     }));
+}
+
+#[tokio::test]
+async fn multi_agent_v2_send_message_unknown_id_lists_addressable_agents() {
+    let (mut session, mut turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    let root = manager
+        .start_thread(StartThreadOptions::new((*turn.config).clone()))
+        .await
+        .expect("root thread should start");
+    session.services.agent_control = manager.agent_control();
+    session.thread_id = root.thread_id;
+    let mut config = (*turn.config).clone();
+    config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .expect("test config should allow feature update");
+    set_turn_config(&mut turn, config);
+
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    SpawnAgentHandlerV2::default()
+        .handle(invocation(
+            session.clone(),
+            turn.clone(),
+            "spawn_agent",
+            function_payload(json!({
+                "message": "inspect this repo",
+                "task_name": "worker"
+            })),
+        ))
+        .await
+        .expect("spawn_agent should succeed");
+
+    let unknown_id = ThreadId::new();
+    let Err(err) = SendMessageHandlerV2
+        .handle(invocation(
+            session.clone(),
+            turn.clone(),
+            "send_message",
+            function_payload(json!({
+                "target": unknown_id.to_string(),
+                "message": "code word MANGO"
+            })),
+        ))
+        .await
+    else {
+        panic!("send_message to an unknown id should fail");
+    };
+    let FunctionCallError::RespondToModel(message) = err else {
+        panic!("unknown id should produce a model-facing error");
+    };
+    assert!(message.contains(&unknown_id.to_string()));
+    assert!(message.contains("Addressable agents"));
+    assert!(message.contains("/root/worker"));
 }
 
 #[tokio::test]

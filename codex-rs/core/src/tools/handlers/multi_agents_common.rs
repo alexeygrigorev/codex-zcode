@@ -40,6 +40,31 @@ pub(crate) fn model_supports_multi_agent_backend(
         || model.multi_agent_version != Some(MultiAgentVersion::Disabled)
 }
 
+/// Hard cap for `SubAgentActivityItem::message_preview` so activity payloads
+/// stay bounded regardless of how large the delivered message was.
+const SUB_AGENT_ACTIVITY_PREVIEW_CHARS: usize = 400;
+
+/// Builds the bounded preview stored on sub-agent activity items.
+///
+/// Whitespace is collapsed first so multi-paragraph messages render as one
+/// transcript line; `None` is returned for empty messages so UIs can omit the
+/// detail entirely.
+pub(crate) fn sub_agent_message_preview(message: &str) -> Option<String> {
+    let collapsed = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return None;
+    }
+    let preview: String = collapsed
+        .chars()
+        .take(SUB_AGENT_ACTIVITY_PREVIEW_CHARS)
+        .collect();
+    Some(if preview.chars().count() < collapsed.chars().count() {
+        format!("{preview}…")
+    } else {
+        preview
+    })
+}
+
 pub(crate) fn function_arguments(payload: ToolPayload) -> Result<String, FunctionCallError> {
     match payload {
         ToolPayload::Function { arguments } => Ok(arguments),

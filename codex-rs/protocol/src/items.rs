@@ -355,6 +355,13 @@ pub struct SubAgentActivityItem {
     pub kind: SubAgentActivityKind,
     pub agent_thread_id: ThreadId,
     pub agent_path: AgentPath,
+    /// Bounded preview of the inter-agent message that caused this activity.
+    ///
+    /// Set for message-driven activity so UIs can show what the sender sent
+    /// without reading the encrypted communication payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub message_preview: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema, PartialEq)]

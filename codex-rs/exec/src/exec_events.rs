@@ -122,6 +122,9 @@ pub enum ThreadItemDetails {
     /// Represents a call to a collab tool. The item starts when the collab tool is
     /// invoked and completes when the collab tool reports success or failure.
     CollabToolCall(CollabToolCallItem),
+    /// Reports lifecycle activity of a spawned sub-agent (started, messaged,
+    /// interrupted, completed).
+    SubAgentActivity(SubAgentActivityItem),
     /// Captures a web search request. It starts when the search is kicked off
     /// and completes when results are returned to the agent.
     WebSearch(WebSearchItem),
@@ -256,6 +259,27 @@ pub struct CollabToolCallItem {
     pub prompt: Option<String>,
     pub agents_states: HashMap<String, CollabAgentState>,
     pub status: CollabToolCallStatus,
+}
+
+/// The kind of sub-agent lifecycle activity.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum SubAgentActivityKind {
+    Started,
+    Interacted,
+    Interrupted,
+    Completed,
+}
+
+/// Lifecycle activity of a spawned sub-agent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
+pub struct SubAgentActivityItem {
+    pub kind: SubAgentActivityKind,
+    pub agent_thread_id: String,
+    pub agent_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub message_preview: Option<String>,
 }
 
 /// Result payload produced by an MCP tool invocation.

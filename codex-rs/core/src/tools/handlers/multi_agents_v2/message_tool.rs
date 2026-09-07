@@ -8,7 +8,7 @@ use super::*;
 use crate::agent_communication::AgentCommunicationContext;
 use crate::agent_communication::AgentCommunicationKind;
 use crate::tools::context::FunctionToolOutput;
-
+use codex_protocol::error::CodexErrorDetails;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MessageDeliveryMode {
     QueueOnly,
@@ -67,11 +67,35 @@ pub(super) async fn handle_message_string_tool(
     } = invocation;
     let receiver_thread_id = resolve_agent_target(&session, &turn, &target).await?;
     analytics.set_receiver(receiver_thread_id);
-    let receiver_agent = session
+    // Models that address agents by invented IDs (observed with the ZCode
+    // backend) can only recover if the error names the agents that do exist.
+    let receiver_agent = match session
         .services
         .agent_control
         .ensure_agent_known(receiver_thread_id)
-        .map_err(|err| collab_agent_error(receiver_thread_id, err))?;
+    {
+        Ok(receiver_agent) => receiver_agent,
+        Err(err) if matches!(err.details(), CodexErrorDetails::ThreadNotFound(_)) => {
+            let roster = session
+                .services
+                .agent_control
+                .list_agents(&turn.session_source, None)
+                .await
+                .map(|agents| {
+                    agents
+                        .iter()
+                        .map(|agent| agent.agent_name.clone())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            return Err(FunctionCallError::RespondToModel(format!(
+                "agent with id {receiver_thread_id} not found. Addressable agents (use one as \
+                 the target): {roster}"
+            )));
+        }
+        Err(err) => return Err(collab_agent_error(receiver_thread_id, err)),
+    };
     if mode == MessageDeliveryMode::TriggerTurn
         && receiver_agent
             .agent_path
@@ -96,6 +120,7 @@ pub(super) async fn handle_message_string_tool(
         .session_source
         .get_agent_path()
         .unwrap_or_else(AgentPath::root);
+    let message_preview = sub_agent_message_preview(&message);
     let communication = communication_from_tool_message(
         author,
         receiver_agent_path.clone(),
@@ -135,6 +160,7 @@ pub(super) async fn handle_message_string_tool(
             agent_thread_id: receiver_thread_id,
             agent_path: receiver_agent_path,
             kind: SubAgentActivityKind::Interacted,
+            message_preview,
         },
     )
     .await;

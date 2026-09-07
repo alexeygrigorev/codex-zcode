@@ -2203,6 +2203,12 @@ impl Session {
         if matches!(status, AgentStatus::Completed(_))
             && let Some(parent_turn_id) = turn_context.turn_metadata_state.parent_turn_id()
         {
+            let completion_preview = match &status {
+                AgentStatus::Completed(message) => message.as_deref().and_then(
+                    crate::tools::handlers::multi_agents_common::sub_agent_message_preview,
+                ),
+                _ => None,
+            };
             let initiating_thread_id = match turn_context
                 .turn_metadata_state
                 .initiating_agent_path()
@@ -2236,6 +2242,7 @@ impl Session {
                             kind: SubAgentActivityKind::Completed,
                             agent_thread_id: self.thread_id,
                             agent_path: child_agent_path.clone(),
+                            message_preview: completion_preview,
                         },
                     )
                     .await

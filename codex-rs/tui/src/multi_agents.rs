@@ -307,36 +307,55 @@ pub(crate) fn sub_agent_activity_display(item: &ThreadItem) -> Option<SubAgentAc
 
 pub(crate) fn sub_agent_activity_history_cell(item: &ThreadItem) -> Option<PlainHistoryCell> {
     let ThreadItem::SubAgentActivity {
-        kind, agent_path, ..
+        kind,
+        agent_thread_id,
+        agent_path,
+        message_preview,
+        ..
     } = item
     else {
         return None;
     };
+    let mut details = Vec::new();
+    if let Some(preview) = message_preview.as_deref() {
+        details.push(prompt_line(preview));
+    }
     Some(collab_event(
-        sub_agent_activity_title(*kind, agent_path),
-        Vec::new(),
+        sub_agent_activity_title(*kind, agent_path, agent_thread_id),
+        details.into_iter().flatten().collect(),
     ))
 }
 
-pub(crate) fn sub_agent_activity_summary(kind: SubAgentActivityKind, agent_path: &str) -> String {
-    match kind {
-        SubAgentActivityKind::Started => format!("Started `{agent_path}`"),
-        SubAgentActivityKind::Interacted => format!("Interacted with `{agent_path}`"),
-        SubAgentActivityKind::Interrupted => format!("Interrupted `{agent_path}`"),
-        SubAgentActivityKind::Completed => format!("Completed `{agent_path}`"),
-    }
+pub(crate) fn sub_agent_activity_summary(
+    kind: SubAgentActivityKind,
+    agent_path: &str,
+    agent_thread_id: &str,
+) -> String {
+    let prefix = match kind {
+        SubAgentActivityKind::Started => "Started",
+        SubAgentActivityKind::Interacted => "Sent message to",
+        SubAgentActivityKind::Interrupted => "Interrupted",
+        SubAgentActivityKind::Completed => "Completed",
+    };
+    format!("{prefix} `{agent_path}` ({agent_thread_id})")
 }
 
-fn sub_agent_activity_title(kind: SubAgentActivityKind, agent_path: &str) -> Line<'static> {
+fn sub_agent_activity_title(
+    kind: SubAgentActivityKind,
+    agent_path: &str,
+    agent_thread_id: &str,
+) -> Line<'static> {
     let (prefix, path) = match kind {
         SubAgentActivityKind::Started => ("Started ", agent_path),
-        SubAgentActivityKind::Interacted => ("Interacted with ", agent_path),
+        SubAgentActivityKind::Interacted => ("Sent message to ", agent_path),
         SubAgentActivityKind::Interrupted => ("Interrupted ", agent_path),
         SubAgentActivityKind::Completed => ("Completed ", agent_path),
     };
     title_spans_line(vec![
         Span::from(prefix).bold(),
         Span::from(format!("`{path}`")).cyan(),
+        Span::from(" ").dim(),
+        Span::from(format!("({agent_thread_id})")).dim(),
     ])
 }
 
@@ -693,6 +712,7 @@ mod tests {
             kind: SubAgentActivityKind::Interacted,
             agent_thread_id: ThreadId::new().to_string(),
             agent_path: "/root/child".to_string(),
+            message_preview: None,
         };
 
         assert_eq!(sub_agent_activity_display(&item), None);
@@ -706,6 +726,7 @@ mod tests {
             kind: SubAgentActivityKind::Completed,
             agent_thread_id: thread_id.to_string(),
             agent_path: "/root/child".to_string(),
+            message_preview: None,
         };
 
         assert_eq!(
@@ -836,6 +857,41 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n\n");
         assert_snapshot!("collab_agent_transcript", snapshot);
+    }
+
+    #[test]
+    fn sub_agent_activity_cells_show_agent_ids_and_message_previews() {
+        let activity =
+            |kind: SubAgentActivityKind, preview: Option<&str>| ThreadItem::SubAgentActivity {
+                id: "activity-1".to_string(),
+                kind,
+                agent_thread_id: "01a07875-1bab-7211-adf5-88351b9f254b".to_string(),
+                agent_path: "/root/visual_probe".to_string(),
+                message_preview: preview.map(str::to_string),
+            };
+
+        let started = sub_agent_activity_history_cell(&activity(
+            SubAgentActivityKind::Started,
+            /*preview*/ None,
+        ))
+        .expect("started activity renders");
+        let sent = sub_agent_activity_history_cell(&activity(
+            SubAgentActivityKind::Interacted,
+            Some("The code word is BANANA. Please acknowledge it."),
+        ))
+        .expect("interacted activity renders");
+        let completed = sub_agent_activity_history_cell(&activity(
+            SubAgentActivityKind::Completed,
+            Some("VISUAL_PROBE_OK"),
+        ))
+        .expect("completed activity renders");
+
+        let snapshot = [started, sent, completed]
+            .iter()
+            .map(cell_to_text)
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        assert_snapshot!("sub_agent_activity_transcript", snapshot);
     }
 
     #[cfg(target_os = "macos")]

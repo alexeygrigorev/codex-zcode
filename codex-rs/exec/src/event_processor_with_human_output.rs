@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
@@ -36,6 +37,9 @@ pub(crate) struct EventProcessorWithHumanOutput {
     final_message_rendered: bool,
     emit_final_message_on_shutdown: bool,
     last_total_token_usage: Option<ThreadTokenUsage>,
+    /// Sub-agent activity item ids already rendered; the same activity arrives
+    /// as both `ItemStarted` and `ItemCompleted` and must print only once.
+    rendered_sub_agent_activities: HashSet<String>,
 }
 
 impl EventProcessorWithHumanOutput {
@@ -61,10 +65,11 @@ impl EventProcessorWithHumanOutput {
             final_message_rendered: false,
             emit_final_message_on_shutdown: false,
             last_total_token_usage: None,
+            rendered_sub_agent_activities: HashSet::new(),
         }
     }
 
-    fn render_item_started(&self, item: &ThreadItem) {
+    fn render_item_started(&mut self, item: &ThreadItem) {
         match item {
             ThreadItem::CommandExecution { command, cwd, .. } => {
                 eprintln!(
@@ -91,9 +96,22 @@ impl EventProcessorWithHumanOutput {
                 eprintln!("{} {tool:?} started", "collab:".style(self.bold));
             }
             ThreadItem::SubAgentActivity {
-                kind, agent_path, ..
+                id,
+                kind,
+                agent_thread_id,
+                agent_path,
+                message_preview,
+                ..
             } => {
-                eprintln!("{} {kind:?} {agent_path}", "subagent:".style(self.bold));
+                if self.rendered_sub_agent_activities.insert(id.clone()) {
+                    eprintln!(
+                        "{} {kind:?} {agent_path} ({agent_thread_id})",
+                        "subagent:".style(self.bold)
+                    );
+                    if let Some(preview) = message_preview {
+                        eprintln!("  {} {preview}", "└".style(self.dimmed));
+                    }
+                }
             }
             _ => {}
         }
@@ -231,9 +249,22 @@ impl EventProcessorWithHumanOutput {
                 }
             }
             ThreadItem::SubAgentActivity {
-                kind, agent_path, ..
+                id,
+                kind,
+                agent_thread_id,
+                agent_path,
+                message_preview,
+                ..
             } => {
-                eprintln!("{} {kind:?} {agent_path}", "subagent:".style(self.bold));
+                if self.rendered_sub_agent_activities.insert(id.clone()) {
+                    eprintln!(
+                        "{} {kind:?} {agent_path} ({agent_thread_id})",
+                        "subagent:".style(self.bold)
+                    );
+                    if let Some(preview) = message_preview {
+                        eprintln!("  {} {preview}", "└".style(self.dimmed));
+                    }
+                }
             }
             _ => {}
         }
