@@ -9,6 +9,9 @@ use super::X_CODEX_PARENT_THREAD_ID_HEADER;
 use super::X_CODEX_TURN_METADATA_HEADER;
 use super::X_CODEX_WINDOW_ID_HEADER;
 use super::X_OPENAI_SUBAGENT_HEADER;
+use super::ZCODE_TOOL_ARGS_PERSIST_CAP;
+use super::zcode_tool_args_from_accumulated;
+use super::zcode_tool_args_from_authoritative;
 use crate::AttestationContext;
 use crate::AttestationProvider;
 use crate::GenerateAttestationFuture;
@@ -63,6 +66,9 @@ use codex_rollout_trace::RawTraceEventPayload;
 use codex_rollout_trace::RolloutTrace;
 use codex_rollout_trace::TraceWriter;
 use codex_rollout_trace::replay_bundle;
+use codex_tools::JsonSchema;
+use codex_tools::ResponsesApiTool;
+use codex_tools::ToolSpec;
 use futures::StreamExt;
 use pretty_assertions::assert_eq;
 use serde_json::json;
@@ -1348,4 +1354,299 @@ async fn non_chatgpt_codex_endpoints_omit_attestation_generation() {
         None,
     );
     assert_eq!(attestation_calls.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn zcode_authoritative_small_input_is_preserved() {
+    let input = json!({
+        "command": "git remote -v",
+        "description": "Show remotes",
+    });
+    let rendered = zcode_tool_args_from_authoritative("Bash", Some(&input))
+        .expect("small input should render");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&rendered).expect("rendered args should parse");
+    assert_eq!(
+        parsed.get("command").and_then(|value| value.as_str()),
+        Some("git remote -v")
+    );
+    assert!(rendered.len() < 1024);
+}
+
+#[test]
+fn zcode_authoritative_oversized_input_becomes_placeholder() {
+    let big_command = "x".repeat(ZCODE_TOOL_ARGS_PERSIST_CAP + 1024);
+    let input = json!({ "command": big_command });
+    let rendered = zcode_tool_args_from_authoritative("Bash", Some(&input))
+        .expect("oversized input should still return a placeholder");
+    assert!(
+        rendered.len() < 1024,
+        "placeholder must stay small, got {} bytes",
+        rendered.len()
+    );
+    assert!(rendered.contains("_error"));
+}
+
+#[test]
+fn zcode_accumulated_valid_json_is_normalized() {
+    let accumulated = r#"{"command":"git remote -v","description":"Show remotes"}"#;
+    let rendered = zcode_tool_args_from_accumulated("Bash", accumulated);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&rendered).expect("normalized args should parse");
+    assert_eq!(
+        parsed.get("cmd").and_then(|value| value.as_str()),
+        Some("git remote -v")
+    );
+}
+
+/// Regression test for the wild 421 KiB repetition loop: the same key
+/// repeated ~12k times, truncated mid-key so it cannot parse. The old code
+/// persisted the raw 421 KiB string into history, bloating every future turn
+/// until execve failed with E2BIG ("could not launch ZCode"). It must now
+/// become a small placeholder instead.
+#[test]
+fn zcode_accumulated_truncated_repetition_becomes_placeholder() {
+    let mut accumulated = String::from(
+        r#"{"command":"git remote set-url origin git@github.com:alexeygrigorev/codex-zcode.git && git remote -v","description":"Change origin remote to SSH URL""#,
+    );
+    for _ in 0..12_781 {
+        accumulated.push_str(r#","dangerouslyDisableSandbox":true"#);
+    }
+    // Truncate mid-key like the observed payload (missing closing brace).
+    accumulated.push_str(r#","dangerouslyDisableSandbox":"#);
+    assert!(accumulated.len() > 400_000);
+
+    let rendered = zcode_tool_args_from_accumulated("Bash", &accumulated);
+    assert!(
+        rendered.len() < 1024,
+        "pathological input must collapse, got {} bytes",
+        rendered.len()
+    );
+    assert!(rendered.contains("_error"));
+    assert!(!rendered.contains("dangerouslyDisableSandbox"));
+}
+
+#[test]
+fn zcode_accumulated_oversized_becomes_placeholder() {
+    let accumulated = format!("{{\"command\":\"{}\"}}", "y".repeat(200 * 1024));
+    let rendered = zcode_tool_args_from_accumulated("Bash", &accumulated);
+    assert!(rendered.len() < 1024);
+    assert!(rendered.contains("_error"));
+}
+
+#[test]
+fn zcode_accumulated_empty_is_empty_object() {
+    assert_eq!(
+        zcode_tool_args_from_accumulated("Bash", ""),
+        "{}".to_string()
+    );
+}
+
+#[test]
+fn zcode_agent_arguments_are_rebuilt_without_harness_extras() {
+    let input = json!({
+        "description": "Probe Agent",
+        "prompt": "Reply with: PROBE_OK",
+        "subagent_type": "general-purpose",
+        "run_in_background": true,
+        "model": "glm-5.3-flash",
+        "reasoning_effort": "max",
+    });
+    let normalized = super::normalize_zcode_tool_arguments("Agent", &input);
+    let task_name = normalized
+        .get("task_name")
+        .and_then(|value| value.as_str())
+        .expect("task_name should be derived from description");
+    assert_eq!(task_name, "probe_agent");
+    let message = normalized
+        .get("message")
+        .and_then(|value| value.as_str())
+        .expect("message should be derived from prompt");
+    assert!(message.starts_with("Reply with: PROBE_OK"));
+    assert!(message.contains("do not spawn additional sub-agents"));
+    assert!(normalized.get("run_in_background").is_none());
+    assert!(normalized.get("subagent_type").is_none());
+    assert!(normalized.get("model").is_none());
+    assert!(normalized.get("reasoning_effort").is_none());
+}
+
+#[test]
+fn zcode_spawn_agent_arguments_pass_task_name_through() {
+    let input = json!({
+        "task_name": "probe_child",
+        "message": "Reply with: PROBE_OK",
+        "run_in_background": true,
+    });
+    let normalized = super::normalize_zcode_tool_arguments("spawn_agent", &input);
+    assert_eq!(
+        normalized.get("task_name").and_then(|value| value.as_str()),
+        Some("probe_child")
+    );
+    assert!(normalized.get("run_in_background").is_none());
+}
+
+#[test]
+fn zcode_send_message_strips_agent_prefix_from_uuid_targets() {
+    let input = json!({
+        "target": "agent_28a74254-19a2-46bd-81a7-b939c72d4ddb",
+        "message": "The code word is BANANA",
+        "summary": "Sending code word",
+    });
+    let normalized = super::normalize_zcode_tool_arguments("SendMessage", &input);
+    assert_eq!(
+        normalized.get("target").and_then(|value| value.as_str()),
+        Some("28a74254-19a2-46bd-81a7-b939c72d4ddb")
+    );
+    let message = normalized
+        .get("message")
+        .and_then(|value| value.as_str())
+        .expect("message should be kept");
+    assert!(message.starts_with("The code word is BANANA"));
+    assert!(message.contains("Summary: Sending code word"));
+    assert!(normalized.get("summary").is_none());
+}
+
+#[test]
+fn zcode_send_message_keeps_non_uuid_targets() {
+    let input = json!({
+        "to": "visual_probe2",
+        "message": "hello",
+    });
+    let normalized = super::normalize_zcode_tool_arguments("send_message", &input);
+    assert_eq!(
+        normalized.get("target").and_then(|value| value.as_str()),
+        Some("visual_probe2")
+    );
+}
+
+#[test]
+fn zcode_followup_task_arguments_are_normalized() {
+    let input = json!({
+        "to": "agent_28a74254-19a2-46bd-81a7-b939c72d4ddb",
+        "message": "follow up",
+        "summary": "extra",
+    });
+    let normalized = super::normalize_zcode_tool_arguments("followup_task", &input);
+    assert_eq!(
+        normalized.get("target").and_then(|value| value.as_str()),
+        Some("28a74254-19a2-46bd-81a7-b939c72d4ddb")
+    );
+    assert_eq!(
+        normalized.get("message").and_then(|value| value.as_str()),
+        Some("follow up\n\nSummary: extra")
+    );
+}
+
+#[test]
+fn zcode_goal_status_protocol_only_when_goal_tool_present() {
+    let goal_tool = |name: &str| {
+        ToolSpec::Function(ResponsesApiTool {
+            name: name.to_string(),
+            description: "goal tool".to_string(),
+            strict: false,
+            defer_loading: None,
+            parameters: JsonSchema::object(
+                std::collections::BTreeMap::new(),
+                Some(Vec::new()),
+                Some(false.into()),
+            ),
+            output_schema: None,
+        })
+    };
+
+    let with_goal = super::zcode_goal_status_protocol(&[goal_tool("update_goal")])
+        .expect("active goal should emit the protocol note");
+    assert!(with_goal.contains(super::ZCODE_GOAL_COMPLETE_MARKER));
+    assert!(with_goal.contains(super::ZCODE_GOAL_BLOCKED_MARKER));
+
+    assert!(super::zcode_goal_status_protocol(&[goal_tool("exec_command")]).is_none());
+    assert!(super::zcode_goal_status_protocol(&[]).is_none());
+}
+
+#[test]
+fn zcode_goal_status_from_reply_accepts_only_trailing_markers() {
+    assert_eq!(
+        super::zcode_goal_status_from_reply("All work is done.\n[GOAL:COMPLETE]"),
+        Some("complete")
+    );
+    assert_eq!(
+        super::zcode_goal_status_from_reply("Still stuck on X.\n\n[GOAL:BLOCKED]"),
+        Some("blocked")
+    );
+    // Marker mentioned mid-text, or followed by more prose: not a status.
+    assert_eq!(
+        super::zcode_goal_status_from_reply("[GOAL:COMPLETE] but then I kept going"),
+        None
+    );
+    assert_eq!(super::zcode_goal_status_from_reply("plain answer"), None);
+    assert_eq!(super::zcode_goal_status_from_reply(""), None);
+}
+
+#[test]
+fn zcode_strip_goal_status_marker_removes_only_the_marker_line() {
+    assert_eq!(
+        super::zcode_strip_goal_status_marker("All work is done.\n[GOAL:COMPLETE]"),
+        "All work is done."
+    );
+    assert_eq!(
+        super::zcode_strip_goal_status_marker("Report\n\n[GOAL:BLOCKED]\n"),
+        "Report"
+    );
+    // No trailing marker: reply passes through untouched.
+    assert_eq!(
+        super::zcode_strip_goal_status_marker("[GOAL:COMPLETE] mid-text"),
+        "[GOAL:COMPLETE] mid-text"
+    );
+}
+
+#[test]
+fn zcode_failure_message_extracts_model_error_with_code() {
+    let payload = serde_json::json!({
+        "error": {
+            "type": "model_error",
+            "code": "model_output_limit_exceeded",
+            "message": "The model's response exceeded the output token maximum."
+        }
+    });
+    assert_eq!(
+        super::zcode_failure_message(&payload),
+        Some(
+            "The model's response exceeded the output token maximum. \
+             (model_output_limit_exceeded)"
+                .to_string()
+        )
+    );
+}
+
+#[test]
+fn zcode_failure_message_supports_last_error_shape() {
+    let payload = serde_json::json!({ "lastError": { "message": "provider unavailable" } });
+    assert_eq!(
+        super::zcode_failure_message(&payload),
+        Some("provider unavailable".to_string())
+    );
+}
+
+#[test]
+fn zcode_failure_message_without_message_is_none() {
+    assert_eq!(
+        super::zcode_failure_message(&serde_json::json!({
+            "error": { "code": "boom" }
+        })),
+        None
+    );
+    assert_eq!(super::zcode_failure_message(&serde_json::json!({})), None);
+}
+
+#[test]
+fn zcode_failure_message_skips_duplicate_code_suffix() {
+    assert_eq!(
+        super::zcode_failure_message(&serde_json::json!({
+            "error": {
+                "code": "rate_limited",
+                "message": "request failed: rate_limited by provider"
+            }
+        })),
+        Some("request failed: rate_limited by provider".to_string())
+    );
 }

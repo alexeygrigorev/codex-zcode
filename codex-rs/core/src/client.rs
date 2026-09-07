@@ -94,6 +94,7 @@ use codex_protocol::protocol::W3cTraceContext;
 use codex_rollout_trace::CompactionTraceContext;
 use codex_rollout_trace::InferenceTraceAttempt;
 use codex_rollout_trace::InferenceTraceContext;
+use codex_tools::ToolSpec;
 use codex_tools::create_tools_json_for_responses_api;
 use codex_tools::create_tools_json_for_responses_lite;
 use codex_tools::create_tools_raw_json_for_responses_api;
@@ -227,6 +228,111 @@ struct PendingZcodeTool {
     name: String,
     arguments: String,
     call_id: String,
+    input_ended: bool,
+    arguments_truncated: bool,
+}
+
+/// Cap for streamed `tool_input_delta` text kept for live UI updates.
+///
+/// A misbehaving model can emit pathological deltas (in the wild: the same
+/// key repeated ~12k times → 421 KiB of arguments that then failed to parse
+/// and poisoned every future turn's transcript, eventually tripping execve
+/// `E2BIG`). Bounding the buffer keeps memory flat; final arguments always
+/// come from authoritative `tool_call.input`, never from raw deltas.
+const ZCODE_TOOL_INPUT_ACCUMULATE_CAP: usize = 64 * 1024;
+
+/// Cap for persisted tool-call arguments.
+///
+/// Legitimate file writes can be tens of KiB, so allow headroom, but never
+/// persist hundreds of KiB of garbage into history. Oversized inputs become
+/// a small error placeholder instead.
+const ZCODE_TOOL_ARGS_PERSIST_CAP: usize = 128 * 1024;
+
+/// Cap for the ZCode child's stderr tail kept for failure diagnostics.
+///
+/// The CLI writes its crash reason (stack traces, provider errors) to stderr;
+/// keeping the last few KiB turns "exit status: 1" into an actionable error.
+const ZCODE_STDERR_TAIL_CAP: usize = 8 * 1024;
+
+/// Wire note bounding the model's final replies.
+///
+/// The provider aborts the whole turn when a single reply exceeds its output
+/// limit (`model_output_limit_exceeded`); on very long transcripts the model
+/// otherwise tends to repetition-loop past that limit, killing in-flight work
+/// mid-turn. Asking for bounded replies up front keeps turns completable.
+const ZCODE_REPLY_BUDGET_NOTE: &str = "\n\nOutput budget: the backend aborts the entire turn if one reply exceeds the model's maximum output length. Never paste file contents, command output, or long reports into a reply - write files and report via tool calls, and keep the final reply focused (under ~300 words) unless the user explicitly asked for more detail.";
+
+/// Builds the persisted arguments string for a ZCode tool call from the
+/// authoritative `tool_call.input` payload.
+///
+/// Returns `None` when there is no usable input (missing) so callers can
+/// fall back to accumulated deltas. Oversized inputs are replaced with a
+/// small placeholder to avoid poisoning the transcript.
+fn zcode_tool_args_from_authoritative(
+    zcode_name: &str,
+    input: Option<&serde_json::Value>,
+) -> Option<String> {
+    let input = input?;
+    let normalized = normalize_zcode_tool_arguments(zcode_name, input);
+    let rendered = serde_json::to_string(&normalized).unwrap_or_else(|_| "{}".to_string());
+    if rendered.len() > ZCODE_TOOL_ARGS_PERSIST_CAP {
+        tracing::warn!(
+            "ZCode tool {zcode_name} input too large ({} bytes); dropping to protect transcript",
+            rendered.len()
+        );
+        return Some(
+            r#"{"_error":"tool input too large; dropped to protect transcript"}"#.to_string(),
+        );
+    }
+    Some(rendered)
+}
+
+/// Builds persisted arguments from accumulated `tool_input_delta` text.
+///
+/// Only used when authoritative `tool_call.input` never arrives (stream cut
+/// off). Invalid or oversized accumulations become a small placeholder
+/// instead of raw garbage, so a truncated 421 KiB repetition loop cannot
+/// poison history and blow up future turns.
+fn zcode_tool_args_from_accumulated(zcode_name: &str, accumulated: &str) -> String {
+    if accumulated.is_empty() {
+        return "{}".to_string();
+    }
+    if accumulated.len() > ZCODE_TOOL_ARGS_PERSIST_CAP {
+        tracing::warn!(
+            "ZCode tool {zcode_name} accumulated deltas too large ({} bytes); dropping",
+            accumulated.len()
+        );
+        return r#"{"_error":"tool input too large; dropped to protect transcript"}"#.to_string();
+    }
+    match serde_json::from_str::<serde_json::Value>(accumulated) {
+        Ok(value) => {
+            let normalized = normalize_zcode_tool_arguments(zcode_name, &value);
+            let rendered =
+                serde_json::to_string(&normalized).unwrap_or_else(|_| accumulated.to_string());
+            if rendered.len() > ZCODE_TOOL_ARGS_PERSIST_CAP {
+                r#"{"_error":"tool input too large; dropped to protect transcript"}"#.to_string()
+            } else {
+                rendered
+            }
+        }
+        Err(_) => r#"{"_error":"tool input invalid; dropped to protect transcript"}"#.to_string(),
+    }
+}
+
+/// Removes a ZCode prompt temp file when it goes out of scope.
+///
+/// The streaming task can exit early (spawn failure, client disconnect) or be
+/// cancelled; relying on explicit `remove_file` calls at each exit leaked
+/// files (observed as stale `zcode-prompt-*` entries in `/tmp`). Holding this
+/// guard for the task lifetime makes cleanup unconditional.
+struct ZcodePromptFileGuard {
+    path: PathBuf,
+}
+
+impl Drop for ZcodePromptFileGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 fn normalize_zcode_tool_name(name: &str) -> String {
@@ -253,7 +359,10 @@ fn normalize_zcode_tool_arguments(name: &str, input: &serde_json::Value) -> serd
         return serde_json::Value::Object(normalized);
     }
 
-    if matches!(name, "SendMessage" | "TaskMessage") {
+    if matches!(
+        name,
+        "SendMessage" | "TaskMessage" | "send_message" | "followup_task"
+    ) {
         let object = match input.as_object() {
             Some(object) => object,
             None => return input.clone(),
@@ -270,7 +379,7 @@ fn normalize_zcode_tool_arguments(name: &str, input: &serde_json::Value) -> serd
             .or_else(|| object.get("agentId"))
             .or_else(|| object.get("agent_id"))
             .and_then(|value| value.as_str())
-            .map(str::to_string);
+            .map(zcodex_normalize_agent_target);
         if let (Some(target), Some(mut message)) = (target, message) {
             if let Some(summary) = object
                 .get("summary")
@@ -279,12 +388,14 @@ fn normalize_zcode_tool_arguments(name: &str, input: &serde_json::Value) -> serd
             {
                 message = format!("{message}\n\nSummary: {summary}");
             }
+            // send_message/followup_task take only target and message; extra
+            // ZCode harness fields would fail the strict argument parser.
             return serde_json::json!({ "target": target, "message": message });
         }
         return input.clone();
     }
 
-    if matches!(name, "Agent" | "Task") {
+    if matches!(name, "Agent" | "Task" | "spawn_agent") {
         let object = match input.as_object() {
             Some(object) => object,
             None => return input.clone(),
@@ -296,26 +407,31 @@ fn normalize_zcode_tool_arguments(name: &str, input: &serde_json::Value) -> serd
             .map(str::to_string);
         let task_name = object
             .get("task_name")
+            .or_else(|| object.get("name"))
             .or_else(|| object.get("description"))
             .and_then(|value| value.as_str())
             .map(zcodex_task_name_from_description);
-        let mut normalized = object.clone();
-        match (task_name, message) {
-            (Some(task_name), Some(message)) => {
-                normalized.insert("task_name".to_string(), serde_json::json!(task_name));
-                normalized.insert(
-                    "message".to_string(),
-                    serde_json::json!(format!(
-                        "{message}\n\nComplete this task yourself and reply with the \
-                         final answer; do not spawn additional sub-agents for it."
-                    )),
-                );
-            }
-            _ => return input.clone(),
+        // spawn_agent rejects unknown fields, and ZCode harness calls carry
+        // extras such as run_in_background and subagent_type, so rebuild the
+        // arguments from the fields spawn_agent actually understands. Model
+        // and reasoning_effort are dropped so the child inherits the parent's
+        // ZCode model instead of failing model validation.
+        let mut normalized = serde_json::Map::new();
+        if let Some(task_name) = task_name {
+            normalized.insert("task_name".to_string(), serde_json::json!(task_name));
         }
-        normalized.remove("prompt");
-        normalized.remove("description");
-        normalized.remove("subagent_type");
+        if let Some(message) = message {
+            normalized.insert(
+                "message".to_string(),
+                serde_json::json!(format!(
+                    "{message}\n\nComplete this task yourself and reply with the \
+                     final answer; do not spawn additional sub-agents for it."
+                )),
+            );
+        }
+        if let Some(fork_turns) = object.get("fork_turns") {
+            normalized.insert("fork_turns".to_string(), fork_turns.clone());
+        }
         return serde_json::Value::Object(normalized);
     }
 
@@ -348,6 +464,116 @@ fn normalize_zcode_tool_arguments(name: &str, input: &serde_json::Value) -> serd
         );
     }
     serde_json::Value::Object(normalized)
+}
+
+/// Maps a ZCode harness agent target to a Codex `send_message` target.
+///
+/// ZCode identifies agents as `agent_<uuid>`; Codex resolves raw thread UUIDs
+/// directly, so strip the prefix when the remainder is a valid UUID. Names and
+/// paths pass through unchanged.
+fn zcodex_normalize_agent_target(target: &str) -> String {
+    let trimmed = target.trim();
+    if let Some(rest) = trimmed.strip_prefix("agent_")
+        && uuid::Uuid::parse_str(rest).is_ok()
+    {
+        return rest.to_string();
+    }
+    trimmed.to_string()
+}
+
+/// Marker line that reports an achieved goal on the ZCode wire.
+pub(crate) const ZCODE_GOAL_COMPLETE_MARKER: &str = "[GOAL:COMPLETE]";
+/// Marker line that reports a blocked goal on the ZCode wire.
+pub(crate) const ZCODE_GOAL_BLOCKED_MARKER: &str = "[GOAL:BLOCKED]";
+
+/// Wire note teaching the ZCode model the goal-status protocol.
+///
+/// The ZCode harness exposes a fixed toolset (`Agent`, `Bash`, ...) and refuses
+/// calls to Codex-side tools, so the model cannot call `update_goal` even when
+/// the goal continuation instructs it to — the goal then re-prompted forever.
+/// Instead, when a goal is active (`update_goal` present in the tool list),
+/// the model ends its reply with a reserved marker line, and the adapter
+/// translates it into a real `update_goal` function call that the normal
+/// registry path executes.
+fn zcode_goal_status_protocol(tools: &[ToolSpec]) -> Option<String> {
+    let goal_active = tools
+        .iter()
+        .any(|tool| matches!(tool, ToolSpec::Function(api_tool) if api_tool.name == "update_goal"));
+    goal_active.then(|| {
+        format!(
+            "[Goal status protocol] This wire cannot call Codex-side tools such as update_goal. \
+             When the goal instructions above apply, end your final reply with exactly one of \
+             these marker lines (on its own line, nothing after it):\n\
+             {ZCODE_GOAL_COMPLETE_MARKER} - the objective is achieved and no required work \
+             remains\n\
+             {ZCODE_GOAL_BLOCKED_MARKER} - the same blocker has repeated for at least three \
+             consecutive goal turns and you are at an impasse\n\
+             Omit both markers while work remains."
+        )
+    })
+}
+
+/// Extracts a human-readable message from a ZCode failure event payload.
+///
+/// `turn.failed` events carry the model error as
+/// `{"error":{"code":"model_output_limit_exceeded","message":"..."}}`; some
+/// serializers use `lastError` instead. Returns `None` when no message is
+/// present so callers can fall back to a stringified payload.
+fn zcode_failure_message(payload: &serde_json::Value) -> Option<String> {
+    let error = payload.get("error").or_else(|| payload.get("lastError"))?;
+    let message = error.get("message")?.as_str()?.trim();
+    if message.is_empty() {
+        return None;
+    }
+    match error.get("code").and_then(|code| code.as_str()) {
+        Some(code) if !code.is_empty() && !message.contains(code) => {
+            Some(format!("{message} ({code})"))
+        }
+        _ => Some(message.to_string()),
+    }
+}
+
+/// Extracts the goal-status marker from a final ZCode reply.
+///
+/// The marker must be the reply's last non-empty line so prose that merely
+/// mentions a marker never triggers a status change.
+fn zcode_goal_status_from_reply(reply: &str) -> Option<&'static str> {
+    let last_line = reply.lines().rev().find(|line| !line.trim().is_empty())?;
+    match last_line.trim() {
+        ZCODE_GOAL_COMPLETE_MARKER => Some("complete"),
+        ZCODE_GOAL_BLOCKED_MARKER => Some("blocked"),
+        _ => None,
+    }
+}
+
+/// Strips a trailing goal-status marker line from the final reply so the
+/// transcript keeps the model's report without the wire-only marker.
+fn zcode_strip_goal_status_marker(reply: &str) -> String {
+    let mut lines = reply.lines();
+    std::iter::from_fn(|| lines.next_back())
+        .skip_while(|line| line.trim().is_empty())
+        .next()
+        .filter(|line| {
+            matches!(
+                line.trim(),
+                ZCODE_GOAL_COMPLETE_MARKER | ZCODE_GOAL_BLOCKED_MARKER
+            )
+        })
+        .map(|_| {
+            reply
+                .lines()
+                .take_while(|line| {
+                    !matches!(
+                        line.trim(),
+                        ZCODE_GOAL_COMPLETE_MARKER | ZCODE_GOAL_BLOCKED_MARKER
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+                .trim_end()
+                .to_string()
+        })
+        .unwrap_or_else(|| reply.to_string())
 }
 
 fn zcodex_task_name_from_description(description: &str) -> String {
@@ -391,7 +617,7 @@ fn prepare_zcode_home(model_slug: &str) -> std::io::Result<PathBuf> {
         std::env::var("UID")
             .ok()
             .filter(|uid| !uid.is_empty())
-            .unwrap_or_else(|| whoami::username())
+            .unwrap_or_else(whoami::username)
     ));
     std::fs::create_dir_all(&isolated_home)?;
 
@@ -2482,6 +2708,24 @@ impl ModelClientSession {
             }
         }
 
+        // The ZCode harness exposes a fixed toolset and refuses Codex-side
+        // tool names, so when a goal is active the model needs the
+        // marker-based status protocol instead of the `update_goal` tool the
+        // goal continuation tells it to call.
+        let protocol_note = zcode_goal_status_protocol(&prompt.tools);
+        let goal_protocol_active = protocol_note.is_some();
+        if let Some(protocol_note) = protocol_note {
+            user_text.push('\n');
+            user_text.push_str(&protocol_note);
+        }
+
+        // Translate the marker at most once per conversation: the synthesized
+        // call becomes part of the flattened history on every later turn, and
+        // re-translating the (persistent) marker instructions would loop.
+        let goal_status_already_reported = prompt.input.iter().any(
+            |item| matches!(item, ResponseItem::FunctionCall { name, .. } if name == "update_goal"),
+        );
+
         let (tx, rx_event) = mpsc::channel::<std::result::Result<ResponseEvent, ApiError>>(64);
         let request_id = format!("zcode_{}", uuid::Uuid::new_v4());
         let request_id_for_stream = request_id.clone();
@@ -2506,6 +2750,9 @@ impl ModelClientSession {
         } else {
             user_text
         };
+        // On every turn: runaway final replies trip the provider's output
+        // limit and abort the whole turn mid-work.
+        let user_text = format!("{user_text}{ZCODE_REPLY_BUDGET_NOTE}");
 
         tokio::spawn(async move {
             let prompt_file = match write_zcode_prompt_file(&user_text) {
@@ -2520,6 +2767,11 @@ impl ModelClientSession {
                 }
             };
             drop(user_text);
+            // Guard removes the temp file on every exit path, including
+            // early returns and task cancellation (previously leaked as
+            // stale `zcode-prompt-*` files in `/tmp`).
+            let prompt_guard = ZcodePromptFileGuard { path: prompt_file };
+            let prompt_file = &prompt_guard.path;
             // Prompt goes via a temp file and is re-injected into argv
             // in-process by the loader, so long transcripts cannot hit
             // execve E2BIG ("Argument list too long").
@@ -2528,7 +2780,7 @@ impl ModelClientSession {
                 .arg("-e")
                 .arg(ZCODE_PROMPT_LOADER)
                 .arg(&runtime)
-                .arg(&prompt_file)
+                .arg(prompt_file)
                 .args([
                     "--output-format",
                     "stream-json",
@@ -2539,7 +2791,7 @@ impl ModelClientSession {
                 ])
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::null())
+                .stderr(Stdio::piped())
                 .kill_on_drop(true);
             if let Some(home) = &zcode_home {
                 command.env("HOME", home);
@@ -2549,7 +2801,6 @@ impl ModelClientSession {
             let mut child = match child {
                 Ok(child) => child,
                 Err(e) => {
-                    let _ = std::fs::remove_file(&prompt_file);
                     let _ = tx
                         .send(Err(ApiError::Stream(format!(
                             "could not launch ZCode: {e}"
@@ -2560,7 +2811,6 @@ impl ModelClientSession {
             };
 
             let Some(stdout) = child.stdout.take() else {
-                let _ = std::fs::remove_file(&prompt_file);
                 let _ = tx
                     .send(Err(ApiError::Stream(
                         "ZCode did not expose stdout".to_string(),
@@ -2568,6 +2818,33 @@ impl ModelClientSession {
                     .await;
                 return;
             };
+
+            // Drain stderr into a bounded tail so the failure reason (crash
+            // stack, provider error) survives for the exit-status error
+            // message instead of being discarded.
+            let stderr_tail = Arc::new(std::sync::Mutex::new(Vec::new()));
+            if let Some(stderr) = child.stderr.take() {
+                let stderr_tail = Arc::clone(&stderr_tail);
+                tokio::spawn(async move {
+                    use tokio::io::AsyncReadExt;
+                    let mut stderr = stderr;
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        match stderr.read(&mut chunk).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(read) => {
+                                let mut tail =
+                                    stderr_tail.lock().unwrap_or_else(|e| e.into_inner());
+                                tail.extend_from_slice(&chunk[..read]);
+                                if tail.len() > ZCODE_STDERR_TAIL_CAP {
+                                    let excess = tail.len() - ZCODE_STDERR_TAIL_CAP;
+                                    tail.drain(..excess);
+                                }
+                            }
+                        }
+                    }
+                });
+            }
 
             use tokio::io::AsyncBufReadExt;
             use tokio::io::BufReader;
@@ -2598,10 +2875,10 @@ impl ModelClientSession {
                 };
                 let payload = parsed.get("payload");
                 let kind = parsed.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                if kind == "session.updated" {
-                    if let Some(id) = parsed.get("sessionId").and_then(|v| v.as_str()) {
-                        session_id = id.to_string();
-                    }
+                if kind == "session.updated"
+                    && let Some(id) = parsed.get("sessionId").and_then(|v| v.as_str())
+                {
+                    session_id = id.to_string();
                 }
                 if kind == "model.streaming" {
                     let event_kind = payload
@@ -2670,6 +2947,8 @@ impl ModelClientSession {
                                     name: mapped_name.clone(),
                                     arguments: String::new(),
                                     call_id: call_id.clone(),
+                                    input_ended: false,
+                                    arguments_truncated: false,
                                 },
                             );
                             let item = ResponseItem::FunctionCall {
@@ -2700,17 +2979,37 @@ impl ModelClientSession {
                             .and_then(|v| v.as_str())
                             .unwrap_or_default();
                         if let Some(pending) = pending_tools.get_mut(tool_call_id) {
-                            pending.arguments.push_str(delta);
-                            if tx
-                                .send(Ok(ResponseEvent::ToolCallInputDelta {
-                                    item_id: pending.call_id.clone(),
-                                    call_id: Some(pending.call_id.clone()),
-                                    delta: delta.to_string(),
-                                }))
-                                .await
-                                .is_err()
-                            {
-                                break;
+                            // Deltas are only for live UI updates; final args
+                            // come from authoritative `tool_call.input`. Cap
+                            // the buffer so a repetition loop cannot grow it
+                            // without bound (421 KiB observed in the wild).
+                            // Once capped, stop accumulating and stop
+                            // forwarding UI deltas for this tool.
+                            let capped = pending.arguments_truncated || pending.input_ended;
+                            if !capped && !delta.is_empty() {
+                                if pending.arguments.len() + delta.len()
+                                    > ZCODE_TOOL_INPUT_ACCUMULATE_CAP
+                                {
+                                    pending.arguments_truncated = true;
+                                    tracing::warn!(
+                                        "ZCode tool {} deltas exceeded {} bytes; truncating",
+                                        pending.zcode_name,
+                                        ZCODE_TOOL_INPUT_ACCUMULATE_CAP
+                                    );
+                                } else {
+                                    pending.arguments.push_str(delta);
+                                    if tx
+                                        .send(Ok(ResponseEvent::ToolCallInputDelta {
+                                            item_id: pending.call_id.clone(),
+                                            call_id: Some(pending.call_id.clone()),
+                                            delta: delta.to_string(),
+                                        }))
+                                        .await
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                }
                             }
                         }
                     }
@@ -2719,23 +3018,31 @@ impl ModelClientSession {
                             .and_then(|p| p.get("toolCallId"))
                             .and_then(|v| v.as_str())
                             .unwrap_or_default();
-                        if let Some(pending) = pending_tools.remove(tool_call_id) {
-                            let authoritative = payload
-                                .and_then(|p| p.get("input"))
-                                .map(|input| {
-                                    serde_json::to_string(&normalize_zcode_tool_arguments(
+                        if tool_call_id.is_empty() || completed_tool_ids.contains(tool_call_id) {
+                            // Duplicate or malformed; authoritative input was
+                            // already emitted (or will be via fallback flush).
+                        } else if let Some(pending) = pending_tools.remove(tool_call_id) {
+                            // Prefer authoritative `input` over accumulated
+                            // deltas. Deltas are raw text fragments that can
+                            // contain pathological repetition (12k repeated
+                            // keys → 421 KiB, truncated and unparseable);
+                            // `input` is already parsed JSON so duplicate keys
+                            // collapse and size is validated.
+                            let authoritative = zcode_tool_args_from_authoritative(
+                                &pending.zcode_name,
+                                payload.and_then(|p| p.get("input")),
+                            )
+                            .unwrap_or_else(|| {
+                                if pending.arguments_truncated {
+                                    r#"{"_error":"tool input truncated; dropped to protect transcript"}"#
+                                        .to_string()
+                                } else {
+                                    zcode_tool_args_from_accumulated(
                                         &pending.zcode_name,
-                                        input,
-                                    ))
-                                    .unwrap_or_else(|_| "{}".to_string())
-                                })
-                                .unwrap_or_else(|| {
-                                    if pending.arguments.is_empty() {
-                                        "{}".to_string()
-                                    } else {
-                                        pending.arguments.clone()
-                                    }
-                                });
+                                        &pending.arguments,
+                                    )
+                                }
+                            });
                             let item = ResponseItem::FunctionCall {
                                 id: None,
                                 name: pending.name,
@@ -2754,34 +3061,28 @@ impl ModelClientSession {
                             }
                             emitted_tool_calls += 1;
                             completed_tool_ids.insert(tool_call_id.to_string());
-                        }
-                    }
-                    if is_tool_input_end {
-                        let tool_call_id = payload
-                            .and_then(|p| p.get("toolCallId"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or_default();
-                        if let Some(pending) = pending_tools.remove(tool_call_id) {
-                            let arguments = if pending.arguments.is_empty() {
-                                "{}".to_string()
-                            } else {
-                                serde_json::from_str::<serde_json::Value>(&pending.arguments)
-                                    .map(|value| {
-                                        serde_json::to_string(&normalize_zcode_tool_arguments(
-                                            &pending.zcode_name,
-                                            &value,
-                                        ))
-                                        .unwrap_or_else(|_| pending.arguments.clone())
-                                    })
-                                    .unwrap_or_else(|_| pending.arguments.clone())
+                        } else {
+                            // Orphan `tool_call` without a prior
+                            // `tool_input_start` (should not happen, but be
+                            // robust): emit directly from authoritative input.
+                            let tool_name = payload
+                                .and_then(|p| p.get("toolName"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("shell");
+                            let mapped_name = normalize_zcode_tool_name(tool_name);
+                            let Some(authoritative) = zcode_tool_args_from_authoritative(
+                                tool_name,
+                                payload.and_then(|p| p.get("input")),
+                            ) else {
+                                continue;
                             };
                             let item = ResponseItem::FunctionCall {
                                 id: None,
-                                name: pending.name,
+                                name: mapped_name,
                                 namespace: None,
-                                arguments,
+                                arguments: authoritative,
                                 encrypted_function_args: Some(Vec::new()),
-                                call_id: pending.call_id,
+                                call_id: format!("zcode_tool_{tool_call_id}"),
                                 internal_chat_message_metadata_passthrough: None,
                             };
                             if tx
@@ -2795,11 +3096,28 @@ impl ModelClientSession {
                             completed_tool_ids.insert(tool_call_id.to_string());
                         }
                     }
+                    if is_tool_input_end {
+                        // Do NOT emit here. ZCode sends `tool_input_end`
+                        // before `tool_call`; emitting from accumulated deltas
+                        // would persist pathological raw text and discard the
+                        // authoritative input arriving next. Just mark the
+                        // pending as ended and wait for `tool_call`. If it
+                        // never arrives, the post-loop flush emits a capped,
+                        // validated fallback.
+                        let tool_call_id = payload
+                            .and_then(|p| p.get("toolCallId"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default();
+                        if let Some(pending) = pending_tools.get_mut(tool_call_id) {
+                            pending.input_ended = true;
+                        }
+                    }
                 }
-                if kind == "session.error" {
+                if kind == "session.error" || kind == "turn.failed" {
                     failed = Some(
                         payload
-                            .and_then(|p| serde_json::to_string(p).ok())
+                            .and_then(zcode_failure_message)
+                            .or_else(|| payload.and_then(|p| serde_json::to_string(p).ok()))
                             .unwrap_or_else(|| "unknown ZCode error".to_string()),
                     );
                     break;
@@ -2809,15 +3127,93 @@ impl ModelClientSession {
                         .get("response")
                         .and_then(|v| v.as_str())
                         .map(str::to_string);
+                    // The headless runner writes the result line and exits 0
+                    // even when the turn's projection ended in an error; a
+                    // silent empty reply would look like a completed turn.
+                    if failed.is_none()
+                        && parsed
+                            .pointer("/projection/status")
+                            .and_then(|v| v.as_str())
+                            == Some("error")
+                    {
+                        failed = Some("ZCode turn failed (projection status: error)".to_string());
+                    }
+                }
+            }
+
+            // Flush tool calls that saw `tool_input_end` (or deltas) but never
+            // got authoritative `tool_call` before stdout closed. Without this
+            // they would vanish silently; with the old code they were emitted
+            // eagerly from raw deltas (the 421 KiB poisoning path). Emit a
+            // capped, validated fallback instead. Skip when the turn already
+            // failed (session.error) so a failed turn does not sprout tools.
+            if failed.is_none() {
+                for (tool_call_id, pending) in std::mem::take(&mut pending_tools) {
+                    if completed_tool_ids.contains(&tool_call_id) {
+                        continue;
+                    }
+                    let arguments = if pending.arguments_truncated {
+                        r#"{"_error":"tool input truncated; dropped to protect transcript"}"#
+                            .to_string()
+                    } else {
+                        zcode_tool_args_from_accumulated(&pending.zcode_name, &pending.arguments)
+                    };
+                    let item = ResponseItem::FunctionCall {
+                        id: None,
+                        name: pending.name,
+                        namespace: None,
+                        arguments,
+                        encrypted_function_args: Some(Vec::new()),
+                        call_id: pending.call_id,
+                        internal_chat_message_metadata_passthrough: None,
+                    };
+                    if tx
+                        .send(Ok(ResponseEvent::OutputItemDone(item)))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    emitted_tool_calls += 1;
+                    completed_tool_ids.insert(tool_call_id);
                 }
             }
 
             let status = child.wait().await;
+            let stderr_text =
+                String::from_utf8_lossy(&stderr_tail.lock().unwrap_or_else(|e| e.into_inner()))
+                    .trim()
+                    .to_string();
             match (status, failed) {
                 (Ok(status), None) if status.success() => {
                     if emitted_tool_calls == 0 {
                         if let Some(final_text) = result_response {
                             response_text = final_text;
+                        }
+                        // The goal-status protocol ends the reply with a
+                        // reserved marker; strip it from the visible reply,
+                        // and translate it into a real `update_goal` call so
+                        // the normal registry path (GoalToolExecutor) records
+                        // the status change. Synthesis happens at most once
+                        // per conversation: the call becomes part of the
+                        // flattened history on every later turn, and
+                        // re-translating it would loop.
+                        if goal_protocol_active
+                            && let Some(goal_status) = zcode_goal_status_from_reply(&response_text)
+                        {
+                            response_text = zcode_strip_goal_status_marker(&response_text);
+                            if !goal_status_already_reported {
+                                let item = ResponseItem::FunctionCall {
+                                    id: None,
+                                    name: "update_goal".to_string(),
+                                    namespace: None,
+                                    arguments: format!(r#"{{"status":"{goal_status}"}}"#),
+                                    encrypted_function_args: Some(Vec::new()),
+                                    call_id: format!("zcode_goal_{request_id_for_stream}"),
+                                    internal_chat_message_metadata_passthrough: None,
+                                };
+                                let _ = tx.send(Ok(ResponseEvent::OutputItemDone(item))).await;
+                            }
                         }
                         let item = ResponseItem::Message {
                             id: None,
@@ -2845,14 +3241,18 @@ impl ModelClientSession {
                         .await;
                 }
                 (Ok(status), None) => {
-                    warn!("ZCode exited unsuccessfully ({status}); will retry");
-                    let _ = tx
-                        .send(Err(ApiError::Stream(format!(
-                            "ZCode exited unsuccessfully ({status})"
-                        ))))
-                        .await;
+                    let mut message = format!("ZCode exited unsuccessfully ({status})");
+                    if !stderr_text.is_empty() {
+                        message.push_str("; stderr: ");
+                        message.push_str(&stderr_text);
+                    }
+                    warn!("{message}; will retry");
+                    let _ = tx.send(Err(ApiError::Stream(message))).await;
                 }
                 (_, Some(message)) => {
+                    if !stderr_text.is_empty() {
+                        warn!("ZCode stderr: {stderr_text}");
+                    }
                     let _ = tx.send(Err(ApiError::Stream(message))).await;
                 }
                 (Err(e), None) => {
@@ -2861,7 +3261,7 @@ impl ModelClientSession {
                         .await;
                 }
             }
-            let _ = std::fs::remove_file(&prompt_file);
+            drop(prompt_guard);
             let _ = session_id;
         });
 
