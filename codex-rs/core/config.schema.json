@@ -5818,6 +5818,13 @@
             "responses"
           ],
           "type": "string"
+        },
+        {
+          "description": "ZCode app-server protocol over stdio.",
+          "enum": [
+            "zcode"
+          ],
+          "type": "string"
         }
       ]
     },
