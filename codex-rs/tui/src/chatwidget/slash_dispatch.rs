@@ -6,6 +6,7 @@
 //! slash-command recall follows the same submitted-input rule as ordinary text.
 
 use super::*;
+use crate::app_event::ManagedWorktreeMode;
 use crate::app_event::ThreadGoalSetMode;
 use crate::bottom_pane::prompt_args::parse_slash_name;
 use crate::bottom_pane::slash_commands::BuiltinCommandFlags;
@@ -181,7 +182,7 @@ impl ChatWidget {
                 self.request_redraw();
             }
             SlashCommand::New => {
-                self.app_event_tx.send(AppEvent::NewSession { name: None });
+                self.show_session_checkout_picker(ManagedWorktreeMode::New, /*name*/ None);
             }
             SlashCommand::Archive => {
                 self.bottom_pane.show_selection_view(SelectionViewParams {
@@ -247,8 +248,10 @@ impl ChatWidget {
                 self.app_event_tx.send(AppEvent::OpenResumePicker);
             }
             SlashCommand::Fork => {
-                self.app_event_tx
-                    .send(AppEvent::ForkCurrentSession { name: None });
+                self.show_session_checkout_picker(ManagedWorktreeMode::Fork, /*name*/ None);
+            }
+            SlashCommand::Worktree => {
+                self.show_managed_worktree_picker();
             }
             SlashCommand::App => {
                 let Some(thread_id) = self.thread_id else {
@@ -330,6 +333,9 @@ impl ChatWidget {
                     );
                 }
             }
+            SlashCommand::Voice => {
+                self.toggle_realtime_conversation();
+            }
             SlashCommand::Side | SlashCommand::Btw => {
                 self.request_empty_side_conversation(cmd);
             }
@@ -404,11 +410,6 @@ impl ChatWidget {
                     let _ = &self.session_telemetry;
                     // Not supported; on non-Windows this command should never be reachable.
                 }
-            }
-            SlashCommand::SandboxReadRoot => {
-                self.add_error_message(
-                    "Usage: /sandbox-add-read-dir <absolute-directory-path>".to_string(),
-                );
             }
             SlashCommand::Experimental => {
                 self.open_experimental_popup();
@@ -754,6 +755,11 @@ impl ChatWidget {
                     }
                 }
             }
+            SlashCommand::Voice => match trimmed.to_ascii_lowercase().as_str() {
+                "mute" => self.toggle_realtime_microphone(),
+                "stop" => self.stop_realtime_conversation(),
+                _ => self.add_error_message("Usage: /voice [mute|stop]".to_string()),
+            },
             SlashCommand::Ide => {
                 self.handle_ide_command_args(trimmed);
             }
@@ -800,9 +806,10 @@ impl ChatWidget {
                 self.app_event_tx.set_thread_name(name);
             }
             SlashCommand::New if !trimmed.is_empty() => {
-                self.app_event_tx.send(AppEvent::NewSession {
-                    name: Some(trimmed.to_string()),
-                });
+                self.show_session_checkout_picker(
+                    ManagedWorktreeMode::New,
+                    Some(trimmed.to_string()),
+                );
             }
             SlashCommand::Clear if !trimmed.is_empty() => {
                 self.app_event_tx.send(AppEvent::ClearUi {
@@ -810,9 +817,10 @@ impl ChatWidget {
                 });
             }
             SlashCommand::Fork if !trimmed.is_empty() => {
-                self.app_event_tx.send(AppEvent::ForkCurrentSession {
-                    name: Some(trimmed.to_string()),
-                });
+                self.show_session_checkout_picker(
+                    ManagedWorktreeMode::Fork,
+                    Some(trimmed.to_string()),
+                );
             }
             SlashCommand::Plan if !trimmed.is_empty() => {
                 let plan_available = self.apply_plan_slash_command();
@@ -992,10 +1000,6 @@ impl ChatWidget {
                 self.app_event_tx
                     .send(AppEvent::ResumeSessionByIdOrName(args));
             }
-            SlashCommand::SandboxReadRoot if !trimmed.is_empty() => {
-                self.app_event_tx
-                    .send(AppEvent::BeginWindowsSandboxGrantReadRoot { path: args });
-            }
             SlashCommand::Pets
                 if matches!(
                     args.trim().to_ascii_lowercase().as_str(),
@@ -1139,6 +1143,9 @@ impl ChatWidget {
             goal_command_enabled: self.config.features.enabled(Feature::Goals),
             service_tier_commands_enabled: self.fast_mode_enabled(),
             personality_command_enabled: self.config.features.enabled(Feature::Personality),
+            voice_command_enabled: self.realtime_conversation_available_for_thread,
+            worktrees_enabled: self.config.features.enabled(Feature::Worktrees)
+                && self.local_worktree_operations,
             allow_elevate_sandbox,
             side_conversation_active: self.active_side_conversation,
         }
@@ -1176,12 +1183,20 @@ impl ChatWidget {
             | SlashCommand::Diff
             | SlashCommand::App
             | SlashCommand::Rename
+            | SlashCommand::Voice
             | SlashCommand::Recap
             | SlashCommand::TestApproval => QueueDrain::Continue,
             SlashCommand::Cd => match self.thread_id {
                 Some(thread_id) if self.can_change_working_directory(thread_id) => QueueDrain::Stop,
                 _ => QueueDrain::Continue,
             },
+            SlashCommand::Worktree => {
+                if self.managed_worktree_available() {
+                    QueueDrain::Stop
+                } else {
+                    QueueDrain::Continue
+                }
+            }
             SlashCommand::Feedback
             | SlashCommand::Export
             | SlashCommand::New
@@ -1204,7 +1219,6 @@ impl ChatWidget {
             | SlashCommand::MultiAgents
             | SlashCommand::Permissions
             | SlashCommand::ElevateSandbox
-            | SlashCommand::SandboxReadRoot
             | SlashCommand::Experimental
             | SlashCommand::AutoReview
             | SlashCommand::Memories

@@ -207,7 +207,6 @@ impl McpHandler {
             payload,
             ..
         } = invocation;
-        let turn = Arc::clone(&step_context.turn);
 
         let payload = match payload {
             ToolPayload::Function { arguments } => arguments,
@@ -223,7 +222,7 @@ impl McpHandler {
             .as_ref()
             .and_then(codex_mcp::PreparedMcpCall::output_token_limit)
             .map(TruncationPolicy::Tokens)
-            .unwrap_or(turn.model_info().truncation_policy.into());
+            .unwrap_or(step_context.settings.model_info.truncation_policy.into());
         let started = Instant::now();
         let result = handle_mcp_tool_call(
             Arc::clone(&session),
@@ -243,7 +242,9 @@ impl McpHandler {
             result: result.result,
             tool_input: result.tool_input,
             wall_time: started.elapsed(),
-            original_image_detail_supported: can_request_original_image_detail(turn.model_info()),
+            original_image_detail_supported: can_request_original_image_detail(
+                &step_context.settings.model_info,
+            ),
             truncation_policy,
         }))
     }
@@ -284,12 +285,11 @@ impl CoreToolRuntime for McpHandler {
     }
 
     fn on_tool_result_accepted(&self, invocation: &ToolInvocation, result: &dyn ToolOutput) {
-        // Direct calls also record sources, before the Code Mode-only evidence path below.
-        if let Some(recorder) = invocation.session.services.executed_tool_calls.as_ref()
-            && let Some(sources) = result.tool_result_sources()
-        {
-            recorder.record_tool_result_sources(&invocation.source, &invocation.call_id, sources);
-        }
+        invocation
+            .session
+            .services
+            .executed_tool_calls
+            .record_accepted_result(&invocation.source, &invocation.call_id, result);
         let ToolCallSource::CodeMode { cell_id, .. } = &invocation.source else {
             return;
         };

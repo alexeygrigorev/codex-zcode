@@ -1242,9 +1242,6 @@ await new Promise(() => {});
                     .disable(Feature::ExecutedToolCallMetadata)
                     .expect("tool call metadata should be disabled");
             }
-            if oversized {
-                let _ = config.features.disable(Feature::RemoteCompactionV2);
-            }
         })
         .await?;
 
@@ -1280,13 +1277,33 @@ await new Promise(() => {});
         let cell_id = extract_running_cell_id(text_item(&first_items, /*index*/ 0));
 
         if oversized {
-            responses::mount_compact_user_history_with_summary_once(&server, "compacted history")
-                .await;
+            let compact = responses::mount_sse_once(
+                &server,
+                responses::sse(vec![
+                    serde_json::json!({
+                        "type": "response.output_item.done",
+                        "item": {
+                            "type": "compaction",
+                            "encrypted_content": "compacted history",
+                        },
+                    }),
+                    responses::ev_completed("resp-compact"),
+                ]),
+            )
+            .await;
             test.codex.submit(Op::Compact).await?;
             wait_for_event(&test.codex, |event| {
                 matches!(event, EventMsg::TurnComplete(_))
             })
             .await;
+
+            assert_eq!(
+                compact
+                    .single_request()
+                    .inputs_of_type("compaction_trigger")
+                    .len(),
+                1
+            );
 
             let wait = responses::mount_function_call_agent_response(
                 &server,
@@ -1384,10 +1401,10 @@ if (!tool) {
             let model = model_catalog
                 .models
                 .iter_mut()
-                .find(|model| model.slug == "gpt-5.4")
-                .expect("gpt-5.4 exists in bundled models.json");
+                .find(|model| model.slug == "gpt-5.5")
+                .expect("gpt-5.5 exists in bundled models.json");
             config.chatgpt_base_url = apps_base_url;
-            config.model = Some("gpt-5.4".to_string());
+            config.model = Some("gpt-5.5".to_string());
             model.supports_search_tool = true;
             config.model_catalog = Some(model_catalog);
         });
@@ -1695,18 +1712,23 @@ text(JSON.stringify(result));
     Ok(())
 }
 
+#[test_case("{}"; "object")]
+#[test_case(""; "omitted")]
+#[test_case("undefined"; "undefined")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn code_mode_current_time_returns_structured_result() -> Result<()> {
+async fn code_mode_current_time_returns_structured_result(argument: &str) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
     let (_test, second_mock) = run_code_mode_turn_with_config(
         &server,
         "use exec to get the current time",
-        r#"
-const result = await tools.clock__curr_time({});
+        &format!(
+            r#"
+const result = await tools.clock__curr_time({argument});
 text(JSON.stringify(result));
 "#,
+        ),
         |config| {
             config
                 .features
@@ -1874,7 +1896,7 @@ text(JSON.stringify([results[0].output.includes("code-alpha-ready"), results[1].
 
 // This model uses token-based tool-output truncation, giving the downstream
 // history assertions a stable `…N tokens truncated…` marker.
-const TOKEN_POLICY_TEST_MODEL: &str = "gpt-5.4";
+const TOKEN_POLICY_TEST_MODEL: &str = "gpt-5.5";
 
 // A nested `exec_command` limit applies to `result.output` inside JavaScript.
 // The outer code-mode and history budgets apply after the script calls `text`.
@@ -2375,12 +2397,19 @@ async fn code_mode_wait_timeout_reconnects_on_next_exec() -> Result<()> {
 #[derive(Default)]
 struct ResponseIdObserver {
     response_ids: Mutex<Vec<(String, Option<String>)>>,
+    originating_items: Mutex<Vec<(String, Option<codex_protocol::ResponseItemId>)>>,
     wait_started: tokio::sync::Notify,
 }
 
 impl ToolLifecycleContributor for ResponseIdObserver {
     fn on_tool_start<'a>(&'a self, input: ToolStartInput<'a>) -> ToolLifecycleFuture<'a> {
         Box::pin(async move {
+            if matches!(input.tool_name.name.as_str(), "exec" | "exec_command") {
+                self.originating_items.lock().unwrap().push((
+                    input.tool_name.name.clone(),
+                    input.originating_item_id.cloned(),
+                ));
+            }
             if matches!(input.tool_name.name.as_str(), "exec_command" | "wait") {
                 self.response_ids.lock().unwrap().push((
                     input.tool_name.name.clone(),
@@ -2550,6 +2579,20 @@ text((await tools.exec_command({{cmd: "printf 'phase 3'"}})).output);
         text_item(&third_items, /*index*/ 0),
     );
     assert_eq!(text_item(&third_items, /*index*/ 1), "phase 3");
+
+    // Resuming the cell changes the response id, but its nested calls retain
+    // the original exec item's identity for request-local freshness accounting.
+    let originating_items = observer.originating_items.lock().unwrap();
+    let wrapper_item = originating_items[0]
+        .1
+        .clone()
+        .expect("wrapper item identity");
+    assert!(originating_items.len() >= 3);
+    assert!(
+        originating_items
+            .iter()
+            .all(|(_, item)| item.as_ref() == Some(&wrapper_item))
+    );
 
     let observed = observer.response_ids.lock().unwrap();
     let mut nested_response_ids = observed
@@ -4053,7 +4096,7 @@ async fn code_mode_resizes_explicit_original_image() -> Result<()> {
         &server,
         "use exec to return a large original-detail image",
         &code,
-        "gpt-5.4",
+        "gpt-5.5",
         |_| {},
     )
     .await?;
@@ -4112,7 +4155,7 @@ image({{
         &server,
         "emit images with legacy detail arguments and MCP metadata",
         &code,
-        "gpt-5.4",
+        "gpt-5.5",
         |config| {
             let _ = config.features.enable(Feature::UnifiedImageBudget);
         },
@@ -4157,14 +4200,21 @@ async fn code_mode_unified_image_budget_preserves_legacy_contract_for_unsupporte
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
-    let (_test, second_mock) = run_code_mode_turn_with_model_and_config(
-        &server,
-        "emit an image on a legacy model",
-        r#"image("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==");"#,
-        "gpt-5.2",
-        |config| {
+    let builder = test_codex()
+        .with_model_info_override("image-budget-unsupported-model", |model| {
+            model.tool_mode = Some(ToolMode::CodeMode);
+            model.supports_image_detail_original = false;
+        })
+        .with_config(|config| {
+            let _ = config.features.enable(Feature::CodeMode);
+            let _ = config.features.enable(Feature::ExecutedToolCallMetadata);
             let _ = config.features.enable(Feature::UnifiedImageBudget);
-        },
+        });
+    let (_test, second_mock) = run_code_mode_turn_with_builder(
+        &server,
+        "emit an image on a model without original-detail support",
+        r#"image("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==");"#,
+        builder,
     )
     .await?;
 
@@ -4193,7 +4243,7 @@ async fn code_mode_view_image_rejects_invalid_file_without_exposing_contents() -
 
     let server = responses::start_mock_server().await;
     let builder = test_codex()
-        .with_model("gpt-5.4")
+        .with_model("gpt-5.5")
         .with_config(|config| {
             let _ = config.features.enable(Feature::CodeMode);
         })
@@ -4242,7 +4292,7 @@ async fn code_mode_can_use_view_image_result_with_image_helper(
 
     let server = responses::start_mock_server().await;
     let mut builder = test_codex()
-        .with_model("gpt-5.4")
+        .with_model("gpt-5.5")
         .with_config(move |config| {
             let _ = config.features.enable(Feature::CodeMode);
             if unified_image_budget {
@@ -4378,7 +4428,7 @@ image(imageItem);
         &server,
         "use exec to call the rmcp image scenario tool and emit its image output",
         code,
-        "gpt-5.4",
+        "gpt-5.5",
     )
     .await?;
 
@@ -4681,8 +4731,7 @@ await tools.exec_command({ cmd: "true", sandbox_permissions: "require_escalated"
 #[test_case("node_repl", true, true, false, Some("unbounded"); "text_fallback_without_context_bound")]
 #[test_case("node_repl", true, true, false, Some("small"); "text_fallback_with_insufficient_context")]
 #[test_case("node_repl", true, true, false, Some("large_prompt"); "images_resume_after_prompt_pressure")]
-#[test_case("node_repl", true, true, false, Some("buffered"); "multimodal_reviewer_preserves_model_owned_fallback_buffer")]
-#[test_case("node_repl", true, true, false, Some("rollover"); "multimodal_reviewer_rollover_replays_evidence")]
+#[test_case("node_repl", true, true, false, Some("compaction"); "multimodal_reviewer_compaction_preserves_evidence")]
 #[test_case("cua_repl", false, false, false, None; "cua_disabled")]
 #[test_case("cua_repl", true, false, false, None; "cua_manually_enabled_text_only")]
 #[test_case("cua_repl", true, true, false, None; "cua_manually_enabled_multimodal")]
@@ -4710,10 +4759,10 @@ async fn code_mode_node_repl_text_evidence_is_visible_only_to_guardian(
     const OTHER_NODE_REPL_RESULT: &str = "ECHOING: guardian-visible-other-tool-result";
     const UNRELATED_RESULT: &str = "ECHOING: guardian-hidden-unrelated-result";
     const PRIVATE_IMAGE: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+    const COMPACTION_SUMMARY: &str = "Guardian browser evidence summary";
     let server = responses::start_mock_server().await;
     let mcp_server_bin = remote_aware_stdio_server_bin()?;
-    let reviewer_rollover = reviewer_constraint == Some("rollover");
-    let reviewer_token_budget = matches!(reviewer_constraint, Some("buffered" | "rollover"));
+    let reviewer_compaction = reviewer_constraint == Some("compaction");
     let check_detail = enhanced_transcripts && transcript_images && reviewer_constraint.is_none();
     let mut large_image = Cursor::new(Vec::new());
     if check_detail {
@@ -4736,7 +4785,7 @@ async fn code_mode_node_repl_text_evidence_is_visible_only_to_guardian(
                     .iter_mut()
                     .find(|model| model.slug == "gpt-5.6-luna")
                     .expect("API-key Guardian reviewer");
-                if reviewer_token_budget {
+                if reviewer_compaction {
                     reviewer.context_window = Some(100_000);
                     reviewer.max_context_window = Some(100_000);
                     reviewer.auto_compact_token_limit = Some(50_000);
@@ -4755,7 +4804,7 @@ async fn code_mode_node_repl_text_evidence_is_visible_only_to_guardian(
                 .features
                 .enable(Feature::CodeMode)
                 .expect("enable Code Mode");
-            if reviewer_token_budget {
+            if reviewer_compaction {
                 config
                     .features
                     .enable(Feature::TokenBudget)
@@ -4797,8 +4846,7 @@ async fn code_mode_node_repl_text_evidence_is_visible_only_to_guardian(
     let test = builder.build_with_auto_env(&server).await?;
     wait_for_mcp_server(&test.codex, repl_server).await?;
     let images_enabled = auto_review_required || (enhanced_transcripts && transcript_images);
-    let reviewer_images =
-        images_enabled && (reviewer_constraint.is_none() || reviewer_token_budget);
+    let reviewer_images = images_enabled && (reviewer_constraint.is_none() || reviewer_compaction);
     let snapshot_padding = if images_enabled && reviewer_constraint != Some("large_prompt") {
         2_500
     } else {
@@ -4827,17 +4875,16 @@ await tools.mcp__node_repl__js({ code: 'nodeRepl.empty()' });
 await tools.mcp__node_repl__js({ code: 'await nodeRepl.emitImage(await tab.screenshot())' });
 if (LARGE_IMAGE) await tools.mcp__node_repl__image_scenario({ scenario: "invalid_image_bytes_then_image" });
 await tools.exec_command({ cmd: "true", sandbox_permissions: "require_escalated", justification: "review" });
-if (!REVIEWER_ROLLOVER) await tools.mcp__node_repl__js({ code: 'await nodeRepl.emitImage(await tab.screenshot())' });
+if (!REVIEWER_COMPACTION) await tools.mcp__node_repl__js({ code: 'await nodeRepl.emitImage(await tab.screenshot())' });
 if (LARGE_IMAGE) await tools.mcp__node_repl__image({});
 await tools.exec_command({ cmd: "printf second", sandbox_permissions: "require_escalated", justification: "review again" });
 "#
     .replace("node_repl", repl_server)
     .replace("SNAPSHOT_PADDING", &snapshot_padding.to_string())
-    .replace("REVIEWER_ROLLOVER", &reviewer_rollover.to_string())
+    .replace("REVIEWER_COMPACTION", &reviewer_compaction.to_string())
     .replace("LARGE_IMAGE", &check_detail.to_string());
-    let response_mock = responses::mount_sse_sequence(
-        &server,
-        vec![
+    let response_mock = responses::mount_sse_sequence(&server, {
+        let mut response_bodies = vec![
             sse(vec![
                 responses::ev_function_call_with_namespace(
                     "node-repl-call",
@@ -4862,22 +4909,34 @@ await tools.exec_command({ cmd: "printf second", sandbox_permissions: "require_e
             ]),
             sse(vec![
                 ev_assistant_message("guardian", r#"{"outcome":"allow"}"#),
-                if reviewer_token_budget {
+                if reviewer_compaction {
                     responses::ev_completed_with_tokens(
                         "resp-guardian",
-                        /*total_tokens*/ if reviewer_rollover { 70_000 } else { 60_000 },
+                        /*total_tokens*/ 70_000,
                     )
                 } else {
                     ev_completed("resp-guardian")
                 },
             ]),
+        ];
+        if reviewer_compaction {
+            response_bodies.push(sse(vec![
+                serde_json::json!({
+                    "type": "response.output_item.done",
+                    "item": {"type": "compaction", "encrypted_content": COMPACTION_SUMMARY},
+                }),
+                ev_completed("resp-guardian-compact"),
+            ]));
+        }
+        response_bodies.extend([
             sse(vec![
                 ev_assistant_message("guardian-again", r#"{"outcome":"allow"}"#),
                 ev_completed("resp-guardian-again"),
             ]),
             sse(vec![ev_completed("resp-done")]),
-        ],
-    )
+        ]);
+        response_bodies
+    })
     .await;
     test.submit_text_turn(&format!("review a nested {repl_server} tool response"))
         .await?;
@@ -4886,6 +4945,7 @@ await tools.exec_command({ cmd: "printf second", sandbox_permissions: "require_e
         .iter()
         .filter(|request| {
             request.body_json()["client_metadata"]["x-openai-subagent"].as_str() == Some("guardian")
+                && request.inputs_of_type("compaction_trigger").is_empty()
         })
         .collect::<Vec<_>>();
     assert_eq!(guardian_requests.len(), 2);
@@ -4970,43 +5030,26 @@ await tools.exec_command({ cmd: "printf second", sandbox_permissions: "require_e
             reviewer_image_urls
         }
     );
-    if reviewer_rollover {
-        let second_request = guardian_requests[1];
-        let second_prompt = second_request
-            .message_input_text_groups("user")
-            .last()
-            .expect("post-rollover Guardian review prompt")
-            .join("");
-        assert!(second_prompt.contains(">>> TRANSCRIPT START\n"));
-        assert!(!second_prompt.contains(">>> TRANSCRIPT DELTA START\n"));
-        assert!(second_prompt.contains(NODE_REPL_DOM_MIDDLE));
+    if reviewer_compaction {
+        let compact_requests = requests
+            .iter()
+            .filter(|request| !request.inputs_of_type("compaction_trigger").is_empty())
+            .collect::<Vec<_>>();
+        assert_eq!(compact_requests.len(), 1);
+        let compact_request = compact_requests[0];
+        assert!(
+            compact_request
+                .message_input_texts("user")
+                .concat()
+                .contains(NODE_REPL_DOM_MIDDLE)
+        );
         assert_eq!(
-            second_request.message_input_image_urls("user"),
-            vec![PRIVATE_IMAGE.to_string()],
-            "browser screenshots must be replayed into the fresh reviewer window"
+            guardian_requests[1].inputs_of_type("compaction")[0]["encrypted_content"],
+            COMPACTION_SUMMARY
         );
-        assert!(
-            second_request
-                .message_input_texts("developer")
-                .iter()
-                .any(|text| text.contains("Previous context window id:")),
-            "Guardian should roll over before rebuilding browser evidence"
-        );
-    } else if reviewer_token_budget {
-        let second_request = guardian_requests[1];
-        let second_prompt = second_request
-            .message_input_text_groups("user")
-            .last()
-            .expect("buffered Guardian review prompt")
-            .join("");
-        assert!(second_prompt.contains(">>> TRANSCRIPT DELTA START\n"));
-        assert!(
-            second_request
-                .message_input_texts("developer")
-                .iter()
-                .all(|text| !text.contains("Previous context window id:")),
-            "Guardian should preserve the reviewer model's fallback buffer before rolling over"
-        );
+        for request in &guardian_requests {
+            assert!(!request.has_content_kinds(&["token_budget.context_window"]));
+        }
     }
     let parent_request = requests.last().expect("parent turn should complete");
     let parent_input = serde_json::to_string(&parent_request.input())?;

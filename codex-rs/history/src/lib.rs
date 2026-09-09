@@ -50,10 +50,14 @@ pub struct CodexHarnessMetadata {
     #[serde(default)]
     pub client_authored: bool,
 
-    /// Overrides history's fallback truncation budget, including on resume.
-    /// Measured in tokens, with any tool-specific allowance already included.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fallback_token_limit_override: Option<usize>,
+    /// The originating history budget, including any tool-specific allowance.
+    /// Measured in tokens and reused when replaying persisted history.
+    #[serde(
+        default,
+        rename = "fallback_token_limit_override",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub history_truncation_token_limit: Option<usize>,
 
     /// Whether a response configuration update was created by the Codex harness itself.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -166,11 +170,15 @@ impl JsonSchema for RolloutItem {
 }
 
 mod guardian_history;
+mod reconciled_retained_context;
 mod retained_context;
 
+pub use reconciled_retained_context::ReconciledRetainedContext;
 pub use retained_context::RetainedContext;
 pub use retained_context::RetainedContextEntry;
 pub use retained_context::RetainedContextEvent;
+pub use retained_context::RetainedContextOrder;
+pub use retained_context::RetainedInputSource;
 pub use retained_context::RetainedUserMessage;
 pub use retained_context::VerifiedAnswer;
 pub use retained_context::VerifiedQuestionAnswer;

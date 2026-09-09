@@ -450,6 +450,7 @@ async fn migration_preserves_image_generation_failure_metadata() {
         }),
         saved_path: None,
         imagegen_request_id: None,
+        generation_id: None,
     };
     let image_completion =
         RolloutItem::EventMsg(EventMsg::ImageGenerationEnd(ImageGenerationEndEvent {
@@ -2289,8 +2290,7 @@ async fn migration_skips_threads_with_an_active_writer() {
     );
     let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
     let _writer = store
-        .writer_lock_coordinator
-        .acquire(thread_id)
+        .acquire_writer_lock(thread_id)
         .expect("acquire live writer lock");
     let original = fs::read(&path).expect("read active rollout");
 
@@ -2358,8 +2358,7 @@ async fn migration_recovers_a_published_rollout_with_missing_projection() {
         .expect("simulate pending migration journal");
 
     let writer = store
-        .writer_lock_coordinator
-        .acquire(thread_id)
+        .acquire_writer_lock(thread_id)
         .expect("acquire live writer lock");
     let busy = store
         .migrate_rollouts(apply_options())
