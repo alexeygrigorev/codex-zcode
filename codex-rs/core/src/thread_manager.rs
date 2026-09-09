@@ -522,6 +522,7 @@ fn zcode_models_catalog(
                 input_modalities: codex_protocol::openai_models::default_input_modalities(),
                 used_fallback_model_metadata: false,
                 supports_search_tool: true,
+                supports_experimental_context: false,
                 use_responses_lite: false,
                 node_repl_auto_review_required: false,
                 node_repl_disabled: false,
