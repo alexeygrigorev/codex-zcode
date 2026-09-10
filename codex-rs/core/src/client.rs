@@ -622,36 +622,21 @@ fn zcodex_task_name_from_description(description: &str) -> String {
     }
 }
 
-fn prepare_zcode_home(model_slug: &str) -> std::io::Result<PathBuf> {
-    let Some(real_home) = dirs::home_dir() else {
+/// Registers `model_slug` in the user's real ZCode config and selects it.
+///
+/// The ZCode CLI resolves its config as `$HOME/.zcode/cli/config.json`
+/// (no flag or environment variable relocates it), and running under the
+/// standard home keeps `~/.gitconfig` and `~/.config/gh` visible to the
+/// tools ZCode launches. The model override is therefore merged into the
+/// real config instead of an isolated home copy.
+fn prepare_zcode_config(model_slug: &str) -> std::io::Result<()> {
+    let Some(home) = dirs::home_dir() else {
         return Err(std::io::Error::other("HOME is not set"));
     };
-    let isolated_home = std::env::temp_dir().join(format!(
-        "zcodex-zcode-home-{}",
-        std::env::var("UID")
-            .ok()
-            .filter(|uid| !uid.is_empty())
-            .unwrap_or_else(whoami::username)
-    ));
-    std::fs::create_dir_all(&isolated_home)?;
-
-    let cli_dir = isolated_home.join(".zcode").join("cli");
-    let config_path = cli_dir.join("config.json");
-    let needs_copy = match std::fs::metadata(&config_path) {
-        Ok(metadata) => !metadata.is_file(),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
-        Err(error) => return Err(error),
-    };
-    if needs_copy {
-        std::fs::create_dir_all(&cli_dir)?;
-        std::fs::copy(
-            real_home.join(".zcode").join("cli").join("config.json"),
-            &config_path,
-        )?;
-    }
-
-    let mut config: serde_json::Value =
+    let config_path = home.join(".zcode").join("cli").join("config.json");
+    let original: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&config_path)?)?;
+    let mut config = original.clone();
     let config = config
         .as_object_mut()
         .ok_or_else(|| std::io::Error::other("ZCode config is not an object"))?;
@@ -681,8 +666,11 @@ fn prepare_zcode_home(model_slug: &str) -> std::io::Result<PathBuf> {
         "model".to_string(),
         serde_json::Value::String(format!("{ZCODE_PROVIDER_ID}/{model_slug}")),
     );
-    std::fs::write(&config_path, serde_json::to_string(&config)?)?;
-    Ok(isolated_home)
+    let updated = serde_json::to_string(&config)?;
+    if updated != serde_json::to_string(&original)? {
+        std::fs::write(&config_path, updated)?;
+    }
+    Ok(())
 }
 
 /// Loads the ZCode prompt from a temp file and requires the runtime.
@@ -2634,11 +2622,9 @@ impl ModelClientSession {
             eprintln!("[zcodex] request tools: {:?}", prompt.tools);
         }
         let _ = std::env::var("ZCODE_DEBUG_TOOLS");
-        let zcode_home = prepare_zcode_home(&model_slug);
-        if let Err(message) = &zcode_home {
-            warn!("ZCode model override unavailable: {message}");
+        if let Err(e) = prepare_zcode_config(&model_slug) {
+            warn!("ZCode model override unavailable: {e}");
         }
-        let zcode_home = zcode_home.ok();
 
         let has_tool_results = prompt
             .input
@@ -2694,9 +2680,6 @@ impl ModelClientSession {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .kill_on_drop(true);
-            if let Some(home) = &zcode_home {
-                command.env("HOME", home);
-            }
             let child = command.spawn();
 
             let mut child = match child {
