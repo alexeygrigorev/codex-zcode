@@ -1495,6 +1495,7 @@ fn zcode_turn_failure_error_maps_output_limit_to_context_window() {
     let error = super::zcode_turn_failure_error(
         "The model's response exceeded the output token maximum. \
          (model_output_limit_exceeded)",
+        "",
     );
     assert!(matches!(error, ApiError::ContextWindowExceeded));
 
@@ -1503,13 +1504,35 @@ fn zcode_turn_failure_error_maps_output_limit_to_context_window() {
     let error = super::zcode_turn_failure_error(
         "ZCode exited unsuccessfully (exit status: 1); stderr: \
          Error: model_output_limit_exceeded",
+        "",
     );
     assert!(matches!(error, ApiError::ContextWindowExceeded));
 }
 
 #[test]
+fn zcode_turn_failure_error_maps_projection_stderr_output_limit() {
+    // The result line's projection carries no error detail, so the generic
+    // fallback must consult the stderr tail for the provider code.
+    let error = super::zcode_turn_failure_error(
+        super::ZCODE_PROJECTION_FAILURE_MESSAGE,
+        "Error: model_output_limit_exceeded",
+    );
+    assert!(matches!(error, ApiError::ContextWindowExceeded));
+
+    // A detailed failure message is authoritative: stderr is not consulted.
+    let error = super::zcode_turn_failure_error(
+        "provider unavailable (rate_limited)",
+        "Error: model_output_limit_exceeded",
+    );
+    match error {
+        ApiError::Stream(message) => assert_eq!(message, "provider unavailable (rate_limited)"),
+        other => panic!("expected stream error, got {other:?}"),
+    }
+}
+
+#[test]
 fn zcode_turn_failure_error_keeps_other_failures_retryable() {
-    let error = super::zcode_turn_failure_error("provider unavailable (boom)");
+    let error = super::zcode_turn_failure_error("provider unavailable (boom)", "");
     match error {
         ApiError::Stream(message) => assert_eq!(message, "provider unavailable (boom)"),
         other => panic!("expected stream error, got {other:?}"),

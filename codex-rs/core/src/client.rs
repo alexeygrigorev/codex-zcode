@@ -530,6 +530,10 @@ fn zcode_failure_message(payload: &serde_json::Value) -> Option<String> {
 /// output-token cap.
 const ZCODE_OUTPUT_LIMIT_CODE: &str = "model_output_limit_exceeded";
 
+/// Failure message for turns whose only failure signal is the result line's
+/// `projection.status: "error"`; the projection carries no error detail.
+const ZCODE_PROJECTION_FAILURE_MESSAGE: &str = "ZCode turn failed (projection status: error)";
+
 /// Maps a ZCode turn failure to the API error Codex should act on.
 ///
 /// A failure carrying `model_output_limit_exceeded` is deterministic: the
@@ -539,8 +543,16 @@ const ZCODE_OUTPUT_LIMIT_CODE: &str = "model_output_limit_exceeded";
 /// context-window error - non-retryable, and it marks the token state as
 /// full so the next turn compacts the transcript before sampling instead of
 /// repeating the same doomed attempt.
-fn zcode_turn_failure_error(message: &str) -> ApiError {
-    if message.contains(ZCODE_OUTPUT_LIMIT_CODE) {
+///
+/// `stderr_tail` is consulted only when `message` is
+/// [`ZCODE_PROJECTION_FAILURE_MESSAGE`]: the result line's projection has no
+/// error detail, and the CLI writes the provider reason to stderr even when
+/// it exits 0.
+fn zcode_turn_failure_error(message: &str, stderr_tail: &str) -> ApiError {
+    let hit_output_limit = message.contains(ZCODE_OUTPUT_LIMIT_CODE)
+        || (message == ZCODE_PROJECTION_FAILURE_MESSAGE
+            && stderr_tail.contains(ZCODE_OUTPUT_LIMIT_CODE));
+    if hit_output_limit {
         ApiError::ContextWindowExceeded
     } else {
         ApiError::Stream(message.to_string())
@@ -3021,7 +3033,7 @@ impl ModelClientSession {
                             .and_then(|v| v.as_str())
                             == Some("error")
                     {
-                        failed = Some("ZCode turn failed (projection status: error)".to_string());
+                        failed = Some(ZCODE_PROJECTION_FAILURE_MESSAGE.to_string());
                     }
                 }
             }
@@ -3134,7 +3146,7 @@ impl ModelClientSession {
                         message.push_str("; stderr: ");
                         message.push_str(&stderr_text);
                     }
-                    let error = zcode_turn_failure_error(&message);
+                    let error = zcode_turn_failure_error(&message, &stderr_text);
                     warn!(
                         "{message}; mapped to {}",
                         if matches!(error, ApiError::ContextWindowExceeded) {
@@ -3149,7 +3161,7 @@ impl ModelClientSession {
                     if !stderr_text.is_empty() {
                         warn!("ZCode stderr: {stderr_text}");
                     }
-                    let error = zcode_turn_failure_error(&message);
+                    let error = zcode_turn_failure_error(&message, &stderr_text);
                     if matches!(error, ApiError::ContextWindowExceeded) {
                         warn!(
                             "ZCode turn hit the output limit; not retrying a deterministic \
