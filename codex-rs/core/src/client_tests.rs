@@ -1538,3 +1538,21 @@ fn zcode_turn_failure_error_keeps_other_failures_retryable() {
         other => panic!("expected stream error, got {other:?}"),
     }
 }
+
+#[test]
+fn zcode_token_usage_prefers_backend_context_used() {
+    let usage = super::zcode_token_usage(Some(432_000), 40_000, 4);
+    assert_eq!(usage.input_tokens, 432_000);
+    assert_eq!(usage.total_tokens, 432_000 + usage.output_tokens);
+    assert!(usage.output_tokens > 0);
+}
+
+#[test]
+fn zcode_token_usage_falls_back_to_byte_estimate() {
+    // A missing backend count falls back to the 4-bytes/token heuristic so
+    // a silent backend still feeds the auto-compact signal.
+    assert_eq!(
+        super::zcode_token_usage(None, 40_000, 0).total_tokens,
+        10_000
+    );
+}

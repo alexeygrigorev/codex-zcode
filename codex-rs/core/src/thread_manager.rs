@@ -392,6 +392,15 @@ pub fn build_models_manager(
     provider.models_manager(config.codex_home.to_path_buf(), model_catalog)
 }
 
+/// Auto-compaction bound for ZCode models.
+///
+/// The ZCode wire resends the whole flattened transcript on every model
+/// turn, and GLM degrades into output-limit repetition loops on very long
+/// transcripts. Bound the context far below the provider window (1M for
+/// GLM-5.3) so pre-turn compaction keeps prompts small and fast instead of
+/// letting turns grow until the provider kills them.
+const ZCODE_AUTO_COMPACT_TOKEN_LIMIT: i64 = 120_000;
+
 /// Zcode exposes no browsable `/models` endpoint through Codex's normal discovery path. Build the
 /// catalog from local ZCode configuration, retaining the configured model as a guaranteed entry.
 fn zcode_static_models_catalog(config: &Config) -> ModelsResponse {
@@ -437,7 +446,11 @@ fn zcode_models_catalog(
                 }
             } else {
                 seen_models.insert(key);
-                models.push((slug, context_window));
+                // Codex slug matching is case-sensitive prefix matching and
+                // config.toml models are lowercase, so store the catalog
+                // slugs lowercase or `glm-5.3-flash` never matches the
+                // `GLM-5.3-Flash` entry the ZCode v2 config provides.
+                models.push((slug.to_lowercase(), context_window));
             }
         }
     };
@@ -515,7 +528,7 @@ fn zcode_models_catalog(
                 supports_image_detail_original: false,
                 context_window,
                 max_context_window: None,
-                auto_compact_token_limit: None,
+                auto_compact_token_limit: Some(ZCODE_AUTO_COMPACT_TOKEN_LIMIT),
                 comp_hash: None,
                 effective_context_window_percent: 95,
                 experimental_supported_tools: Vec::new(),

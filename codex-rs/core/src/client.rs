@@ -88,6 +88,7 @@ use codex_protocol::protocol::Event as ProtocolEvent;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::InternalSessionSource;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::W3cTraceContext;
 use codex_rollout_trace::InferenceTraceAttempt;
 use codex_rollout_trace::InferenceTraceContext;
@@ -95,6 +96,7 @@ use codex_tools::ToolSpec;
 use codex_tools::create_tools_json_for_responses_api;
 use codex_tools::create_tools_json_for_responses_lite;
 use codex_tools::create_tools_raw_json_for_responses_api;
+use codex_utils_output_truncation::approx_tokens_from_byte_count_i64;
 use eventsource_stream::Event;
 use eventsource_stream::EventStreamError;
 use futures::StreamExt;
@@ -556,6 +558,29 @@ fn zcode_turn_failure_error(message: &str, stderr_tail: &str) -> ApiError {
         ApiError::ContextWindowExceeded
     } else {
         ApiError::Stream(message.to_string())
+    }
+}
+
+/// Builds the token usage Codex records for one completed ZCode invocation.
+///
+/// The wire resends the entire flattened transcript on every invocation and
+/// the backend reports no usage of its own, so without this Codex never sees
+/// the context fill up and auto-compact never fires. Prefer the backend's
+/// own post-compaction token count (`projection.contextUsed` on the result
+/// line); fall back to the 4-bytes/token heuristic core uses elsewhere.
+fn zcode_token_usage(
+    context_used: Option<i64>,
+    prompt_bytes: usize,
+    reply_bytes: usize,
+) -> TokenUsage {
+    let input_tokens =
+        context_used.unwrap_or_else(|| approx_tokens_from_byte_count_i64(prompt_bytes as i64));
+    let output_tokens = approx_tokens_from_byte_count_i64(reply_bytes as i64);
+    TokenUsage {
+        input_tokens,
+        output_tokens,
+        total_tokens: input_tokens.saturating_add(output_tokens),
+        ..TokenUsage::default()
     }
 }
 
@@ -2652,6 +2677,9 @@ impl ModelClientSession {
         // On every turn: runaway final replies trip the provider's output
         // limit and abort the whole turn mid-work.
         let user_text = format!("{user_text}{ZCODE_REPLY_BUDGET_NOTE}");
+        // Captured before the prompt text moves into the spawn task; feeds
+        // the token-usage fallback estimate for the Completed event.
+        let prompt_bytes = user_text.len();
 
         tokio::spawn(async move {
             let prompt_file = match write_zcode_prompt_file(&user_text) {
@@ -2752,6 +2780,7 @@ impl ModelClientSession {
             let mut failed: Option<String> = None;
             let mut started_output = false;
             let mut result_response: Option<String> = None;
+            let mut result_context_used: Option<i64> = None;
             let mut pending_tools: HashMap<String, PendingZcodeTool> = HashMap::new();
             let mut emitted_tool_calls: usize = 0;
             let mut completed_tool_ids: std::collections::HashSet<String> =
@@ -3024,6 +3053,12 @@ impl ModelClientSession {
                         .get("response")
                         .and_then(|v| v.as_str())
                         .map(str::to_string);
+                    // The backend's own post-compaction token count; zero or
+                    // missing means fall back to the byte estimate.
+                    result_context_used = parsed
+                        .pointer("/projection/contextUsed")
+                        .and_then(serde_json::Value::as_i64)
+                        .filter(|tokens| *tokens > 0);
                     // The headless runner writes the result line and exits 0
                     // even when the turn's projection ended in an error; a
                     // silent empty reply would look like a completed turn.
@@ -3077,6 +3112,9 @@ impl ModelClientSession {
             }
 
             let status = child.wait().await;
+            // Byte length before the final-text replacement and the move
+            // into the Message item; an estimate is fine for output tokens.
+            let reply_bytes = response_text.len();
             let stderr_text = String::from_utf8_lossy(
                 &stderr_tail
                     .lock()
@@ -3134,7 +3172,11 @@ impl ModelClientSession {
                     let _ = tx
                         .send(Ok(ResponseEvent::Completed {
                             response_id: request_id_for_stream,
-                            token_usage: None,
+                            token_usage: Some(zcode_token_usage(
+                                result_context_used,
+                                prompt_bytes,
+                                reply_bytes,
+                            )),
                             usage_metadata: None,
                             end_turn: Some(true),
                         }))

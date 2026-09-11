@@ -92,7 +92,9 @@ fn zcode_catalog_merges_sources_and_supports_full_reasoning_range() {
         .iter()
         .map(|model| model.slug.as_str())
         .collect::<Vec<_>>();
-    assert_eq!(slugs, vec!["GLM-5.2", "GLM-5-Turbo", "glm-5.3-flash"]);
+    // Catalog slugs are stored lowercase so the case-sensitive slug lookup
+    // matches the lowercase model slugs in config.toml.
+    assert_eq!(slugs, vec!["glm-5.2", "glm-5-turbo", "glm-5.3-flash"]);
     assert_eq!(catalog.models.len(), 3);
     assert_eq!(
         catalog
