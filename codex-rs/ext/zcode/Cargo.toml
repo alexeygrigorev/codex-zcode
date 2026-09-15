@@ -8,6 +8,7 @@ license.workspace = true
 name = "codex_zcode"
 path = "src/lib.rs"
 doctest = false
+test = false
 
 [lints]
 workspace = true
