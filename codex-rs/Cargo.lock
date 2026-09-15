@@ -5085,7 +5085,6 @@ dependencies = [
 name = "codex-zcode"
 version = "0.0.0"
 dependencies = [
- "codex-context-fragments",
  "codex-extension-api",
  "codex-protocol",
  "codex-tools",
