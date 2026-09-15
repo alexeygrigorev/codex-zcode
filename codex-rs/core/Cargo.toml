@@ -95,7 +95,6 @@ indexmap = { workspace = true }
 libc = { workspace = true }
 once_cell = { workspace = true }
 rand = { workspace = true }
-regex-lite = { workspace = true }
 rmcp = { workspace = true, default-features = false, features = [
     "base64",
     "macros",
@@ -155,6 +154,7 @@ maplit = { workspace = true }
 opentelemetry = { workspace = true }
 predicates = { workspace = true }
 pretty_assertions = { workspace = true }
+regex-lite = { workspace = true }
 test-case = "3.3.1"
 opentelemetry_sdk = { workspace = true, features = [
     "experimental_metrics_custom_reader",
