@@ -24,8 +24,6 @@ mod world_state;
 
 pub use approval_review::ApprovalDecision;
 pub use approval_review::ApprovalDecisionInput;
-pub use approval_review::ApprovalReviewError;
-pub use approval_review::ApprovalReviewInput;
 pub use approval_review::GuardianV2Enabled;
 pub use approval_review::SynchronousApprovalReviewer;
 pub use context::TurnContextContributionInput;
@@ -170,7 +168,8 @@ pub trait ThreadLifecycleContributor<C: Sync>: Send + Sync {
         })
     }
 
-    /// Called before the host drops the thread runtime and thread-scoped store.
+    /// Called during runtime teardown, before the host closes persistent history.
+    /// Contributors must cancel and join their background work before returning.
     fn on_thread_stop<'a>(&'a self, input: ThreadStopInput<'a>) -> ExtensionFuture<'a, ()> {
         Box::pin(async move {
             let _self = self;
@@ -192,6 +191,16 @@ pub trait TurnLifecycleContributor: Send + Sync {
             let _self = self;
             let _input = input;
         })
+    }
+
+    /// Observes a completed item without changing it or delaying streamed deltas.
+    fn on_item_completed<'a>(
+        &'a self,
+        _thread_store: &'a ExtensionData,
+        _turn_store: &'a ExtensionData,
+        _item: &'a TurnItem,
+    ) -> ExtensionFuture<'a, ()> {
+        Box::pin(std::future::ready(()))
     }
 
     /// Called before the host drops the completed turn runtime and turn store.

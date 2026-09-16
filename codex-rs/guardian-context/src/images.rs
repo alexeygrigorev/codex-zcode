@@ -10,6 +10,7 @@ use crate::SectionScope;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::ImageDetail;
+use codex_protocol::models::ImageReference;
 use codex_protocol::models::ResponseItem;
 use std::collections::VecDeque;
 
@@ -65,7 +66,11 @@ impl TranscriptImages {
             while images.len() >= MAX_TRANSCRIPT_IMAGES
                 || image_bytes + image_url.len() > MAX_TRANSCRIPT_IMAGE_BYTES
             {
-                let Some(ContentItem::InputImage { image_url, .. }) = images.pop_front() else {
+                let Some(ContentItem::InputImage {
+                    image: ImageReference::Inline { image_url },
+                    ..
+                }) = images.pop_front()
+                else {
                     break;
                 };
                 image_bytes -= image_url.len();
@@ -73,19 +78,33 @@ impl TranscriptImages {
             }
             image_bytes += image_url.len();
             images.push_back(ContentItem::InputImage {
-                image_url: image_url.to_owned(),
+                image: ImageReference::Inline {
+                    image_url: image_url.to_owned(),
+                },
                 detail,
             });
         };
 
+        // TODO(kc) Include file-backed images once Guardian can admit them without resolving or
+        // applying byte-based checks in Core.
         for item in items {
             match item {
                 ResponseItem::Message { role, content, .. }
                     if matches!(role.as_str(), "user" | "assistant") =>
                 {
                     for item in content {
-                        if let ContentItem::InputImage { image_url, detail } = item {
-                            include_image(image_url, *detail);
+                        match item {
+                            ContentItem::InputImage {
+                                image: ImageReference::Inline { image_url },
+                                detail,
+                            } => include_image(image_url, *detail),
+                            ContentItem::InputImage {
+                                image: ImageReference::File { .. },
+                                ..
+                            }
+                            | ContentItem::InputText { .. }
+                            | ContentItem::InputAudio { .. }
+                            | ContentItem::OutputText { .. } => {}
                         }
                     }
                 }
@@ -95,10 +114,18 @@ impl TranscriptImages {
                 {
                     if let Some(content) = output.content_items() {
                         for item in content {
-                            if let FunctionCallOutputContentItem::InputImage { image_url, detail } =
-                                item
-                            {
-                                include_image(image_url, *detail);
+                            match item {
+                                FunctionCallOutputContentItem::InputImage {
+                                    image: ImageReference::Inline { image_url },
+                                    detail,
+                                } => include_image(image_url, *detail),
+                                FunctionCallOutputContentItem::InputImage {
+                                    image: ImageReference::File { .. },
+                                    ..
+                                }
+                                | FunctionCallOutputContentItem::InputText { .. }
+                                | FunctionCallOutputContentItem::InputAudio { .. }
+                                | FunctionCallOutputContentItem::EncryptedContent { .. } => {}
                             }
                         }
                     }
@@ -108,8 +135,18 @@ impl TranscriptImages {
         }
         if input.include_tool_outputs {
             for image in input.node_repl_images {
-                if let ContentItem::InputImage { image_url, detail } = image {
-                    include_image(image_url, *detail);
+                match image {
+                    ContentItem::InputImage {
+                        image: ImageReference::Inline { image_url },
+                        detail,
+                    } => include_image(image_url, *detail),
+                    ContentItem::InputImage {
+                        image: ImageReference::File { .. },
+                        ..
+                    }
+                    | ContentItem::InputText { .. }
+                    | ContentItem::InputAudio { .. }
+                    | ContentItem::OutputText { .. } => {}
                 }
             }
         }

@@ -212,6 +212,8 @@ pub(super) async fn make_chatwidget_manual_with_auth(
         session_telemetry,
     };
     let mut widget = ChatWidget::new_with_op_target(common, super::CodexOpTarget::Direct(op_tx));
+    widget.windows_sandbox_host = crate::app::WindowsSandboxHost::Local;
+    widget.windows_sandbox_config.requirements = Some(None);
     widget.transcript.active_cell = None;
     widget.transcript.active_cell_revision = 0;
     widget.set_model(&resolved_model);
@@ -883,6 +885,7 @@ pub(super) fn begin_exec_with_source(
         .map(|parsed| AppServerCommandAction::from_core_with_cwd(parsed, &chat.config.cwd))
         .collect();
     let item = AppServerThreadItem::CommandExecution {
+        model_context: None,
         id: call_id.to_string(),
         command: codex_shell_command::parse_command::shlex_join(&command),
         cwd: chat.config.cwd.clone().into(),
@@ -908,6 +911,7 @@ pub(super) fn begin_unified_exec_startup(
 ) -> AppServerThreadItem {
     let command = vec!["bash".to_string(), "-lc".to_string(), raw_cmd.to_string()];
     let item = AppServerThreadItem::CommandExecution {
+        model_context: None,
         id: call_id.to_string(),
         command: codex_shell_command::parse_command::shlex_join(&command),
         cwd: chat.config.cwd.clone().into(),
@@ -994,6 +998,7 @@ pub(super) fn pending_steer(text: &str) -> PendingSteer {
         client_id: "test-submission".to_string(),
         user_message: UserMessage::from(text),
         history_record: UserMessageHistoryRecord::UserMessageText,
+        source: UserMessageSource::Prompt,
         compare_key: PendingSteerCompareKey {
             message: text.to_string(),
             image_count: 0,
@@ -1141,6 +1146,7 @@ pub(super) fn end_exec(
     handle_exec_end(
         chat,
         AppServerThreadItem::CommandExecution {
+            model_context: None,
             id,
             command,
             cwd,

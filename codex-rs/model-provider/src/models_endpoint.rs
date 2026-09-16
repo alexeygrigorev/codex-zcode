@@ -20,6 +20,7 @@ use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_login::collect_auth_env_telemetry;
 use codex_login::default_client::create_client_for_route_async;
+use codex_model_provider_info::CHATGPT_CODEX_BASE_URL;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_models_manager::manager::ModelsEndpointClient;
 use codex_models_manager::manager::ModelsEndpointFuture;
@@ -34,7 +35,6 @@ use tokio::time::timeout;
 
 use crate::auth::agent_identity_telemetry;
 use crate::auth::resolve_provider_auth;
-use crate::provider::enforce_managed_residency;
 
 const MODELS_REFRESH_TIMEOUT: Duration = Duration::from_secs(5);
 const MODELS_ENDPOINT: &str = "/models";
@@ -84,7 +84,13 @@ impl OpenAiModelsEndpoint {
         let identity = crate::models_identity::identity(&self.provider_info, auth.as_ref())?;
         let auth_mode = auth.as_ref().map(CodexAuth::auth_mode);
         let mut api_provider = self.provider_info.to_api_provider(auth_mode)?;
-        enforce_managed_residency(&mut api_provider);
+        if auth.as_ref().is_some_and(CodexAuth::is_api_key_auth)
+            && self.supports_api_key_models()
+            && self.provider_info.base_url.is_none()
+        {
+            // Codex metadata is served by the Codex backend, not the public /v1/models API.
+            api_provider.base_url = CHATGPT_CODEX_BASE_URL.to_string();
+        }
         let api_auth = resolve_provider_auth(auth.as_ref(), &self.provider_info)?;
         let request_url =
             ModelsClient::<ReqwestTransport>::request_url(&api_provider, client_version);
@@ -114,7 +120,7 @@ impl OpenAiModelsEndpoint {
                 .map_err(map_api_error)
         })
         .await
-        .map_err(|_| CodexErr::Timeout)??;
+        .map_err(|_| CodexErr::RequestTimeout)??;
         Ok(ModelsEndpointResponse {
             models,
             etag,
@@ -132,6 +138,10 @@ impl OpenAiModelsEndpoint {
 }
 
 impl ModelsEndpointClient for OpenAiModelsEndpoint {
+    fn supports_api_key_models(&self) -> bool {
+        self.provider_info.is_openai()
+    }
+
     fn identity(&self) -> Option<String> {
         let auth = self
             .auth_manager
@@ -290,6 +300,10 @@ impl RequestTelemetry for ModelsRequestTelemetry {
 }
 
 #[cfg(test)]
+#[path = "models_endpoint_timeout_tests.rs"]
+mod timeout_tests;
+
+#[cfg(test)]
 mod tests {
     use std::num::NonZeroU64;
     use std::sync::Mutex;
@@ -300,6 +314,10 @@ mod tests {
     use codex_login::default_client::ResidencyRequirement;
     use codex_login::default_client::create_client;
     use codex_login::default_client::set_default_client_residency_requirement;
+    use codex_models_manager::manager::ModelsManager;
+    use codex_models_manager::manager::OpenAiModelsManager;
+    use codex_models_manager::manager::RefreshStrategy;
+    use codex_protocol::auth::AuthMode;
     use codex_protocol::config_types::ModelProviderAuthInfo;
     use codex_protocol::openai_models::ModelsResponse;
     use pretty_assertions::assert_eq;
@@ -330,6 +348,76 @@ mod tests {
                     Some((http_client_factory.outbound_proxy_policy(), request_url));
                 Ok(ReqwestTransport::from_http_client(create_client()))
             })
+        }
+    }
+
+    #[derive(Debug)]
+    struct CaptureModelsUrl(Mutex<Option<String>>);
+
+    impl ModelsTransportBuilder for CaptureModelsUrl {
+        fn build(
+            &self,
+            _http_client_factory: HttpClientFactory,
+            request_url: String,
+        ) -> ModelsTransportFuture<'_> {
+            *self.0.lock().unwrap() = Some(request_url);
+            Box::pin(async { Err(std::io::Error::other("transport intentionally unavailable")) })
+        }
+    }
+
+    #[tokio::test]
+    async fn api_key_discovery_respects_provider_routing() {
+        let client_version = codex_models_manager::client_version_to_whole();
+        for (name, base_url, models_url, inference_url) in [
+            (
+                "OpenAI",
+                None,
+                Some("https://chatgpt.com/backend-api/codex/models"),
+                "https://api.openai.com/v1",
+            ),
+            (
+                "OpenAI",
+                Some("https://example.com/codex"),
+                Some("https://example.com/codex/models"),
+                "https://example.com/codex",
+            ),
+            (
+                "Azure",
+                Some("https://example.openai.azure.com/openai/v1"),
+                None,
+                "https://example.openai.azure.com/openai/v1",
+            ),
+        ] {
+            let capture = Arc::new(CaptureModelsUrl(Mutex::new(/*t*/ None)));
+            let auth = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("test-api-key"));
+            let endpoint = Arc::new(OpenAiModelsEndpoint {
+                provider_info: ModelProviderInfo {
+                    name: name.to_string(),
+                    ..ModelProviderInfo::create_openai_provider(base_url.map(str::to_string))
+                },
+                auth_manager: Some(auth.clone()),
+                transport_builder: capture.clone(),
+            });
+            let manager = OpenAiModelsManager::new_without_cache(endpoint.clone(), Some(auth));
+            manager.set_api_key_model_discovery_enabled(/*enabled*/ true);
+            manager
+                .raw_model_catalog(
+                    RefreshStrategy::Online,
+                    HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+                )
+                .await;
+            assert_eq!(
+                *capture.0.lock().unwrap(),
+                models_url.map(|url| format!("{url}?client_version={client_version}"))
+            );
+            assert_eq!(
+                endpoint
+                    .provider_info
+                    .to_api_provider(Some(AuthMode::ApiKey))
+                    .unwrap()
+                    .base_url,
+                inference_url
+            );
         }
     }
 

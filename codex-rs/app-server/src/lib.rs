@@ -43,7 +43,6 @@ use crate::transport::TransportEvent;
 use crate::transport::acquire_app_server_startup_lock;
 use crate::transport::app_server_startup_lock_path;
 use crate::transport::auth::policy_from_settings;
-use crate::transport::prepare_control_socket_path;
 use crate::transport::route_outgoing_envelope;
 use crate::transport::start_control_socket_acceptor;
 use crate::transport::start_remote_control;
@@ -55,6 +54,7 @@ use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::TextPosition as AppTextPosition;
 use codex_app_server_protocol::TextRange as AppTextRange;
+use codex_app_server_transport::daemon_recovery_file_path;
 use codex_config::ConfigLayerSource;
 use codex_config::ConfigLoadError;
 use codex_config::TextRange as CoreTextRange;
@@ -106,6 +106,7 @@ mod config_manager_service;
 mod connection_cleanup;
 mod connection_rpc_gate;
 mod current_time;
+mod daemon_thread_recovery;
 mod dynamic_tools;
 mod effective_plugin_change;
 mod error_code;
@@ -445,6 +446,15 @@ pub async fn run_main(
         AppServerRuntimeOptions::default(),
     )
     .await
+    .map(|_| ())
+}
+
+/// Reports whether shutdown finished or the managed daemon must exit without waiting for I/O.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppServerExit {
+    Graceful,
+    /// Executables should exit before dropping their runtime; libraries must not exit their host.
+    Forced,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -459,6 +469,7 @@ pub struct AppServerRuntimeOptions {
     pub plugin_startup_tasks: PluginStartupTasks,
     pub remote_control_startup_mode: RemoteControlStartupMode,
     pub install_shutdown_signal_handler: bool,
+    pub managed_daemon: bool,
 }
 
 impl Default for AppServerRuntimeOptions {
@@ -468,6 +479,7 @@ impl Default for AppServerRuntimeOptions {
             plugin_startup_tasks: PluginStartupTasks::Start,
             remote_control_startup_mode: RemoteControlStartupMode::ResolvePersisted,
             install_shutdown_signal_handler: true,
+            managed_daemon: false,
         }
     }
 }
@@ -483,7 +495,9 @@ pub async fn run_main_with_transport_options(
     session_source: SessionSource,
     auth: AppServerWebsocketAuthSettings,
     runtime_options: AppServerRuntimeOptions,
-) -> IoResult<()> {
+) -> IoResult<AppServerExit> {
+    #[cfg(target_os = "windows")]
+    let _registered_core = codex_windows_sandbox::registered_core_requested();
     let loader_overrides = loader_overrides_with_test_user_config_file(
         loader_overrides,
         test_user_config_file_from_env(),
@@ -618,10 +632,9 @@ pub async fn run_main_with_transport_options(
     codex_core::otel_init::record_process_start(otel.as_ref(), OTEL_SERVICE_NAME);
     codex_core::otel_init::install_sqlite_telemetry(otel.as_ref(), OTEL_SERVICE_NAME);
     let unix_socket_startup_lock = match &transport {
-        AppServerTransport::UnixSocket { socket_path } => {
+        AppServerTransport::UnixSocket { .. } => {
             let startup_lock_path = app_server_startup_lock_path(&codex_home)?;
             let startup_lock = acquire_app_server_startup_lock(startup_lock_path).await?;
-            prepare_control_socket_path(socket_path.as_path()).await?;
             Some(startup_lock)
         }
         _ => None,
@@ -741,18 +754,21 @@ pub async fn run_main_with_transport_options(
     let single_client_mode = matches!(&transport, AppServerTransport::Stdio);
     let graceful_signal_restart_enabled =
         runtime_options.install_shutdown_signal_handler && !single_client_mode;
+    let managed_daemon = matches!(&transport, AppServerTransport::UnixSocket { .. })
+        && runtime_options.managed_daemon;
     let mut app_server_client_name_rx = None;
 
     match &transport {
         AppServerTransport::Stdio => {
             let (stdio_client_name_tx, stdio_client_name_rx) = oneshot::channel::<String>();
             app_server_client_name_rx = Some(stdio_client_name_rx);
-            start_stdio_connection(
+            let handle = start_stdio_connection(
                 transport_event_tx.clone(),
-                &mut transport_accept_handles,
                 stdio_client_name_tx,
+                runtime_options.install_shutdown_signal_handler,
             )
             .await?;
+            transport_accept_handles.push(handle);
         }
         AppServerTransport::UnixSocket { socket_path } => {
             let accept_handle = start_control_socket_acceptor(
@@ -924,6 +940,7 @@ pub async fn run_main_with_transport_options(
         info!("outbound router task exited (channel closed)");
     });
 
+    let recovery_file = daemon_recovery_file_path(&config.codex_home);
     let processor_handle = tokio::spawn({
         let auth_manager = Arc::clone(&auth_manager);
         let analytics_events_client =
@@ -965,30 +982,82 @@ pub async fn run_main_with_transport_options(
         let mut active_admissions_rx = processor.turn_admission.subscribe_active();
         let mut connections = HashMap::<ConnectionId, ConnectionState>::new();
         let mut connection_cleanup_tasks = ConnectionCleanupTasks::new();
+        let mut thread_listener_tasks = tokio::task::JoinSet::new();
         let mut remote_control_status_rx = remote_control_handle.status_receiver();
         let mut remote_control_status = remote_control_status_rx.borrow().clone();
         let transport_shutdown_token = transport_shutdown_token.clone();
         async move {
+            let recovery_task = if managed_daemon {
+                match daemon_thread_recovery::start_recovery(
+                    recovery_file.clone(),
+                    Arc::clone(&processor),
+                )
+                .await
+                {
+                    Ok(task) => Some(task),
+                    Err(err) => {
+                        warn!("failed to consume daemon recovery snapshot: {err}");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
             let mut listen_for_threads = true;
+            // Keep force signals and daemon control events responsive while saving.
+            let mut snapshot = Box::pin(async {
+                let processor = Arc::clone(&processor);
+                let recovery_file = recovery_file.clone();
+                // Run independently: snapshot locks can require the event loop to make progress.
+                let task = tokio::spawn(async move {
+                    let saved = processor.daemon_recovery_snapshot().await;
+                    if let Err(err) = daemon_thread_recovery::snapshot(recovery_file, saved).await {
+                        warn!("failed to save threads during daemon shutdown: {err}");
+                    }
+                });
+                let _ = tokio_util::task::AbortOnDropHandle::new(task).await;
+            });
+            let mut snapshot_finished = !managed_daemon;
+            let mut clients_disconnected = false;
             let mut shutdown_state = ShutdownState::default();
+            let mut shutdown_signal_future = Box::pin(shutdown_signal());
             let exit_reason = loop {
                 // Sample submissions first: one can publish a running turn before
                 // releasing its permit, and shutdown must observe that new turn.
                 let active_admissions = *active_admissions_rx.borrow_and_update();
                 let running_turn_count = *running_turn_count_rx.borrow_and_update();
-                if matches!(
+                let ready_to_exit = matches!(
                     shutdown_state.update(running_turn_count, active_admissions, connections.len()),
                     ShutdownAction::Finish
-                ) {
-                    transport_shutdown_token.cancel();
-                    let _ = outbound_control_tx
-                        .send(OutboundControlEvent::DisconnectAll)
-                        .await;
-                    break "shutdown_requested";
+                );
+                if ready_to_exit {
+                    if let Some(task) = &recovery_task {
+                        task.abort();
+                    }
+                    let finished = snapshot_finished || shutdown_state.forced();
+                    if finished {
+                        transport_shutdown_token.cancel();
+                    }
+                    if managed_daemon && shutdown_state.forced() {
+                        break "forced_shutdown_requested";
+                    }
+                    if !clients_disconnected {
+                        let _ = outbound_control_tx
+                            .send(OutboundControlEvent::DisconnectAll)
+                            .await;
+                        clients_disconnected = true;
+                    }
+                    if finished {
+                        break "shutdown_requested";
+                    }
                 }
 
                 tokio::select! {
-                    shutdown_signal_result = shutdown_signal(), if graceful_signal_restart_enabled && !shutdown_state.forced() => {
+                    _ = &mut snapshot, if shutdown_state.requested() && active_admissions == 0 && !snapshot_finished => {
+                        snapshot_finished = true;
+                    }
+                    shutdown_signal_result = &mut shutdown_signal_future, if graceful_signal_restart_enabled && !shutdown_state.forced() => {
+                        shutdown_signal_future.set(shutdown_signal());
                         let signal = match shutdown_signal_result {
                             Ok(signal) => signal,
                             Err(err) => {
@@ -1013,6 +1082,12 @@ pub async fn run_main_with_transport_options(
                         let Some(event) = event else {
                             break "transport_channel_closed";
                         };
+                        if ready_to_exit && !matches!(event, TransportEvent::DaemonShutdown) {
+                            if let TransportEvent::ConnectionOpened { disconnect_sender: Some(token), .. } = event {
+                                token.cancel();
+                            }
+                            continue;
+                        }
                         match event {
                             TransportEvent::DaemonShutdown => {
                                 shutdown_state.on_signal(ShutdownSignal::Forceable, connections.len(), *running_turn_count_rx.borrow(), &processor.turn_admission);
@@ -1020,6 +1095,7 @@ pub async fn run_main_with_transport_options(
                             TransportEvent::ConnectionOpened {
                                 connection_id,
                                 origin,
+                                auth,
                                 writer,
                                 disconnect_sender,
                             } => {
@@ -1050,6 +1126,7 @@ pub async fn run_main_with_transport_options(
                                     connection_id,
                                     ConnectionState::new(
                                         origin,
+                                        auth,
                                         outbound_initialized,
                                         outbound_experimental_api_enabled,
                                         outbound_opted_out_notification_methods,
@@ -1082,12 +1159,15 @@ pub async fn run_main_with_transport_options(
                                 }
                             }
                             TransportEvent::IncomingMessage { connection_id, message } => {
+                                let Some(connection_state) = connections.get_mut(&connection_id) else {
+                                    warn!("dropping message from unknown connection: {connection_id:?}");
+                                    continue;
+                                };
+                                if connection_state.session.rpc_gate.is_closed() {
+                                    continue;
+                                }
                                 match message {
                                     JSONRPCMessage::Request(request) => {
-                                        let Some(connection_state) = connections.get_mut(&connection_id) else {
-                                            warn!("dropping request from unknown connection: {connection_id:?}");
-                                            continue;
-                                        };
                                         let was_initialized =
                                             connection_state.session.initialized();
                                         processor
@@ -1149,24 +1229,12 @@ pub async fn run_main_with_transport_options(
                                         }
                                     }
                                     JSONRPCMessage::Response(response) => {
-                                        if !connections.contains_key(&connection_id) {
-                                            warn!("dropping response from unknown connection: {connection_id:?}");
-                                            continue;
-                                        }
                                         processor.process_response(connection_id, response).await;
                                     }
                                     JSONRPCMessage::Notification(notification) => {
-                                        if !connections.contains_key(&connection_id) {
-                                            warn!("dropping notification from unknown connection: {connection_id:?}");
-                                            continue;
-                                        }
                                         processor.process_notification(notification).await;
                                     }
                                     JSONRPCMessage::Error(err) => {
-                                        if !connections.contains_key(&connection_id) {
-                                            warn!("dropping error from unknown connection: {connection_id:?}");
-                                            continue;
-                                        }
                                         processor.process_error(connection_id, err).await;
                                     }
                                 }
@@ -1174,6 +1242,11 @@ pub async fn run_main_with_transport_options(
                         }
                     }
                     _ = connection_cleanup_tasks.reap_next() => {}
+                    result = thread_listener_tasks.join_next(), if !thread_listener_tasks.is_empty() => {
+                        if let Some(Err(err)) = result {
+                            warn!("thread listener attachment failed: {err}");
+                        }
+                    }
                     changed = remote_control_status_rx.changed() => {
                         if changed.is_err() {
                             continue;
@@ -1188,7 +1261,7 @@ pub async fn run_main_with_transport_options(
                             .send_server_notification(notification)
                             .await;
                     }
-                    created = thread_created_rx.recv(), if listen_for_threads => {
+                    created = thread_created_rx.recv(), if listen_for_threads && !ready_to_exit => {
                         match created {
                             Ok(thread_id) => {
                                 let mut initialized_connection_ids = Vec::new();
@@ -1197,12 +1270,16 @@ pub async fn run_main_with_transport_options(
                                         initialized_connection_ids.push(*connection_id);
                                     }
                                 }
-                                processor
-                                    .try_attach_thread_listener(
-                                        thread_id,
-                                        initialized_connection_ids,
-                                    )
-                                    .await;
+                                let processor = Arc::clone(&processor);
+                                // Attachment can wait on snapshot locks; keep force shutdown responsive.
+                                thread_listener_tasks.spawn(async move {
+                                    processor
+                                        .try_attach_thread_listener(
+                                            thread_id,
+                                            initialized_connection_ids,
+                                        )
+                                        .await;
+                                });
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                                 // TODO(jif) handle lag.
@@ -1219,6 +1296,11 @@ pub async fn run_main_with_transport_options(
                 }
             };
 
+            if let Some(task) = recovery_task {
+                task.abort();
+            }
+            drop(snapshot);
+            drop(thread_listener_tasks);
             if !shutdown_state.forced() {
                 futures::future::join_all(connections.iter().map(
                     |(&connection_id, connection_state)| {
@@ -1238,12 +1320,19 @@ pub async fn run_main_with_transport_options(
                 shutdown_forced = shutdown_state.forced(),
                 "processor task exited"
             );
+            if managed_daemon && shutdown_state.forced() {
+                AppServerExit::Forced
+            } else {
+                AppServerExit::Graceful
+            }
         }
     });
 
     drop(transport_event_tx);
 
-    let _ = processor_handle.await;
+    if matches!(processor_handle.await, Ok(AppServerExit::Forced)) {
+        return Ok(AppServerExit::Forced);
+    }
     let _ = outbound_handle.await;
 
     transport_shutdown_token.cancel();
@@ -1252,7 +1341,7 @@ pub async fn run_main_with_transport_options(
         let _ = handle.await;
     }
 
-    Ok(())
+    Ok(AppServerExit::Graceful)
 }
 
 struct SqliteRecoveryNotice {

@@ -5,6 +5,7 @@
 use std::io::Write;
 
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::ImageReference;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::TruncationPolicy;
 
@@ -97,10 +98,17 @@ impl SectionCost {
             ContentItem::InputText { text } | ContentItem::OutputText { text } => {
                 self.text_bytes = self.text_bytes.saturating_add(text.len());
             }
-            ContentItem::InputImage { image_url, .. } => {
+            ContentItem::InputImage {
+                image: ImageReference::Inline { image_url },
+                ..
+            } => {
                 self.image_bytes = self.image_bytes.saturating_add(image_url.len());
                 self.image_count = self.image_count.saturating_add(1);
             }
+            ContentItem::InputImage {
+                image: ImageReference::File { .. },
+                ..
+            } => {}
             ContentItem::InputAudio { audio_url } => {
                 // Guardian currently has no audio contributor. Count a future opaque
                 // payload conservatively until its consumer supplies modality costs.
@@ -168,7 +176,21 @@ pub fn estimate_input_tokens(item: &ResponseItem) -> usize {
 }
 
 pub(super) fn content_tokens(item: &ContentItem) -> usize {
-    let bytes = ByteCount::measure(|counter| serde_json::to_writer(counter, item));
+    let mut bytes = ByteCount::measure(|counter| serde_json::to_writer(counter, item));
+    if let ContentItem::InputText { text } = item {
+        let extra_parts = crate::composition::bounded_text_parts(text)
+            .count()
+            .saturating_sub(1);
+        let framing = ByteCount::measure(|counter| {
+            serde_json::to_writer(
+                counter,
+                &ContentItem::InputText {
+                    text: String::new(),
+                },
+            )
+        });
+        bytes = bytes.saturating_add(extra_parts.saturating_mul(framing.saturating_add(1)));
+    }
     adjusted_tokens(bytes, std::slice::from_ref(item))
 }
 
@@ -192,7 +214,11 @@ pub(super) fn content_framing_tokens(item_count: usize) -> usize {
 
 fn adjusted_tokens(mut bytes: usize, content: &[ContentItem]) -> usize {
     for item in content {
-        if let ContentItem::InputImage { image_url, .. } = item {
+        if let ContentItem::InputImage {
+            image: ImageReference::Inline { image_url },
+            ..
+        } = item
+        {
             let payload = ByteCount::measure(|counter| serde_json::to_writer(counter, image_url));
             if payload == usize::MAX {
                 return usize::MAX;

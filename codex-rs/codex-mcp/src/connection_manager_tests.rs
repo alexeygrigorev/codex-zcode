@@ -106,10 +106,9 @@ impl McpConnectionSet {
             servers: HashMap::new(),
             event_stream_connection: None,
             disabled_servers: Vec::new(),
-            protocol_mode: crate::McpProtocolMode::Legacy,
             required_servers: Vec::new(),
             optional_startup_deadline: OnceLock::new(),
-            tool_plugin_provenance: Arc::new(ToolPluginProvenance::default()),
+            tool_plugin_context: Arc::new(ToolPluginContext::default()),
             prefix_mcp_tool_names,
             non_prefixed_mcp_tool_servers: Vec::new(),
             elicitation_requests: ElicitationRequestManager::new(
@@ -126,12 +125,17 @@ impl McpConnectionSet {
         }
     }
 
-    fn insert_test_client(&mut self, name: impl Into<String>, client: AsyncManagedClient) {
+    pub(crate) fn insert_test_client(
+        &mut self,
+        name: impl Into<String>,
+        client: AsyncManagedClient,
+    ) {
         let name = name.into();
         self.servers.insert(
             name,
             McpServerView {
                 tool_filter: ToolFilter::default(),
+                protocol_mode: crate::McpProtocolMode::Legacy,
                 connection: Arc::new(McpServerConnection {
                     identity: None,
                     client,
@@ -497,7 +501,7 @@ async fn prepared_call_timeout_includes_trusted_access_lookup() {
     config
         .server_permission_profiles
         .insert("docs".to_string(), PermissionProfile::default());
-    manager.tool_plugin_provenance = Arc::new(crate::tool_plugin_provenance(&config));
+    manager.tool_plugin_context = Arc::new(crate::tool_plugin_context(&config));
     let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
     manager.trusted_access = Some(TrustedAccessContext::new(
         auth.clone(),
@@ -514,11 +518,13 @@ async fn prepared_call_timeout_includes_trusted_access_lookup() {
         default_tools_approval_mode: None,
         tool_approval_modes: HashMap::new(),
     };
+    let client = Arc::new(create_test_managed_client(vec![tool.clone()]).await);
+    let catalog_snapshot = client.tool_catalog.read(Arc::new).await;
     let prepared = crate::PreparedMcpCall::new(
         manager,
-        Arc::new(create_test_managed_client(vec![tool.clone()]).await),
+        client,
         Arc::new(config),
-        /*catalog_revision*/ 0,
+        catalog_snapshot,
         tool,
         server_metadata,
         Some("docs@test".to_string()),
@@ -540,7 +546,7 @@ async fn prepared_call_timeout_includes_trusted_access_lookup() {
     assert!(format!("{error:#}").contains("timed out awaiting tools/call after 1s"));
 }
 
-async fn create_ready_async_managed_client(tools: Vec<ToolInfo>) -> AsyncManagedClient {
+pub(crate) async fn create_ready_async_managed_client(tools: Vec<ToolInfo>) -> AsyncManagedClient {
     AsyncManagedClient {
         client: futures::future::ready::<Result<ManagedClient, StartupOutcomeError>>(Ok(
             create_test_managed_client(tools).await,
@@ -548,6 +554,7 @@ async fn create_ready_async_managed_client(tools: Vec<ToolInfo>) -> AsyncManaged
         .boxed()
         .shared(),
         is_codex_apps_mcp_server: false,
+        server_capabilities: Arc::new(std::sync::Mutex::new(None)),
         cached_server_info: None,
         codex_apps_tools_cache_context: None,
         tool_catalog_cache_context: None,
@@ -713,6 +720,7 @@ fn create_gated_async_managed_client(
         AsyncManagedClient {
             client,
             is_codex_apps_mcp_server: false,
+            server_capabilities: Arc::new(std::sync::Mutex::new(None)),
             cached_server_info: None,
             codex_apps_tools_cache_context: None,
             tool_catalog_cache_context: None,
@@ -780,6 +788,7 @@ pub(crate) async fn create_test_manager_with_ready_apps_client(
             .boxed()
             .shared(),
             is_codex_apps_mcp_server: true,
+            server_capabilities: Arc::new(std::sync::Mutex::new(None)),
             cached_server_info: Some(create_test_server_info("Codex Apps")),
             codex_apps_tools_cache_context: Some(cache_context),
             tool_catalog_cache_context: None,
@@ -831,6 +840,7 @@ fn create_test_manager_with_failed_apps_startup(
         AsyncManagedClient {
             client,
             is_codex_apps_mcp_server: true,
+            server_capabilities: Arc::new(std::sync::Mutex::new(None)),
             cached_server_info: None,
             codex_apps_tools_cache_context: Some(cache_context),
             tool_catalog_cache_context: None,
@@ -1986,6 +1996,97 @@ fn codex_apps_env_bearer_token_bypasses_shared_tools_cache() {
 }
 
 #[tokio::test]
+async fn hosted_apps_protocol_mode_is_independent_of_generic_mode() -> anyhow::Result<()> {
+    let codex_home = tempdir()?;
+    let server_config: McpServerConfig =
+        serde_json::from_value(serde_json::json!({ "url": "http://127.0.0.1:1/ps/mcp" }))?;
+
+    for (generic_mode, hosted_mode) in [
+        (
+            crate::McpProtocolMode::Legacy,
+            crate::McpProtocolMode::V20260728,
+        ),
+        (
+            crate::McpProtocolMode::V20260728,
+            crate::McpProtocolMode::Legacy,
+        ),
+    ] {
+        let mut config = crate::mcp::tests::test_mcp_config(codex_home.path().to_path_buf());
+        config.protocol_mode = generic_mode;
+        config.host_owned_apps_protocol_mode = hosted_mode;
+        let mut catalog = crate::ResolvedMcpCatalog::builder();
+        catalog.register(crate::McpServerRegistration::from_hosted_apps(
+            "test-host",
+            /*contribution_order*/ 0,
+            server_config.clone(),
+        ));
+        catalog.register(crate::McpServerRegistration::from_config(
+            "third_party".to_string(),
+            server_config.clone(),
+        ));
+        config.mcp_server_catalog = catalog.build();
+
+        let startup_cancellation_token = CancellationToken::new();
+        startup_cancellation_token.cancel();
+        let manager = McpConnectionSet::new(
+            /*previous*/ None,
+            McpPublicationGate::already_published(),
+            McpRuntimeInput {
+                startup_policy: McpStartupPolicy::Eager,
+                config: Arc::new(config),
+                plugins_available: false,
+                ready_selected_capability_roots: Vec::new(),
+                mcp_servers: HashMap::from([
+                    (
+                        CODEX_APPS_MCP_SERVER_NAME.to_string(),
+                        EffectiveMcpServer::configured(server_config.clone()),
+                    ),
+                    (
+                        "third_party".to_string(),
+                        EffectiveMcpServer::configured(server_config.clone()),
+                    ),
+                ]),
+                submit_id: "protocol-mode-scope".to_string(),
+                tx_event: None,
+                startup_cancellation_token,
+                runtime_context: McpRuntimeContext::new(
+                    Arc::new(environment_manager_without_environments()),
+                    codex_home.path().to_path_buf(),
+                ),
+                codex_apps_tools_cache: ConnectorRuntimeManager::default(),
+                tool_catalog_cache: McpToolCatalogCache::default(),
+                codex_apps_tools_cache_key: ConnectorRuntimeContextKey::personal(
+                    /*account_id*/ None, /*chatgpt_user_id*/ None,
+                ),
+                client_mcp_extensions: ClientMcpExtensions::default(),
+                auth: None,
+                auth_manager: None,
+                elicitation_reviewer: None,
+                elicitation_lifecycle: None,
+            },
+            ElicitationRequestRouter::default(),
+        )
+        .await;
+
+        assert_eq!(
+            manager.servers[CODEX_APPS_MCP_SERVER_NAME].protocol_mode,
+            hosted_mode
+        );
+        assert_eq!(manager.servers["third_party"].protocol_mode, generic_mode);
+        assert_eq!(
+            manager
+                .event_stream_connection
+                .as_ref()
+                .expect("hosted Apps event stream")
+                .protocol_mode,
+            hosted_mode
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn codex_apps_extension_does_not_share_host_owned_tools_cache() -> anyhow::Result<()> {
     let codex_home = tempdir()?;
     let cache_key = ConnectorRuntimeContextKey::personal(
@@ -2004,59 +2105,81 @@ async fn codex_apps_extension_does_not_share_host_owned_tools_cache() -> anyhow:
 
     let server_config: McpServerConfig =
         serde_json::from_value(serde_json::json!({ "url": "http://127.0.0.1:1" }))?;
-    let mut config = crate::mcp::tests::test_mcp_config(codex_home.path().to_path_buf());
-    let mut catalog = crate::ResolvedMcpCatalog::builder();
-    catalog.register(crate::McpServerRegistration::from_extension(
-        CODEX_APPS_MCP_SERVER_NAME.to_string(),
-        "test-extension",
-        /*contribution_order*/ 0,
-        server_config.clone(),
-    ));
-    config.mcp_server_catalog = catalog.build();
+    for (hosted_mode, extension_mode, expected_mode) in [
+        (
+            crate::McpProtocolMode::V20260728,
+            None,
+            crate::McpProtocolMode::Legacy,
+        ),
+        (
+            crate::McpProtocolMode::Legacy,
+            Some(crate::McpProtocolMode::V20260728),
+            crate::McpProtocolMode::V20260728,
+        ),
+    ] {
+        let mut config = crate::mcp::tests::test_mcp_config(codex_home.path().to_path_buf());
+        config.host_owned_apps_protocol_mode = hosted_mode;
+        let mut registration = crate::McpServerRegistration::from_extension(
+            CODEX_APPS_MCP_SERVER_NAME.to_string(),
+            "test-extension",
+            /*contribution_order*/ 0,
+            server_config.clone(),
+        );
+        if let Some(mode) = extension_mode {
+            registration = registration.with_protocol_mode(mode);
+        }
+        let mut catalog = crate::ResolvedMcpCatalog::builder();
+        catalog.register(registration);
+        config.mcp_server_catalog = catalog.build();
 
-    let startup_cancellation_token = CancellationToken::new();
-    startup_cancellation_token.cancel();
-    let manager = McpConnectionSet::new(
-        /*previous*/ None,
-        McpPublicationGate::already_published(),
-        McpRuntimeInput {
-            startup_policy: McpStartupPolicy::Eager,
-            config: Arc::new(config),
-            plugins_available: false,
-            ready_selected_capability_roots: Vec::new(),
-            mcp_servers: HashMap::from([(
-                CODEX_APPS_MCP_SERVER_NAME.to_string(),
-                EffectiveMcpServer::configured(server_config),
-            )]),
-            submit_id: "cache-ownership-test".to_string(),
-            tx_event: None,
-            startup_cancellation_token,
-            runtime_context: McpRuntimeContext::new(
-                Arc::new(environment_manager_without_environments()),
-                codex_home.path().to_path_buf(),
-            ),
-            codex_apps_tools_cache,
-            tool_catalog_cache: McpToolCatalogCache::default(),
-            codex_apps_tools_cache_key: cache_key,
-            client_mcp_extensions: ClientMcpExtensions::default(),
-            auth: None,
-            auth_manager: None,
-            elicitation_reviewer: None,
-            elicitation_lifecycle: None,
-        },
-        ElicitationRequestRouter::default(),
-    )
-    .await;
+        let startup_cancellation_token = CancellationToken::new();
+        startup_cancellation_token.cancel();
+        let manager = McpConnectionSet::new(
+            /*previous*/ None,
+            McpPublicationGate::already_published(),
+            McpRuntimeInput {
+                startup_policy: McpStartupPolicy::Eager,
+                config: Arc::new(config),
+                plugins_available: false,
+                ready_selected_capability_roots: Vec::new(),
+                mcp_servers: HashMap::from([(
+                    CODEX_APPS_MCP_SERVER_NAME.to_string(),
+                    EffectiveMcpServer::configured(server_config.clone()),
+                )]),
+                submit_id: "cache-ownership-test".to_string(),
+                tx_event: None,
+                startup_cancellation_token,
+                runtime_context: McpRuntimeContext::new(
+                    Arc::new(environment_manager_without_environments()),
+                    codex_home.path().to_path_buf(),
+                ),
+                codex_apps_tools_cache: codex_apps_tools_cache.clone(),
+                tool_catalog_cache: McpToolCatalogCache::default(),
+                codex_apps_tools_cache_key: cache_key.clone(),
+                client_mcp_extensions: ClientMcpExtensions::default(),
+                auth: None,
+                auth_manager: None,
+                elicitation_reviewer: None,
+                elicitation_lifecycle: None,
+            },
+            ElicitationRequestRouter::default(),
+        )
+        .await;
 
-    let client = manager.test_client(CODEX_APPS_MCP_SERVER_NAME);
-    assert!(
-        client.codex_apps_tools_cache_context.is_none(),
-        "an extension must not receive the host-owned Apps cache"
-    );
-    assert!(
-        !client.has_cached_tools(),
-        "an extension must not expose cached host-owned Apps tools"
-    );
+        let client = manager.test_client(CODEX_APPS_MCP_SERVER_NAME);
+        assert_eq!(
+            manager.servers[CODEX_APPS_MCP_SERVER_NAME].protocol_mode, expected_mode,
+            "an ordinary extension must use its own mode, not the hosted protocol default"
+        );
+        assert!(
+            client.codex_apps_tools_cache_context.is_none(),
+            "an extension must not receive the host-owned Apps cache"
+        );
+        assert!(
+            !client.has_cached_tools(),
+            "an extension must not expose cached host-owned Apps tools"
+        );
+    }
 
     Ok(())
 }
@@ -2091,6 +2214,7 @@ async fn list_all_tools_uses_shared_codex_apps_cache_while_client_is_pending() {
         AsyncManagedClient {
             client: pending_client,
             is_codex_apps_mcp_server: true,
+            server_capabilities: Arc::new(std::sync::Mutex::new(None)),
             cached_server_info: None,
             codex_apps_tools_cache_context: Some(cache_context),
             tool_catalog_cache_context: None,
@@ -2149,6 +2273,7 @@ async fn capture_binding_uses_the_ready_clients_own_tools() {
         AsyncManagedClient {
             client: futures::future::ready(Ok(ready_client)).boxed().shared(),
             is_codex_apps_mcp_server: true,
+            server_capabilities: Arc::new(std::sync::Mutex::new(None)),
             cached_server_info: None,
             codex_apps_tools_cache_context: Some(cache_context),
             tool_catalog_cache_context: None,
@@ -2512,6 +2637,7 @@ async fn list_available_server_infos_uses_cache_while_client_is_pending() {
         AsyncManagedClient {
             client: pending_client,
             is_codex_apps_mcp_server: true,
+            server_capabilities: Arc::new(std::sync::Mutex::new(None)),
             cached_server_info: Some(server_info.clone()),
             codex_apps_tools_cache_context: None,
             tool_catalog_cache_context: None,
@@ -2608,6 +2734,7 @@ async fn capture_binding_exposes_cached_tools_before_startup() {
         AsyncManagedClient {
             client: pending_client,
             is_codex_apps_mcp_server: true,
+            server_capabilities: Arc::new(std::sync::Mutex::new(None)),
             cached_server_info: None,
             codex_apps_tools_cache_context: Some(cache_context),
             tool_catalog_cache_context: None,
@@ -2699,7 +2826,7 @@ async fn capture_binding_skips_pending_optional_servers_after_configured_shared_
     ));
     plugin_config.mcp_server_catalog = catalog.build();
     plugin_config.optional_mcp_startup_grace = Duration::from_millis(250);
-    manager.tool_plugin_provenance = Arc::new(crate::tool_plugin_provenance(&plugin_config));
+    manager.tool_plugin_context = Arc::new(crate::tool_plugin_context(&plugin_config));
     for server_name in ["pending-one", "pending-two", "pending-selected"] {
         manager.insert_test_client(
             server_name.to_string(),
@@ -2708,6 +2835,7 @@ async fn capture_binding_skips_pending_optional_servers_after_configured_shared_
                     .boxed()
                     .shared(),
                 is_codex_apps_mcp_server: false,
+                server_capabilities: Arc::new(std::sync::Mutex::new(None)),
                 cached_server_info: None,
                 codex_apps_tools_cache_context: None,
                 tool_catalog_cache_context: None,
@@ -2723,7 +2851,7 @@ async fn capture_binding_skips_pending_optional_servers_after_configured_shared_
         &permission_profile,
         /*prefix_mcp_tool_names*/ true,
     );
-    required_manager.tool_plugin_provenance = Arc::clone(&manager.tool_plugin_provenance);
+    required_manager.tool_plugin_context = Arc::clone(&manager.tool_plugin_context);
     required_manager.insert_test_client(
         "pending-selected",
         manager.test_client("pending-selected").clone(),
@@ -2959,6 +3087,7 @@ async fn capture_binding_shares_optional_startup_grace_across_connection_sets() 
                     .boxed()
                     .shared(),
                 is_codex_apps_mcp_server: false,
+                server_capabilities: Arc::new(std::sync::Mutex::new(None)),
                 cached_server_info: None,
                 codex_apps_tools_cache_context: None,
                 tool_catalog_cache_context: Some(cache_context.clone()),
@@ -3592,6 +3721,7 @@ async fn list_all_tools_blocks_while_client_is_pending_without_cached_tools() {
         AsyncManagedClient {
             client: pending_client,
             is_codex_apps_mcp_server: true,
+            server_capabilities: Arc::new(std::sync::Mutex::new(None)),
             cached_server_info: None,
             codex_apps_tools_cache_context: None,
             tool_catalog_cache_context: None,
@@ -3649,6 +3779,7 @@ async fn shutdown_cancels_pending_tool_listing() {
         AsyncManagedClient {
             client: pending_client,
             is_codex_apps_mcp_server: true,
+            server_capabilities: Arc::new(std::sync::Mutex::new(None)),
             cached_server_info: None,
             codex_apps_tools_cache_context: None,
             tool_catalog_cache_context: None,
@@ -3695,6 +3826,7 @@ async fn shutdown_continues_after_caller_is_aborted() {
         AsyncManagedClient {
             client: blocking_client,
             is_codex_apps_mcp_server: true,
+            server_capabilities: Arc::new(std::sync::Mutex::new(None)),
             cached_server_info: None,
             codex_apps_tools_cache_context: None,
             tool_catalog_cache_context: None,
@@ -3747,6 +3879,7 @@ async fn list_all_tools_does_not_block_when_shared_codex_apps_cache_is_empty() {
         AsyncManagedClient {
             client: pending_client,
             is_codex_apps_mcp_server: true,
+            server_capabilities: Arc::new(std::sync::Mutex::new(None)),
             cached_server_info: None,
             codex_apps_tools_cache_context: Some(cache_context),
             tool_catalog_cache_context: None,
@@ -3799,6 +3932,7 @@ async fn list_all_tools_uses_shared_codex_apps_cache_when_client_startup_fails()
         AsyncManagedClient {
             client: failed_client,
             is_codex_apps_mcp_server: true,
+            server_capabilities: Arc::new(std::sync::Mutex::new(None)),
             cached_server_info: Some(server_info.clone()),
             codex_apps_tools_cache_context: Some(cache_context),
             tool_catalog_cache_context: None,
@@ -4907,6 +5041,7 @@ async fn manager_with_reusable_ready_server(
     manager.servers.insert(
         "docs".to_string(),
         McpServerView {
+            protocol_mode: crate::McpProtocolMode::Legacy,
             connection: Arc::new(McpServerConnection {
                 identity: Some(reusable_server_identity("docs", config, runtime_context)),
                 client: create_ready_async_managed_client(tools).await,
@@ -4993,7 +5128,9 @@ async fn apps_catalog_broadcast_preserves_running_calls_and_rejects_stale_calls(
     .with_live_scope("apps".to_string());
     let original = vec![create_test_tool(CODEX_APPS_MCP_SERVER_NAME, "original")];
     let updated = vec![create_test_tool(CODEX_APPS_MCP_SERVER_NAME, "updated")];
+    store_current_tools(&context, original.clone());
     let catalog = ClientToolCatalog::new(original.clone(), context.subscribe());
+    let snapshot = catalog.read(Arc::new).await;
 
     store_current_tools(&context, original.clone());
     assert_eq!(
@@ -5003,17 +5140,11 @@ async fn apps_catalog_broadcast_preserves_running_calls_and_rejects_stale_calls(
     );
 
     let (release, released) = tokio::sync::oneshot::channel::<()>();
-    let running = catalog.run_with_revision(
-        /*expected_revision*/ 0,
-        || async { released.await.unwrap() },
-    );
+    let running = catalog.run_with_snapshot(&snapshot, || async { released.await.unwrap() });
     tokio::pin!(running);
     assert!(futures::poll!(&mut running).is_pending());
     store_current_tools(&context, updated.clone());
-    let stale = catalog.run_with_revision(
-        /*expected_revision*/ 0,
-        || async { panic!("stale preparation") },
-    );
+    let stale = catalog.run_with_snapshot(&snapshot, || async { panic!("stale preparation") });
     tokio::pin!(stale);
     assert!(
         futures::poll!(&mut stale).is_pending(),
@@ -5024,15 +5155,94 @@ async fn apps_catalog_broadcast_preserves_running_calls_and_rejects_stale_calls(
     assert_eq!(stale.await, None::<()>);
     assert_eq!(
         catalog
-            .read(|catalog| (catalog.revision, catalog.tools.clone()))
+            .read(|catalog| (catalog.revision, catalog.tools.to_vec()))
             .await,
         (1, updated.clone())
     );
 
     // A client whose startup finishes late adopts the already-published result.
     let late = ClientToolCatalog::new(original, context.subscribe());
-    assert_eq!(late.read(|catalog| catalog.tools.clone()).await, updated);
+    assert_eq!(late.read(|catalog| catalog.tools.to_vec()).await, updated);
     Ok(())
+}
+
+#[tokio::test]
+async fn apps_catalog_broadcast_restores_equivalent_calls() -> anyhow::Result<()> {
+    let codex_home = tempdir()?;
+    let context = create_codex_apps_tools_cache_context(
+        codex_home.path().to_path_buf(),
+        /*account_id*/ None,
+        /*chatgpt_user_id*/ None,
+    )
+    .with_live_scope("apps".to_string());
+    let original = vec![
+        create_test_tool(CODEX_APPS_MCP_SERVER_NAME, "first"),
+        create_test_tool(CODEX_APPS_MCP_SERVER_NAME, "second"),
+    ];
+    store_current_tools(&context, original.clone());
+    let catalog = ClientToolCatalog::new(original.clone(), context.subscribe());
+    let snapshot = catalog.read(Arc::new).await;
+
+    let mut changed = original.clone();
+    changed[0].tool.description = Some("Changed definition".into());
+    store_current_tools(&context, changed);
+    assert_eq!(
+        catalog
+            .run_with_snapshot(&snapshot, || async { panic!("changed preparation") })
+            .await,
+        None::<()>
+    );
+
+    let mut restored = original;
+    restored.reverse();
+    store_current_tools(&context, restored);
+    assert_eq!(
+        catalog
+            .run_with_snapshot(&snapshot, || async { "prepared" })
+            .await,
+        Some("prepared")
+    );
+    catalog
+        .refresh(
+            || async { Ok((snapshot.tools.to_vec(), ())) },
+            |tools, ()| store_current_tools(&context, tools.to_vec()),
+        )
+        .await?;
+    assert_eq!(
+        catalog
+            .run_with_snapshot(&snapshot, || async { panic!("refreshed preparation") })
+            .await,
+        None::<()>
+    );
+    Ok(())
+}
+
+#[test]
+fn idle_apps_clients_do_not_retain_replaced_tools() {
+    let context = ConnectorRuntimeManager::<ToolInfo>::new_without_cache()
+        .context(
+            PathBuf::from("unused"),
+            ConnectorRuntimeContextKey::personal(
+                /*account_id*/ None, /*chatgpt_user_id*/ None,
+            ),
+        )
+        .with_live_scope("apps".into());
+    let tool = create_test_tool(CODEX_APPS_MCP_SERVER_NAME, "original");
+    let schema = Arc::downgrade(&tool.tool.input_schema);
+    store_current_tools(&context, vec![tool]);
+    let clients = [
+        ClientToolCatalog::new(Vec::new(), context.subscribe()),
+        ClientToolCatalog::new(Vec::new(), context.subscribe()),
+    ];
+    store_current_tools(
+        &context,
+        vec![create_test_tool(CODEX_APPS_MCP_SERVER_NAME, "updated")],
+    );
+    assert!(
+        schema.upgrade().is_none(),
+        "idle clients must not own the old schema"
+    );
+    drop(clients);
 }
 
 #[tokio::test]
@@ -5044,11 +5254,12 @@ async fn apps_catalog_broadcast_survives_an_older_local_refresh() -> anyhow::Res
         /*chatgpt_user_id*/ None,
     )
     .with_live_scope("apps".to_string());
+    store_current_tools(&context, Vec::new());
     let catalog = ClientToolCatalog::new(Vec::new(), context.subscribe());
     let older_ticket = context.begin_fetch(ConnectorRuntimeFetchSource::HardRefresh);
     let newer = vec![create_test_tool(CODEX_APPS_MCP_SERVER_NAME, "newer")];
     store_current_tools(&context, newer.clone());
-    assert_eq!(catalog.read(|catalog| catalog.tools.clone()).await, newer);
+    assert_eq!(catalog.read(|catalog| catalog.tools.to_vec()).await, newer);
     catalog
         .refresh(
             || async { Ok((Vec::new(), older_ticket)) },
@@ -5061,7 +5272,7 @@ async fn apps_catalog_broadcast_survives_an_older_local_refresh() -> anyhow::Res
             },
         )
         .await?;
-    assert_eq!(catalog.read(|catalog| catalog.tools.clone()).await, newer);
+    assert_eq!(catalog.read(|catalog| catalog.tools.to_vec()).await, newer);
     Ok(())
 }
 
@@ -5226,11 +5437,13 @@ async fn reconciliation_reuses_connection_without_relisting_regular_tools() -> a
     previous.servers.insert(
         "docs".to_string(),
         McpServerView {
+            protocol_mode: crate::McpProtocolMode::Legacy,
             connection: Arc::new(McpServerConnection {
                 identity: Some(reusable_server_identity("docs", &config, &runtime_context)),
                 client: AsyncManagedClient {
                     client: futures::future::ready(Ok(managed_client)).boxed().shared(),
                     is_codex_apps_mcp_server: false,
+                    server_capabilities: Arc::new(std::sync::Mutex::new(None)),
                     cached_server_info: None,
                     codex_apps_tools_cache_context: None,
                     tool_catalog_cache_context: None,
@@ -5796,6 +6009,7 @@ async fn reconciliation_replaces_closed_connections() -> anyhow::Result<()> {
                 .boxed()
                 .shared(),
             is_codex_apps_mcp_server: false,
+            server_capabilities: Arc::new(std::sync::Mutex::new(None)),
             cached_server_info: None,
             codex_apps_tools_cache_context: None,
             tool_catalog_cache_context: None,

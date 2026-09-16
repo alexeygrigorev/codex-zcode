@@ -9,7 +9,7 @@ use crate::exec_policy::AllowPrefixRules;
 use crate::shell_snapshot::ShellSnapshot;
 use crate::shell_snapshot::ShellSnapshotFile;
 use crate::shell_snapshot::ShellSnapshotSandbox;
-use crate::tools::sandboxing::executor_windows_sandbox_level;
+use crate::tools::sandboxing::executor_windows_sandbox_selection;
 use arc_swap::ArcSwap;
 use codex_core_plugins::PluginCommandAttribution;
 use codex_core_plugins::ResolvedPluginMetricsOperation;
@@ -227,7 +227,7 @@ impl TurnEnvironment {
             workspace_roots: self.workspace_roots().to_vec(),
             user_home_dir: self.user_home_dir.clone(),
             temporary_directories: self.temporary_directories.clone(),
-            windows_sandbox_level: executor_windows_sandbox_level(
+            windows_sandbox_selection: executor_windows_sandbox_selection(
                 config.windows_sandbox_level,
                 self.cwd(),
             ),
@@ -295,6 +295,8 @@ pub struct TurnContext {
     /// Frozen settings used to construct this context. Legacy turn consumers
     /// keep this view even when later steps use different settings.
     pub(crate) initial_settings: Arc<ResolvedStepSettings>,
+    /// Thread-owned plugin selection captured when this turn was admitted.
+    pub(crate) disabled_plugin_ids: Vec<String>,
     /// Snapshot for the next step; request consumers use their captured StepContext.
     pub(super) current_settings: ArcSwap<ResolvedStepSettings>,
     /// Turn-wide telemetry; model-attributed step work should use `StepContext::session_telemetry`.
@@ -478,22 +480,22 @@ impl TurnContext {
     }
 
     /// Combines the selected environment's workspace roots with its permission profile roots.
-    pub(crate) fn effective_workspace_roots(&self) -> Vec<AbsolutePathBuf> {
+    pub(crate) fn effective_workspace_roots(&self) -> Vec<PathUri> {
         let Some(environment) = self.environments.primary() else {
             return self.config.effective_workspace_roots();
         };
 
-        let mut workspace_roots = environment
-            .workspace_roots()
-            .iter()
-            .filter_map(|root| root.to_abs_path().ok())
-            .collect::<Vec<_>>();
+        let mut workspace_roots = environment.workspace_roots().to_vec();
         for root in environment
             .config()
             .permission_profile
             .profile_workspace_roots()
         {
-            if !workspace_roots.contains(root) {
+            let root = root.as_uri();
+            if !workspace_roots
+                .iter()
+                .any(|existing| existing.to_string() == root.to_string())
+            {
                 workspace_roots.push(root.clone());
             }
         }
@@ -594,6 +596,7 @@ impl TurnContext {
             use_model_token_budget_defaults: self.use_model_token_budget_defaults,
             auth_manager: self.auth_manager.clone(),
             initial_settings: Arc::clone(&step_settings),
+            disabled_plugin_ids: self.disabled_plugin_ids.clone(),
             current_settings: ArcSwap::from(step_settings),
             session_telemetry,
             provider: self.provider.clone(),
@@ -649,14 +652,39 @@ impl TurnContext {
     }
 
     pub(crate) fn to_turn_context_item(&self) -> TurnContextItem {
-        let workspace_roots = self.effective_workspace_roots();
+        // The legacy rollout field still stores host-native paths. Keep its
+        // runtime-root filtering and omit it for unrepresentable profile roots;
+        // the authoritative permission profile retains its concrete entries.
+        let profile_roots = self.environments.primary().map_or_else(
+            || self.config.permissions.profile_workspace_roots(),
+            |environment| {
+                environment
+                    .config()
+                    .permission_profile
+                    .profile_workspace_roots()
+            },
+        );
+        let workspace_roots = if profile_roots
+            .iter()
+            .all(|root| root.as_uri().to_abs_path().is_ok())
+        {
+            let roots = self
+                .effective_workspace_roots()
+                .iter()
+                .filter_map(|root| root.to_abs_path().ok())
+                .collect::<Vec<_>>();
+            (!roots.is_empty()).then_some(roots)
+        } else {
+            None
+        };
         #[allow(deprecated)]
         let cwd = self.cwd.clone();
         TurnContextItem {
             turn_id: Some(self.sub_id.clone()),
             root_turn_id: self.turn_metadata_state.root_turn_id(),
+            disabled_plugin_ids: Some(self.disabled_plugin_ids.clone()),
             cwd,
-            workspace_roots: (!workspace_roots.is_empty()).then_some(workspace_roots),
+            workspace_roots,
             current_date: self.current_date.clone(),
             timezone: self.timezone.clone(),
             approval_policy: self.approval_policy(),
@@ -866,6 +894,7 @@ impl Session {
             use_model_token_budget_defaults,
             auth_manager,
             initial_settings: Arc::clone(&step_settings),
+            disabled_plugin_ids: session_configuration.disabled_plugin_ids.clone(),
             current_settings: ArcSwap::from(step_settings),
             session_telemetry: session_telemetry_for_context,
             provider,
@@ -1013,15 +1042,14 @@ impl Session {
             .resolve_model_info(
                 self.services.models_manager.as_ref(),
                 &session_configuration.model_info_overrides,
-                self.features.enabled(Feature::Personality),
             )
             .await;
-        self.services
-            .thread_extension_data
-            .insert(model_info.clone());
-
         let multi_agent_version = match multi_agent_runtime {
             TurnMultiAgentRuntime::ResolveAndStore => {
+                // A background preview must not overwrite a newer turn's model metadata.
+                self.services
+                    .thread_extension_data
+                    .insert(model_info.clone());
                 self.resolve_multi_agent_version_for_model(&model_info, &per_turn_config)
             }
             TurnMultiAgentRuntime::Preview => per_turn_config.multi_agent_version_for_model(
@@ -1034,18 +1062,8 @@ impl Session {
             .services
             .plugins_manager
             .plugins_for_config(&plugins_input)
-            .await;
-        // Cache changes from another process do not notify this session's hook runtime.
-        if !self.hooks().matches_plugin_hooks(
-            plugin_outcome.iter_effective_plugin_hook_sources(),
-            plugin_outcome.iter_effective_plugin_hook_warnings(),
-        ) {
-            // Keep the refresh state out of the enclosing turn-construction future.
-            Box::pin(self.refresh_hooks(Arc::clone(
-                &session_configuration.original_config_do_not_use,
-            )))
-            .await;
-        }
+            .await
+            .without_plugins(&session_configuration.disabled_plugin_ids);
         let trusted_plugin_roots = TrustedPluginRoots::from_plugin_load_outcome(
             &plugin_outcome,
             per_turn_config.codex_home.as_path(),

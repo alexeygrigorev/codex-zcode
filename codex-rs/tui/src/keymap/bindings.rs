@@ -396,8 +396,12 @@ define_runtime_action_bindings! {
         resume,
         search,
         new_task,
+        new_worktree,
         rename,
         stop,
+        archive,
+        delete,
+        hide,
         toggle_grouping,
     ],
     "approval" => Approval, approval, approval [

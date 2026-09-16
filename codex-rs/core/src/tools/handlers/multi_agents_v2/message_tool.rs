@@ -5,24 +5,10 @@
 
 use super::analytics::ToolCallAnalytics;
 use super::*;
-use crate::agent_communication::AgentCommunicationContext;
-use crate::agent_communication::AgentCommunicationKind;
+use crate::agent::control::MessageDeliveryError;
+use crate::agent::control::MessageDeliveryMode;
 use crate::tools::context::FunctionToolOutput;
 use codex_protocol::error::CodexErrorDetails;
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MessageDeliveryMode {
-    QueueOnly,
-    TriggerTurn,
-}
-
-impl MessageDeliveryMode {
-    fn trigger_turn(self) -> bool {
-        match self {
-            Self::QueueOnly => false,
-            Self::TriggerTurn => true,
-        }
-    }
-}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -69,17 +55,27 @@ pub(super) async fn handle_message_string_tool(
     analytics.set_receiver(receiver_thread_id);
     // Models that address agents by invented IDs (observed with the ZCode
     // backend) can only recover if the error names the agents that do exist.
-    let receiver_agent = match session
+    let message_preview = sub_agent_message_preview(&message);
+    let receiver_agent_path = match session
         .services
         .agent_control
-        .ensure_agent_known(receiver_thread_id)
+        .deliver_message(
+            session.thread_id,
+            &turn,
+            receiver_thread_id,
+            agent_message_from_tool(message, &source),
+            mode,
+        )
+        .await
     {
-        Ok(receiver_agent) => receiver_agent,
-        Err(err) if matches!(err.details(), CodexErrorDetails::ThreadNotFound(_)) => {
+        Ok(receiver_agent_path) => receiver_agent_path,
+        Err(MessageDeliveryError::Agent(err))
+            if matches!(err.details(), CodexErrorDetails::ThreadNotFound(_)) =>
+        {
             let roster = session
                 .services
                 .agent_control
-                .list_agents(&turn.session_source, None)
+                .list_agents(&turn.session_source, /*path_prefix*/ None)
                 .await
                 .map(|agents| {
                     agents
@@ -94,64 +90,13 @@ pub(super) async fn handle_message_string_tool(
                  the target): {roster}"
             )));
         }
-        Err(err) => return Err(collab_agent_error(receiver_thread_id, err)),
+        Err(MessageDeliveryError::InvalidRequest(message)) => {
+            return Err(FunctionCallError::RespondToModel(message));
+        }
+        Err(MessageDeliveryError::Agent(err)) => {
+            return Err(collab_agent_error(receiver_thread_id, err));
+        }
     };
-    if mode == MessageDeliveryMode::TriggerTurn
-        && receiver_agent
-            .agent_path
-            .as_ref()
-            .is_some_and(AgentPath::is_root)
-    {
-        return Err(FunctionCallError::RespondToModel(
-            "Follow-up tasks can't target the root agent".to_string(),
-        ));
-    }
-    let receiver_agent_path = receiver_agent.agent_path.clone().ok_or_else(|| {
-        FunctionCallError::RespondToModel("target agent is missing an agent_path".to_string())
-    })?;
-    let resume_config = build_agent_resume_config(turn.as_ref())?;
-    session
-        .services
-        .agent_control
-        .ensure_v2_agent_loaded(resume_config, receiver_thread_id, /*parent*/ None)
-        .await
-        .map_err(|err| collab_agent_error(receiver_thread_id, err))?;
-    let author = turn
-        .session_source
-        .get_agent_path()
-        .unwrap_or_else(AgentPath::root);
-    let message_preview = sub_agent_message_preview(&message);
-    let communication = communication_from_tool_message(
-        author,
-        receiver_agent_path.clone(),
-        message,
-        &source,
-        mode.trigger_turn(),
-    );
-    let kind = match mode {
-        MessageDeliveryMode::QueueOnly => AgentCommunicationKind::Message,
-        MessageDeliveryMode::TriggerTurn => AgentCommunicationKind::Followup,
-    };
-    let context = AgentCommunicationContext::new(kind, session.thread_id);
-    let parent_turn_id =
-        matches!(mode, MessageDeliveryMode::TriggerTurn).then(|| turn.sub_id.clone());
-    let result = session
-        .services
-        .agent_control
-        .send_inter_agent_communication(
-            receiver_thread_id,
-            communication,
-            context,
-            crate::TurnStartOptions {
-                parent_turn_id,
-                root_turn_id: turn.turn_metadata_state.root_turn_id(),
-                cyber_access_program: turn.cyber_access_program,
-                ..Default::default()
-            },
-        )
-        .await
-        .map_err(|err| collab_agent_error(receiver_thread_id, err));
-    result?;
     emit_sub_agent_activity(
         &session,
         &turn,

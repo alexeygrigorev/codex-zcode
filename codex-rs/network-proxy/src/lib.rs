@@ -25,6 +25,8 @@ mod responses;
 mod runtime;
 mod socks5;
 mod state;
+#[cfg(target_os = "macos")]
+mod system_dns;
 mod upstream;
 #[cfg(target_os = "windows")]
 mod windows_proxy_ingress;
@@ -83,6 +85,7 @@ pub use proxy::Args;
 pub use proxy::CODEX_PROXY_GIT_SSH_COMMAND_MARKER;
 pub use proxy::DEFAULT_NO_PROXY_VALUE;
 pub use proxy::ManagedNetworkSandboxContext;
+pub use proxy::ManagedProxyRouting;
 pub use proxy::NO_PROXY_ENV_KEYS;
 pub use proxy::NetworkProxy;
 pub use proxy::NetworkProxyBuilder;

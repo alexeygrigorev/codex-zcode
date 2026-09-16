@@ -1,5 +1,7 @@
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
+use codex_protocol::models::ImageReference;
 use codex_protocol::models::LocalShellAction;
 use codex_protocol::models::LocalShellExecAction;
 use codex_protocol::models::LocalShellStatus;
@@ -41,7 +43,10 @@ fn entry(kind: ConversationTranscriptEntryKind, text: &str) -> ConversationTrans
 
 #[test]
 fn registered_transcript_preserves_shared_roles_and_node_repl_tool_attribution() {
-    let approved_action = format!("{MANUAL_APPROVAL_DEVELOPER_PREFIX}\nApproved action: {{}}");
+    let approved_action = format!(
+        "{MANUAL_APPROVAL_DEVELOPER_PREFIX}\nApproved action: {}",
+        "exact action ".repeat(/*n*/ 1_000)
+    );
     let history = vec![
         ResponseItem::Message {
             id: None,
@@ -238,6 +243,21 @@ fn outputs_with_call_ids_or_explicit_names_are_retained() {
             Some("notifications"),
             "named notification",
         ),
+        ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: None,
+            name: Some("notifications".to_string()),
+            namespace: Some("slack".to_string()),
+            output: FunctionCallOutputPayload::from_content_items(vec![
+                FunctionCallOutputContentItem::InputImage {
+                    image: ImageReference::Inline {
+                        image_url: "data:image/png;base64,image".to_string(),
+                    },
+                    detail: None,
+                },
+            ]),
+            internal_chat_message_metadata_passthrough: None,
+        },
         output(
             Some("missing-call"),
             Some("notifications"),
@@ -287,6 +307,12 @@ fn outputs_with_call_ids_or_explicit_names_are_retained() {
             let mut expected = vec![
                 generic("orphaned function output"),
                 named.clone(),
+                entry(
+                    ConversationTranscriptEntryKind::ToolOutput(
+                        "tool slack.notifications result".to_string(),
+                    ),
+                    "[non-text output]",
+                ),
                 generic("named orphaned function output"),
                 generic("orphaned custom output"),
                 generic("named orphaned custom output"),
@@ -340,7 +366,7 @@ fn reused_registry_applies_current_history_sources_and_entry_limits() {
             transcript_items(&sections[0]),
             vec![ConversationTranscriptEntry {
                 kind: ConversationTranscriptEntryKind::User,
-                text: truncate_text(&text, message_tokens),
+                text: text.clone(),
                 original_bytes: text.len(),
             }]
         );
@@ -377,7 +403,7 @@ fn reused_registry_applies_current_history_sources_and_entry_limits() {
             .expect("transcript collection should succeed");
         let mut expected = vec![ConversationTranscriptEntry {
             kind: ConversationTranscriptEntryKind::User,
-            text: truncate_text(&text, /*max_tokens*/ 60),
+            text: text.clone(),
             original_bytes: text.len(),
         }];
         if include_tool_calls {

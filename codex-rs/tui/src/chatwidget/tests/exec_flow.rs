@@ -164,6 +164,7 @@ async fn replayed_commands_preserve_individual_output_and_failure_status() {
     let cwd = chat.config.cwd.clone();
     let replayed_command =
         |id: &str, output: &str, source: ExecCommandSource| AppServerThreadItem::CommandExecution {
+            model_context: None,
             id: id.to_string(),
             command: format!("printf {output}"),
             cwd: cwd.clone().into(),
@@ -612,6 +613,7 @@ async fn exec_end_without_begin_uses_event_command() {
     handle_exec_end(
         &mut chat,
         AppServerThreadItem::CommandExecution {
+            model_context: None,
             id: "call-orphan".to_string(),
             command: codex_shell_command::parse_command::shlex_join(&command),
             cwd: cwd.into(),
@@ -1297,6 +1299,7 @@ async fn bang_shell_enter_while_task_running_submits_run_user_shell_command() {
     let thread_id = ThreadId::new();
     let rollout_file = NamedTempFile::new().unwrap();
     let configured = crate::session_state::ThreadSessionState {
+        windows_sandbox_host: crate::app::WindowsSandboxHost::Local,
         thread_id,
         forked_from_id: None,
         fork_parent_title: None,

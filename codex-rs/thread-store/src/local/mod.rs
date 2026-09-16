@@ -16,6 +16,7 @@ mod rollout_migration;
 #[allow(dead_code)]
 mod rollout_lineage;
 mod search_threads;
+mod thread_attachments;
 mod thread_history;
 mod thread_history_materialization;
 mod thread_rollout_resolver;
@@ -52,6 +53,8 @@ use tokio::sync::OwnedRwLockReadGuard;
 use tokio::sync::OwnedRwLockWriteGuard;
 use tokio::sync::RwLock;
 
+use crate::AddThreadAttachmentOutcome;
+use crate::AddThreadAttachmentParams;
 use crate::AppendThreadItemsParams;
 use crate::ArchiveThreadParams;
 use crate::ArchiveThreadsParams;
@@ -66,6 +69,7 @@ use crate::DeletedProject;
 use crate::ItemPage;
 use crate::ListItemsParams;
 use crate::ListProjectsParams;
+use crate::ListThreadAttachmentsParams;
 use crate::ListThreadSectionsParams;
 use crate::ListThreadsParams;
 use crate::ListTimelineParams;
@@ -79,6 +83,8 @@ use crate::PreparedFork;
 use crate::ProjectMoveOutcome;
 use crate::ReadThreadByRolloutPathParams;
 use crate::ReadThreadParams;
+use crate::RemoveThreadAttachmentOutcome;
+use crate::RemoveThreadAttachmentParams;
 use crate::RenameThreadSectionParams;
 use crate::ResumeThreadParams;
 use crate::RevertThreadParams;
@@ -91,6 +97,7 @@ use crate::StoredThread;
 use crate::StoredThreadHistory;
 use crate::StoredThreadSection;
 use crate::StoredThreadSectionsPage;
+use crate::ThreadAttachmentPage;
 use crate::ThreadMetadataPatch;
 use crate::ThreadOccurrenceSearchPage;
 use crate::ThreadPage;
@@ -474,6 +481,19 @@ impl ThreadStore for LocalThreadStore {
         })
     }
 
+    fn read_pending_thread_metadata(
+        &self,
+        thread_id: ThreadId,
+    ) -> ThreadStoreFuture<'_, Option<ThreadMetadataPatch>> {
+        Box::pin(async move {
+            Ok(self
+                .pending_thread_metadata
+                .lock(thread_id)
+                .await
+                .and_then(|metadata| metadata.clone()))
+        })
+    }
+
     fn remove_pending_thread_metadata(&self, thread_id: ThreadId) -> ThreadStoreFuture<'_, ()> {
         Box::pin(async move {
             self.pending_thread_metadata.remove(thread_id).await;
@@ -578,6 +598,46 @@ impl ThreadStore for LocalThreadStore {
         params: DeleteThreadSectionParams,
     ) -> ThreadStoreFuture<'_, bool> {
         Box::pin(async move { thread_sections::delete_thread_section(self, params).await })
+    }
+
+    fn supports_thread_attachments(&self) -> bool {
+        self.state_db.is_some()
+    }
+
+    fn copy_thread_attachments(
+        &self,
+        source_thread_id: ThreadId,
+        destination_thread_id: ThreadId,
+    ) -> ThreadStoreFuture<'_, ()> {
+        Box::pin(async move {
+            thread_attachments::copy_thread_attachments(
+                self,
+                source_thread_id,
+                destination_thread_id,
+            )
+            .await
+        })
+    }
+
+    fn add_thread_attachment(
+        &self,
+        params: AddThreadAttachmentParams,
+    ) -> ThreadStoreFuture<'_, AddThreadAttachmentOutcome> {
+        Box::pin(async move { thread_attachments::add_thread_attachment(self, params).await })
+    }
+
+    fn list_thread_attachments(
+        &self,
+        params: ListThreadAttachmentsParams,
+    ) -> ThreadStoreFuture<'_, ThreadAttachmentPage> {
+        Box::pin(async move { thread_attachments::list_thread_attachments(self, params).await })
+    }
+
+    fn remove_thread_attachment(
+        &self,
+        params: RemoveThreadAttachmentParams,
+    ) -> ThreadStoreFuture<'_, RemoveThreadAttachmentOutcome> {
+        Box::pin(async move { thread_attachments::remove_thread_attachment(self, params).await })
     }
 
     fn supports_projects(&self) -> bool {
@@ -701,6 +761,8 @@ impl ThreadStore for LocalThreadStore {
 
 #[cfg(test)]
 mod tests {
+    #[path = "acquisition_tests.rs"]
+    mod acquisition_tests;
     use std::sync::Arc;
 
     use codex_protocol::ThreadId;
@@ -957,6 +1019,7 @@ mod tests {
             RolloutItem::TurnContext(TurnContextItem {
                 turn_id: Some("turn-1".to_string()),
                 root_turn_id: None,
+                disabled_plugin_ids: None,
                 cwd: serde_json::from_value(serde_json::json!(cwd)).expect("absolute cwd"),
                 workspace_roots: None,
                 current_date: None,
@@ -981,13 +1044,16 @@ mod tests {
             })
         };
 
+        let mut guard = crate::LiveThreadInitGuard::default();
         let live_thread = LiveThread::create_with_inherited_model_context(
             store,
             params,
             &[turn_context("parent-model", AskForApproval::Never)],
+            &mut guard,
         )
         .await
         .expect("create live thread with inherited context");
+        guard.commit();
         live_thread
             .persist(PersistContext::Standard)
             .await
@@ -1043,6 +1109,7 @@ mod tests {
             .append_items(&[RolloutItem::EventMsg(EventMsg::TurnStarted(
                 TurnStartedEvent {
                     turn_id: "turn-1".to_string(),
+                    root_turn_id: None,
                     trace_id: None,
                     started_at: None,
                     model_context_window: None,
