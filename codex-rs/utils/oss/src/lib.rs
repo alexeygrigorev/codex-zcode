@@ -1,10 +1,14 @@
 //! OSS provider utilities shared between TUI and exec.
 
+#[cfg(feature = "oss")]
 use codex_core::config::Config;
+#[cfg(feature = "oss")]
 use codex_model_provider_info::LMSTUDIO_OSS_PROVIDER_ID;
+#[cfg(feature = "oss")]
 use codex_model_provider_info::OLLAMA_OSS_PROVIDER_ID;
 
 /// Returns the default model for a given OSS provider.
+#[cfg(feature = "oss")]
 pub fn get_default_model_for_oss_provider(provider_id: &str) -> Option<&'static str> {
     match provider_id {
         LMSTUDIO_OSS_PROVIDER_ID => Some(codex_lmstudio::DEFAULT_OSS_MODEL),
@@ -14,6 +18,7 @@ pub fn get_default_model_for_oss_provider(provider_id: &str) -> Option<&'static 
 }
 
 /// Ensures the specified OSS provider is ready (models downloaded, service reachable).
+#[cfg(feature = "oss")]
 pub async fn ensure_oss_provider_ready(
     provider_id: &str,
     config: &Config,
@@ -38,7 +43,34 @@ pub async fn ensure_oss_provider_ready(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(not(feature = "oss"))]
+mod lean {
+    use codex_core::config::Config;
+
+    /// Returns the default model for a given OSS provider.
+    ///
+    /// This build excludes the `oss` feature, so no OSS provider defaults exist.
+    pub fn get_default_model_for_oss_provider(_provider_id: &str) -> Option<&'static str> {
+        None
+    }
+
+    /// Ensures the specified OSS provider is ready (models downloaded, service reachable).
+    pub async fn ensure_oss_provider_ready(
+        _provider_id: &str,
+        _config: &Config,
+    ) -> Result<(), std::io::Error> {
+        Err(std::io::Error::other(
+            "OSS provider support is not included in this build (missing the `oss` feature)",
+        ))
+    }
+}
+
+#[cfg(not(feature = "oss"))]
+pub use lean::ensure_oss_provider_ready;
+#[cfg(not(feature = "oss"))]
+pub use lean::get_default_model_for_oss_provider;
+
+#[cfg(all(test, feature = "oss"))]
 mod tests {
     use super::*;
 
