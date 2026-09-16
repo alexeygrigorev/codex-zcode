@@ -13,7 +13,6 @@ pub enum SlashCommand {
     // DO NOT ALPHA-SORT! Enum order is presentation order in the popup, so
     // more frequently used commands should be listed first.
     Model,
-    Ide,
     Permissions,
     Keymap,
     Vim,
@@ -122,9 +121,6 @@ impl SlashCommand {
             SlashCommand::MemoryDrop => "DO NOT USE",
             SlashCommand::MemoryUpdate => "DO NOT USE",
             SlashCommand::Model => "choose what model and reasoning effort to use",
-            SlashCommand::Ide => {
-                "include current selection, open files, and other context from your IDE"
-            }
             SlashCommand::Plan => "switch to Plan mode",
             SlashCommand::Voice => "start or stop voice; use /voice settings to choose a voice",
             SlashCommand::Goal => "set or view the goal for a long-running task",
@@ -167,7 +163,6 @@ impl SlashCommand {
                 | SlashCommand::Plan
                 | SlashCommand::Goal
                 | SlashCommand::Voice
-                | SlashCommand::Ide
                 | SlashCommand::Keymap
                 | SlashCommand::Mcp
                 | SlashCommand::Export
@@ -195,7 +190,6 @@ impl SlashCommand {
                 | SlashCommand::Daemon
                 | SlashCommand::Pwd
                 | SlashCommand::Usage
-                | SlashCommand::Ide
         )
     }
 
@@ -251,7 +245,6 @@ impl SlashCommand {
             | SlashCommand::Statusline
             | SlashCommand::AutoReview
             | SlashCommand::Feedback
-            | SlashCommand::Ide
             | SlashCommand::Quit
             | SlashCommand::Exit
             | SlashCommand::Side
@@ -302,7 +295,6 @@ mod tests {
     #[test]
     fn certain_commands_are_available_during_task() {
         assert!(SlashCommand::Goal.available_during_task());
-        assert!(SlashCommand::Ide.available_during_task());
         assert!(SlashCommand::Title.available_during_task());
         assert!(SlashCommand::Statusline.available_during_task());
         assert!(SlashCommand::Raw.available_during_task());

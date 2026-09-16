@@ -506,9 +506,6 @@ impl ChatWidget {
                     self.open_usage_menu();
                 }
             }
-            SlashCommand::Ide => {
-                self.handle_ide_command();
-            }
             SlashCommand::DebugConfig => {
                 self.add_debug_config_output();
             }
@@ -762,9 +759,6 @@ impl ChatWidget {
                 "stop" => self.stop_realtime_conversation(),
                 _ => self.add_error_message("Usage: /voice [settings|mute|stop]".to_string()),
             },
-            SlashCommand::Ide => {
-                self.handle_ide_command_args(trimmed);
-            }
             SlashCommand::Mcp => match trimmed.to_ascii_lowercase().as_str() {
                 "verbose" => self.add_mcp_output(McpServerStatusDetail::Full),
                 _ => self.add_error_message("Usage: /mcp [verbose]".to_string()),
@@ -1159,8 +1153,7 @@ impl ChatWidget {
             return QueueDrain::Stop;
         }
         match cmd {
-            SlashCommand::Ide
-            | SlashCommand::Status
+            SlashCommand::Status
             | SlashCommand::Daemon
             | SlashCommand::Pwd
             | SlashCommand::Usage

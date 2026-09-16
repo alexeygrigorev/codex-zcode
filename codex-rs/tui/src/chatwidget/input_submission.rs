@@ -407,7 +407,6 @@ impl ChatWidget {
             return (false, None);
         }
 
-        self.maybe_apply_ide_context(&mut items);
         crate::task_mentions::apply_task_references(&mut items, &mention_bindings, self.thread_id);
 
         let collaboration_mode = if self.collaboration_modes_enabled() {

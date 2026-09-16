@@ -682,7 +682,7 @@ impl ChatWidget {
         remote_image_urls: Vec<String>,
     ) -> UserMessageDisplay {
         let (message, prompt_request_offset) =
-            crate::ide_context::extract_prompt_request_with_offset(&message);
+            crate::prompt_request::extract_prompt_request_with_offset(&message);
         let prompt_request_end = prompt_request_offset + message.len();
         // Prompt context uses the same delimiter and stripping behavior as the desktop app and IDE
         // extension. The raw user message goes to the agent, but every surface renders only the
