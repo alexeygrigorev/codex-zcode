@@ -431,11 +431,11 @@ impl ChatWidget {
         }
         self.status_state.pending_status_indicator_restore = item.questions.is_some()
             || match item.phase {
-                // Models that don't support preambles only output AgentMessageItems on turn completion.
-                Some(MessagePhase::FinalAnswer) | None => {
-                    !self.input_queue.pending_steers.is_empty()
-                }
-                Some(MessagePhase::Commentary) => true,
+                // Models that don't support preambles emit phase-less messages
+                // mid-turn too, so their completions must restore the working
+                // row like commentary; turn completion hides the row again.
+                Some(MessagePhase::FinalAnswer) => !self.input_queue.pending_steers.is_empty(),
+                Some(MessagePhase::Commentary) | None => true,
             };
         self.maybe_restore_status_indicator_after_stream_idle();
     }
