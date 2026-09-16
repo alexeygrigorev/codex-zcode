@@ -25,7 +25,7 @@ done
 manual_rust_test_targets="$(
   ./.github/scripts/run-bazel-query-ci.sh \
     --output=label \
-    -- 'kind("rust_test rule", attr(tags, "manual", //codex-rs/... except //codex-rs/v8-poc/...))'
+    -- 'kind("rust_test rule", attr(tags, "manual", //codex-rs/...))'
 )"
 if [[ "${RUNNER_OS:-}" != "Windows" ]]; then
   # Non-Windows clippy jobs lint the native test binaries; the
@@ -43,7 +43,6 @@ fi
 
 printf '%s\n' \
   "//codex-rs/..." \
-  "-//codex-rs/v8-poc:all"
 
 # `--config=clippy` on the `workspace_root_test` wrappers does not lint the
 # underlying `rust_test` binaries. Add the internal manual `*-unit-tests-bin`
