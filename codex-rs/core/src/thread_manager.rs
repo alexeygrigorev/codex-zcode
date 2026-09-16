@@ -590,6 +590,7 @@ fn zcode_models_catalog(
                 model_specialty: None,
                 tool_mode: None,
                 multi_agent_version: Some(MultiAgentVersion::V2),
+                available_access_programs: None,
             })
             .collect(),
     }
