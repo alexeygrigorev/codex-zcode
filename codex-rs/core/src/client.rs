@@ -330,6 +330,30 @@ impl Drop for ZcodePromptFileGuard {
     }
 }
 
+/// Node binary and launcher script used to run one ZCode invocation.
+///
+/// Resolved from the environment in production; tests construct it directly
+/// to point the stream loop at a scripted fake runtime.
+struct ZcodeRuntime {
+    node: String,
+    cjs: String,
+}
+
+impl ZcodeRuntime {
+    /// Resolves the runtime paths from the environment and installs the
+    /// model override config, which must happen before the CLI spawns.
+    fn from_env(model_slug: &str) -> Self {
+        if let Err(e) = prepare_zcode_config(model_slug) {
+            warn!("ZCode model override unavailable: {e}");
+        }
+        Self {
+            node: std::env::var("ZCODE_NODE").unwrap_or_else(|_| "node".to_string()),
+            cjs: std::env::var("ZCODE_CJS")
+                .unwrap_or_else(|_| "/opt/ZCode/resources/glm/zcode.cjs".to_string()),
+        }
+    }
+}
+
 fn normalize_zcode_tool_name(name: &str) -> String {
     match name {
         "Agent" | "Task" => "spawn_agent".to_string(),
@@ -506,6 +530,29 @@ fn zcode_goal_status_protocol(tools: &[ToolSpec]) -> Option<String> {
              Omit both markers while work remains."
         )
     })
+}
+
+/// Items added after the most recent user message: everything the current
+/// turn has produced so far in the flattened transcript.
+fn zcode_current_turn_tail(input: &[ResponseItem]) -> &[ResponseItem] {
+    match input.iter().rposition(
+        |item| matches!(item, ResponseItem::Message { role, .. } if role.as_str() == "user"),
+    ) {
+        Some(index) => &input[index + 1..],
+        None => &[],
+    }
+}
+
+/// Whether the current turn already translated a goal-status marker into an
+/// `update_goal` call.
+///
+/// The synthesized call stays in the flattened history forever, so only calls
+/// from the current turn may block re-translation; otherwise a second goal in
+/// the same thread could never be reported.
+fn zcode_goal_already_reported_in_current_turn(input: &[ResponseItem]) -> bool {
+    zcode_current_turn_tail(input).iter().any(
+        |item| matches!(item, ResponseItem::FunctionCall { name, .. } if name == "update_goal"),
+    )
 }
 
 /// Extracts a human-readable message from a ZCode failure event payload.
@@ -2515,14 +2562,8 @@ impl ModelClientSession {
             }
             WireApi::Zcode => {
                 let inference_trace_attempt = inference_trace.start_attempt();
-                let api_stream = self
-                    .stream_zcode(
-                        model_info.slug.clone(),
-                        prompt,
-                        responses_metadata,
-                        inference_trace,
-                    )
-                    .await?;
+                let runtime = ZcodeRuntime::from_env(&model_info.slug);
+                let api_stream = Self::stream_zcode(runtime, prompt).await?;
                 let (stream, _) = map_response_stream(
                     api_stream,
                     session_telemetry.clone(),
@@ -2540,19 +2581,13 @@ impl ModelClientSession {
     /// maps NDJSON streaming events to Codex response events.
     /// This is fast (~8s) compared to the app-server approach.
     async fn stream_zcode(
-        &self,
-        model_slug: String,
+        runtime: ZcodeRuntime,
         prompt: &Prompt,
-        _responses_metadata: &CodexResponsesMetadata,
-        _inference_trace: &InferenceTraceContext,
     ) -> Result<codex_api::ResponseStream> {
         use std::process::Stdio;
         use tokio::process::Command;
         use tokio::sync::mpsc;
 
-        let runtime = std::env::var("ZCODE_CJS")
-            .unwrap_or_else(|_| "/opt/ZCode/resources/glm/zcode.cjs".to_string());
-        let node = std::env::var("ZCODE_NODE").unwrap_or_else(|_| "node".to_string());
         let cwd = std::env::current_dir()
             .unwrap_or_default()
             .to_string_lossy()
@@ -2645,22 +2680,17 @@ impl ModelClientSession {
             user_text.push_str(&protocol_note);
         }
 
-        // Translate the marker at most once per conversation: the synthesized
-        // call becomes part of the flattened history on every later turn, and
-        // re-translating the (persistent) marker instructions would loop.
-        let goal_status_already_reported = prompt.input.iter().any(
-            |item| matches!(item, ResponseItem::FunctionCall { name, .. } if name == "update_goal"),
-        );
+        // Only an `update_goal` call translated in the current turn blocks
+        // re-translation; older ones stay in the flattened history forever
+        // and must not silence a later goal.
+        let goal_status_already_reported =
+            zcode_goal_already_reported_in_current_turn(&prompt.input);
 
         let (tx, rx_event) = mpsc::channel::<std::result::Result<ResponseEvent, ApiError>>(64);
         let request_id = format!("zcode_{}", uuid::Uuid::new_v4());
         let request_id_for_stream = request_id.clone();
         if std::env::var("ZCODE_DEBUG_TOOLS").as_deref() == Ok("1") {
-            eprintln!("[zcodex] request tools: {:?}", prompt.tools);
-        }
-        let _ = std::env::var("ZCODE_DEBUG_TOOLS");
-        if let Err(e) = prepare_zcode_config(&model_slug) {
-            warn!("ZCode model override unavailable: {e}");
+            tracing::debug!("[zcodex] request tools: {:?}", prompt.tools);
         }
 
         let has_tool_results = prompt
@@ -2680,6 +2710,37 @@ impl ModelClientSession {
         // Captured before the prompt text moves into the spawn task; feeds
         // the token-usage fallback estimate for the Completed event.
         let prompt_bytes = user_text.len();
+
+        // A goal-status marker is translated by the previous invocation into
+        // a synthesized `update_goal` call; the follow-up request that
+        // carries only that call's output exists purely to record the
+        // bookkeeping. Re-prompting ZCode makes the model answer the same
+        // question a second time (observed as near-duplicate replies), so
+        // end the turn here: the answer is already finalized in history.
+        let turn_tail = zcode_current_turn_tail(&prompt.input);
+        let only_goal_bookkeeping = !turn_tail.is_empty()
+            && turn_tail.iter().all(|item| match item {
+                ResponseItem::FunctionCallOutput { call_id, .. } => call_id
+                    .as_deref()
+                    .unwrap_or_default()
+                    .starts_with("zcode_goal_"),
+                ResponseItem::FunctionCall { name, .. } => name == "update_goal",
+                _ => false,
+            });
+        if only_goal_bookkeeping {
+            let _ = tx
+                .send(Ok(ResponseEvent::Completed {
+                    response_id: request_id_for_stream,
+                    token_usage: Some(zcode_token_usage(None, prompt_bytes, 0)),
+                    usage_metadata: None,
+                    end_turn: Some(true),
+                }))
+                .await;
+            return Ok(codex_api::ResponseStream {
+                rx_event,
+                upstream_request_id: Some(request_id),
+            });
+        }
 
         tokio::spawn(async move {
             let prompt_file = match write_zcode_prompt_file(&user_text) {
@@ -2702,11 +2763,11 @@ impl ModelClientSession {
             // Prompt goes via a temp file and is re-injected into argv
             // in-process by the loader, so long transcripts cannot hit
             // execve E2BIG ("Argument list too long").
-            let mut command = Command::new(&node);
+            let mut command = Command::new(&runtime.node);
             command
                 .arg("-e")
                 .arg(ZCODE_PROMPT_LOADER)
-                .arg(&runtime)
+                .arg(&runtime.cjs)
                 .arg(prompt_file)
                 .args([
                     "--output-format",
@@ -2776,6 +2837,10 @@ impl ModelClientSession {
             let reader = BufReader::new(stdout);
             let mut lines = reader.lines();
             let mut response_text = String::new();
+            // Text streamed since the currently open message item started;
+            // reset at every tool boundary so each segment can be finalized
+            // with exactly the content the user watched stream in.
+            let mut segment_text = String::new();
             let mut session_id = String::new();
             let mut failed: Option<String> = None;
             let mut started_output = false;
@@ -2817,35 +2882,47 @@ impl ModelClientSession {
                     let is_tool_input_end = event_kind == "tool_input_end";
                     let is_tool_call = event_kind == "tool_call";
 
-                    if (is_text || is_tool_input_start || is_tool_input_delta || is_tool_call)
-                        && started_output
-                        && (is_tool_input_start || is_tool_call)
-                    {
-                        // A completed assistant message cannot stay active
-                        // across a tool item; leave the prior message item
-                        // open only while its own deltas are arriving.
-                        started_output = false;
-                    }
-
-                    if is_text && !started_output {
+                    if started_output && (is_tool_input_start || is_tool_call) {
+                        // Complete the streamed segment before the tool item
+                        // arrives: core drops a message that is still active
+                        // across a tool call, which is how streamed answers
+                        // used to vanish from history and the transcript.
                         let item = ResponseItem::Message {
                             id: None,
                             role: "assistant".to_string(),
                             content: vec![codex_protocol::models::ContentItem::OutputText {
-                                text: String::new(),
+                                text: std::mem::take(&mut segment_text),
                             }],
                             phase: None,
                             internal_chat_message_metadata_passthrough: None,
                         };
-                        let _ = tx.send(Ok(ResponseEvent::OutputItemAdded(item))).await;
-                        started_output = true;
+                        let _ = tx.send(Ok(ResponseEvent::OutputItemDone(item))).await;
+                        started_output = false;
                     }
+
                     let delta = payload
                         .and_then(|p| p.get("delta"))
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
                     if is_text && !delta.is_empty() {
+                        if !started_output {
+                            // Open the message lazily on the first non-empty
+                            // delta so a text-free turn never leaves an
+                            // empty streaming item behind.
+                            let item = ResponseItem::Message {
+                                id: None,
+                                role: "assistant".to_string(),
+                                content: vec![codex_protocol::models::ContentItem::OutputText {
+                                    text: String::new(),
+                                }],
+                                phase: None,
+                                internal_chat_message_metadata_passthrough: None,
+                            };
+                            let _ = tx.send(Ok(ResponseEvent::OutputItemAdded(item))).await;
+                            started_output = true;
+                        }
                         response_text.push_str(delta);
+                        segment_text.push_str(delta);
                         if tx
                             .send(Ok(ResponseEvent::OutputTextDelta(delta.to_string())))
                             .await
@@ -3124,50 +3201,57 @@ impl ModelClientSession {
             .to_string();
             match (status, failed) {
                 (Ok(status), None) if status.success() => {
-                    if emitted_tool_calls == 0 {
-                        if let Some(final_text) = result_response {
-                            response_text = final_text;
+                    // Finalize the reply from the text actually streamed: the
+                    // completed item must match what the user watched, and on
+                    // tool turns this trailing segment is the only
+                    // finalization it ever gets. The runtime's result line
+                    // only backs turns where ZCode reported a reply without
+                    // streaming text, so follow-up turns keep an answer in
+                    // history.
+                    let mut reply = if started_output {
+                        std::mem::take(&mut segment_text)
+                    } else if emitted_tool_calls == 0 {
+                        result_response.unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
+                    // The goal-status protocol ends the reply with a reserved
+                    // marker; strip it from the visible reply and translate it
+                    // into a real `update_goal` call so the normal registry
+                    // path (GoalToolExecutor) records the status change.
+                    // Translation is skipped when the current turn already
+                    // carried one.
+                    let mut goal_call = None;
+                    if goal_protocol_active
+                        && let Some(goal_status) = zcode_goal_status_from_reply(&reply)
+                    {
+                        reply = zcode_strip_goal_status_marker(&reply);
+                        if !goal_status_already_reported {
+                            goal_call = Some(ResponseItem::FunctionCall {
+                                id: None,
+                                name: "update_goal".to_string(),
+                                namespace: None,
+                                arguments: format!(r#"{{"status":"{goal_status}"}}"#),
+                                encrypted_function_args: Some(Vec::new()),
+                                call_id: format!("zcode_goal_{request_id_for_stream}"),
+                                internal_chat_message_metadata_passthrough: None,
+                            });
                         }
-                        // The goal-status protocol ends the reply with a
-                        // reserved marker; strip it from the visible reply,
-                        // and translate it into a real `update_goal` call so
-                        // the normal registry path (GoalToolExecutor) records
-                        // the status change. Synthesis happens at most once
-                        // per conversation: the call becomes part of the
-                        // flattened history on every later turn, and
-                        // re-translating it would loop.
-                        if goal_protocol_active
-                            && let Some(goal_status) = zcode_goal_status_from_reply(&response_text)
-                        {
-                            response_text = zcode_strip_goal_status_marker(&response_text);
-                            if !goal_status_already_reported {
-                                let item = ResponseItem::FunctionCall {
-                                    id: None,
-                                    name: "update_goal".to_string(),
-                                    namespace: None,
-                                    arguments: format!(r#"{{"status":"{goal_status}"}}"#),
-                                    encrypted_function_args: Some(Vec::new()),
-                                    call_id: format!("zcode_goal_{request_id_for_stream}"),
-                                    internal_chat_message_metadata_passthrough: None,
-                                };
-                                let _ = tx.send(Ok(ResponseEvent::OutputItemDone(item))).await;
-                            }
-                        }
+                    }
+                    if !reply.is_empty() {
                         let item = ResponseItem::Message {
                             id: None,
                             role: "assistant".to_string(),
                             content: vec![codex_protocol::models::ContentItem::OutputText {
-                                text: response_text,
+                                text: reply,
                             }],
                             phase: None,
                             internal_chat_message_metadata_passthrough: None,
                         };
                         let _ = tx.send(Ok(ResponseEvent::OutputItemDone(item))).await;
-                    } else {
-                        // ZCode completed one or more tool calls. Codex will
-                        // execute them and start a follow-up model turn; a
-                        // final message here would describe work that has not
-                        // happened yet.
+                    }
+                    if let Some(item) = goal_call {
+                        let _ = tx.send(Ok(ResponseEvent::OutputItemDone(item))).await;
                     }
                     let _ = tx
                         .send(Ok(ResponseEvent::Completed {

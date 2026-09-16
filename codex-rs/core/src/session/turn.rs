@@ -581,7 +581,12 @@ pub(crate) async fn run_turn(
                 }
 
                 if !needs_follow_up {
-                    last_agent_message = sampling_request_last_agent_message;
+                    // A trailing bookkeeping step (the ZCode goal-status
+                    // call) produces no message of its own; keep the answer
+                    // from an earlier step so Stop hooks still see it.
+                    if sampling_request_last_agent_message.is_some() {
+                        last_agent_message = sampling_request_last_agent_message;
+                    }
                     let stop_outcome = run_turn_stop_hooks(
                         &sess,
                         &step_context,

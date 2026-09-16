@@ -718,6 +718,7 @@ async fn response_stream_records_last_model_feedback_ids() {
     );
 }
 
+#[cfg(feature = "bedrock")]
 #[tokio::test]
 async fn bedrock_unauthorized_error_uses_provider_mapping() {
     let provider = create_model_provider(
@@ -1554,5 +1555,419 @@ fn zcode_token_usage_falls_back_to_byte_estimate() {
     assert_eq!(
         super::zcode_token_usage(None, 40_000, 0).total_tokens,
         10_000
+    );
+}
+
+#[test]
+fn zcode_goal_already_reported_only_counts_current_turn_calls() {
+    let earlier_turn = vec![
+        zcode_user_message("first question"),
+        zcode_goal_call("zcode_goal_old"),
+        zcode_function_call_output("zcode_goal_old"),
+        zcode_user_message("second question"),
+    ];
+    // A synthesized call from an earlier turn must not silence a new goal.
+    assert!(!super::zcode_goal_already_reported_in_current_turn(
+        &earlier_turn
+    ));
+
+    let mut current_turn = earlier_turn;
+    current_turn.push(zcode_goal_call("zcode_goal_new"));
+    assert!(super::zcode_goal_already_reported_in_current_turn(
+        &current_turn
+    ));
+
+    // No user message means no turn boundary; nothing counts as reported.
+    let history_only = vec![
+        zcode_goal_call("zcode_goal_old"),
+        zcode_function_call_output("zcode_goal_old"),
+    ];
+    assert!(!super::zcode_goal_already_reported_in_current_turn(
+        &history_only
+    ));
+}
+
+/// A fake `zcode.cjs` that scripts NDJSON streams per scenario tag found in
+/// the prompt, so `stream_zcode` is exercised end to end without the real
+/// runtime. The default branch marks an unexpected spawn.
+const FAKE_ZCODE_RUNTIME: &str = r#"
+const prompt = process.argv[3] || "";
+const emit = (obj) => console.log(JSON.stringify(obj));
+if (prompt.includes("ZCODEFAKE=segments")) {
+  emit({ type: "session.updated", sessionId: "sess-fake" });
+  emit({ type: "model.streaming", payload: { kind: "text_delta", delta: "Let me check." } });
+  emit({ type: "model.streaming", payload: { kind: "tool_input_start", toolCallId: "t1", toolName: "Bash" } });
+  emit({ type: "model.streaming", payload: { kind: "tool_input_delta", toolCallId: "t1", delta: '{"command":"echo hi"}' } });
+  emit({ type: "model.streaming", payload: { kind: "tool_input_end", toolCallId: "t1" } });
+  emit({ type: "model.streaming", payload: { kind: "tool_call", toolCallId: "t1", toolName: "Bash", input: { command: "echo hi" } } });
+  emit({ type: "model.streaming", payload: { kind: "text_delta", delta: "Done checking." } });
+  emit({ type: "result", response: "stale result line" });
+} else if (prompt.includes("ZCODEFAKE=streamed-wins")) {
+  emit({ type: "model.streaming", payload: { kind: "text_delta", delta: "watched reply" } });
+  emit({ type: "result", response: "different result line" });
+} else if (prompt.includes("ZCODEFAKE=goal-marker")) {
+  emit({ type: "model.streaming", payload: { kind: "text_delta", delta: "All work is done.\n[GOAL:COMPLETE]" } });
+  emit({ type: "result", response: "All work is done.\n[GOAL:COMPLETE]" });
+} else {
+  emit({ type: "model.streaming", payload: { kind: "text_delta", delta: "spawned unexpectedly" } });
+  emit({ type: "result", response: "spawned unexpectedly" });
+}
+"#;
+
+fn node_available() -> bool {
+    std::process::Command::new("node")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok()
+}
+
+fn write_fake_zcode_runtime() -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "zcode-fake-runtime-{}-{}.cjs",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be after the epoch")
+            .as_nanos()
+    ));
+    std::fs::write(&path, FAKE_ZCODE_RUNTIME).expect("write fake runtime");
+    path
+}
+
+fn zcode_user_message(text: &str) -> ResponseItem {
+    ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: text.to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    }
+}
+
+fn zcode_goal_call(call_id: &str) -> ResponseItem {
+    ResponseItem::FunctionCall {
+        id: None,
+        name: "update_goal".to_string(),
+        namespace: None,
+        arguments: r#"{"status":"complete"}"#.to_string(),
+        encrypted_function_args: Some(Vec::new()),
+        call_id: call_id.to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    }
+}
+
+fn zcode_function_call_output(call_id: &str) -> ResponseItem {
+    ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: Some(call_id.to_string()),
+        name: None,
+        namespace: None,
+        output: codex_protocol::models::FunctionCallOutputPayload::from_text(
+            "recorded".to_string(),
+        ),
+        internal_chat_message_metadata_passthrough: None,
+    }
+}
+
+fn zcode_goal_tool_spec() -> ToolSpec {
+    ToolSpec::Function(ResponsesApiTool {
+        name: "update_goal".to_string(),
+        description: "goal tool".to_string(),
+        strict: false,
+        defer_loading: None,
+        parameters: JsonSchema::object(
+            std::collections::BTreeMap::new(),
+            Some(Vec::new()),
+            Some(false.into()),
+        ),
+        output_schema: None,
+    })
+}
+
+fn completed_message_texts(events: &[ResponseEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            ResponseEvent::OutputItemDone(ResponseItem::Message { content, .. }) => Some(
+                content
+                    .iter()
+                    .filter_map(|item| match item {
+                        ContentItem::OutputText { text } => Some(text.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(""),
+            ),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn zcode_stream_completes_text_segments_around_tool_calls() {
+    if !node_available() {
+        // The fake-runtime tests spawn `node`; nothing to verify without it.
+        return;
+    }
+    let cjs_path = write_fake_zcode_runtime();
+    let prompt = Prompt {
+        input: vec![zcode_user_message("ZCODEFAKE=segments")],
+        ..Default::default()
+    };
+    let mut stream = super::ModelClientSession::stream_zcode(
+        super::ZcodeRuntime {
+            node: "node".to_string(),
+            cjs: cjs_path.to_string_lossy().into_owned(),
+        },
+        &prompt,
+    )
+    .await
+    .expect("stream_zcode should launch the fake runtime");
+
+    let mut events = Vec::new();
+    while let Some(event) = stream.rx_event.recv().await {
+        events.push(event.expect("fake runtime should not fail"));
+    }
+    let _ = std::fs::remove_file(&cjs_path);
+
+    assert_eq!(events.len(), 10, "unexpected event sequence: {events:?}");
+    assert!(matches!(
+        &events[0],
+        ResponseEvent::OutputItemAdded(ResponseItem::Message { .. })
+    ));
+    assert!(
+        matches!(&events[1], ResponseEvent::OutputTextDelta(delta) if delta == "Let me check.")
+    );
+    // The first segment completes with its own text before the tool item,
+    // so core finalizes text the user already watched stream in.
+    assert_eq!(
+        completed_message_texts(&events[..3]),
+        vec!["Let me check.".to_string()]
+    );
+    assert!(matches!(
+        &events[3],
+        ResponseEvent::OutputItemAdded(ResponseItem::FunctionCall { name, .. }) if name == "exec_command"
+    ));
+    assert!(matches!(
+        &events[4],
+        ResponseEvent::ToolCallInputDelta { call_id: Some(call_id), .. } if call_id == "zcode_tool_t1"
+    ));
+    assert!(matches!(
+        &events[5],
+        ResponseEvent::OutputItemDone(ResponseItem::FunctionCall { name, .. }) if name == "exec_command"
+    ));
+    assert!(matches!(
+        &events[6],
+        ResponseEvent::OutputItemAdded(ResponseItem::Message { .. })
+    ));
+    assert!(
+        matches!(&events[7], ResponseEvent::OutputTextDelta(delta) if delta == "Done checking.")
+    );
+    assert!(matches!(
+        &events[8],
+        ResponseEvent::OutputItemDone(ResponseItem::Message { .. })
+    ));
+    assert!(matches!(
+        &events[9],
+        ResponseEvent::Completed {
+            end_turn: Some(true),
+            ..
+        }
+    ));
+    // The result line ("stale result line") must not replace streamed text.
+    assert_eq!(
+        completed_message_texts(&events),
+        vec!["Let me check.".to_string(), "Done checking.".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn zcode_stream_final_reply_keeps_streamed_text_over_result_line() {
+    if !node_available() {
+        // The fake-runtime tests spawn `node`; nothing to verify without it.
+        return;
+    }
+    let cjs_path = write_fake_zcode_runtime();
+    let prompt = Prompt {
+        input: vec![zcode_user_message("ZCODEFAKE=streamed-wins")],
+        ..Default::default()
+    };
+    let mut stream = super::ModelClientSession::stream_zcode(
+        super::ZcodeRuntime {
+            node: "node".to_string(),
+            cjs: cjs_path.to_string_lossy().into_owned(),
+        },
+        &prompt,
+    )
+    .await
+    .expect("stream_zcode should launch the fake runtime");
+
+    let mut events = Vec::new();
+    while let Some(event) = stream.rx_event.recv().await {
+        events.push(event.expect("fake runtime should not fail"));
+    }
+    let _ = std::fs::remove_file(&cjs_path);
+
+    assert_eq!(events.len(), 4, "unexpected event sequence: {events:?}");
+    assert_eq!(
+        completed_message_texts(&events),
+        vec!["watched reply".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn zcode_goal_marker_reply_emits_message_then_synthesized_call() {
+    if !node_available() {
+        // The fake-runtime tests spawn `node`; nothing to verify without it.
+        return;
+    }
+    let cjs_path = write_fake_zcode_runtime();
+    let mut prompt = Prompt {
+        input: vec![zcode_user_message("ZCODEFAKE=goal-marker")],
+        ..Default::default()
+    };
+    prompt.tools = vec![zcode_goal_tool_spec()].into();
+    let mut stream = super::ModelClientSession::stream_zcode(
+        super::ZcodeRuntime {
+            node: "node".to_string(),
+            cjs: cjs_path.to_string_lossy().into_owned(),
+        },
+        &prompt,
+    )
+    .await
+    .expect("stream_zcode should launch the fake runtime");
+
+    let mut events = Vec::new();
+    while let Some(event) = stream.rx_event.recv().await {
+        events.push(event.expect("fake runtime should not fail"));
+    }
+    let _ = std::fs::remove_file(&cjs_path);
+
+    assert_eq!(events.len(), 5, "unexpected event sequence: {events:?}");
+    // The marker is stripped from the visible reply.
+    assert_eq!(
+        completed_message_texts(&events),
+        vec!["All work is done.".to_string()]
+    );
+    let call_index = events
+        .iter()
+        .position(
+            |event| matches!(event, ResponseEvent::OutputItemDone(ResponseItem::FunctionCall { name, .. }) if name == "update_goal"),
+        )
+        .expect("marker should translate into an update_goal call");
+    assert!(
+        call_index > 2,
+        "the reply must be finalized before the goal bookkeeping call"
+    );
+    match &events[call_index] {
+        ResponseEvent::OutputItemDone(ResponseItem::FunctionCall {
+            arguments, call_id, ..
+        }) => {
+            assert_eq!(arguments, r#"{"status":"complete"}"#);
+            assert!(call_id.starts_with("zcode_goal_"));
+        }
+        other => panic!("expected a function call item, got {other:?}"),
+    }
+    assert!(matches!(
+        &events[4],
+        ResponseEvent::Completed {
+            end_turn: Some(true),
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn zcode_goal_bookkeeping_continuation_skips_the_runtime() {
+    if !node_available() {
+        // The fake-runtime tests spawn `node`; nothing to verify without it.
+        return;
+    }
+    let cjs_path = write_fake_zcode_runtime();
+    let prompt = Prompt {
+        input: vec![
+            zcode_user_message("ZCODEFAKE=never-spawn"),
+            zcode_goal_call("zcode_goal_r1"),
+            zcode_function_call_output("zcode_goal_r1"),
+        ],
+        ..Default::default()
+    };
+    let mut stream = super::ModelClientSession::stream_zcode(
+        super::ZcodeRuntime {
+            node: "node".to_string(),
+            cjs: cjs_path.to_string_lossy().into_owned(),
+        },
+        &prompt,
+    )
+    .await
+    .expect("stream_zcode should short-circuit without spawning");
+
+    let mut events = Vec::new();
+    while let Some(event) = stream.rx_event.recv().await {
+        events.push(event.expect("short-circuit should not fail"));
+    }
+    let _ = std::fs::remove_file(&cjs_path);
+
+    // Only the Completed event: spawning the runtime would emit
+    // "spawned unexpectedly" from the fake's default branch.
+    assert_eq!(events.len(), 1, "unexpected event sequence: {events:?}");
+    assert!(matches!(
+        &events[0],
+        ResponseEvent::Completed {
+            end_turn: Some(true),
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn zcode_real_tool_continuation_still_invokes_the_runtime() {
+    if !node_available() {
+        // The fake-runtime tests spawn `node`; nothing to verify without it.
+        return;
+    }
+    let cjs_path = write_fake_zcode_runtime();
+    let prompt = Prompt {
+        input: vec![
+            zcode_user_message("ZCODEFAKE=streamed-wins"),
+            ResponseItem::FunctionCall {
+                id: None,
+                name: "exec_command".to_string(),
+                namespace: None,
+                arguments: r#"{"command":"echo hi"}"#.to_string(),
+                encrypted_function_args: Some(Vec::new()),
+                call_id: "zcode_tool_1".to_string(),
+                internal_chat_message_metadata_passthrough: None,
+            },
+            zcode_function_call_output("zcode_tool_1"),
+        ],
+        ..Default::default()
+    };
+    let mut stream = super::ModelClientSession::stream_zcode(
+        super::ZcodeRuntime {
+            node: "node".to_string(),
+            cjs: cjs_path.to_string_lossy().into_owned(),
+        },
+        &prompt,
+    )
+    .await
+    .expect("stream_zcode should launch the fake runtime");
+
+    let mut events = Vec::new();
+    while let Some(event) = stream.rx_event.recv().await {
+        events.push(event.expect("fake runtime should not fail"));
+    }
+    let _ = std::fs::remove_file(&cjs_path);
+
+    // Real tool results must reach ZCode; the short-circuit applies only to
+    // goal bookkeeping, so the runtime actually answered here.
+    assert_eq!(events.len(), 4, "unexpected event sequence: {events:?}");
+    assert_eq!(
+        completed_message_texts(&events),
+        vec!["watched reply".to_string()]
     );
 }
