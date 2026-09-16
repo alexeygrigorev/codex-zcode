@@ -482,7 +482,6 @@ async fn completed_plan_table_tail_skips_provisional_history_insert() {
     );
 }
 
-
 #[tokio::test]
 async fn prefetch_rate_limits_is_gated_on_chatgpt_auth_provider() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;

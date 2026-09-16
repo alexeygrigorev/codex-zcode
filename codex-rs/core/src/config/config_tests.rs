@@ -4206,9 +4206,6 @@ resume_cwd = "current"
     );
 }
 
-
-
-
 #[test]
 fn tui_config_missing_notifications_field_defaults_to_enabled() {
     let cfg = r#"
