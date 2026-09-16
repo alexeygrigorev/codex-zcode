@@ -41,7 +41,6 @@ members = [
     "shell-escalation",
     "skills",
     "core",
-    "core-api",
     "core-plugins",
     "diagnostics",
     "guardian-context",
@@ -105,7 +104,6 @@ members = [
     "tui",
     "user-verification",
     "tools",
-    "v8-poc",
     "websocket-client",
     "windows-sandbox-service",
     "worktree",
@@ -121,7 +119,6 @@ members = [
     "utils/json-to-toml",
     "utils/home-dir",
     "utils/pty",
-    "utils/readiness",
     "utils/redacted-string",
     "utils/rustls-provider",
     "utils/string",
@@ -142,7 +139,6 @@ members = [
     "state",
     "terminal-detection",
     "test-binary-support",
-    "thread-manager-sample",
     "thread-store",
     "uds",
     "codex-experimental-api-macros",
@@ -200,7 +196,6 @@ codex-agent-extension = { path = "ext/agent" }
 codex-connectors-extension = { path = "ext/connectors" }
 codex-context-fragments = { path = "context-fragments" }
 codex-core = { path = "core" }
-codex-core-api = { path = "core-api" }
 codex-core-plugins = { path = "core-plugins" }
 codex-diagnostics = { path = "diagnostics" }
 codex-exec = { path = "exec" }
