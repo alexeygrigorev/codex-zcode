@@ -24,6 +24,7 @@ use codex_protocol::error::CodexErr;
 use codex_protocol::openai_models::ModelsResponse;
 use http::HeaderValue;
 
+#[cfg(feature = "bedrock")]
 use crate::amazon_bedrock::AmazonBedrockModelProvider;
 use crate::auth::ProviderAuthScope;
 use crate::auth::ResolvedProviderAuth;
@@ -321,11 +322,11 @@ pub fn create_model_provider(
     provider_info: ModelProviderInfo,
     auth_manager: Option<Arc<AuthManager>>,
 ) -> SharedModelProvider {
+    #[cfg(feature = "bedrock")]
     if provider_info.is_amazon_bedrock() {
-        Arc::new(AmazonBedrockModelProvider::new(provider_info, auth_manager))
-    } else {
-        Arc::new(ConfiguredModelProvider::new(provider_info, auth_manager))
+        return Arc::new(AmazonBedrockModelProvider::new(provider_info, auth_manager));
     }
+    Arc::new(ConfiguredModelProvider::new(provider_info, auth_manager))
 }
 
 /// Runtime model provider backed by configured `ModelProviderInfo`.
@@ -514,20 +515,27 @@ impl ModelProvider for ConfiguredModelProvider {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "bedrock")]
     use std::future::Future;
     use std::num::NonZeroU64;
+    #[cfg(feature = "bedrock")]
     use std::task::Context;
+    #[cfg(feature = "bedrock")]
     use std::task::Waker;
 
     use codex_http_client::HttpClientFactory;
     use codex_http_client::OutboundProxyPolicy;
     use codex_login::auth::AgentIdentityAuthPolicy;
     use codex_login::auth::BedrockApiKeyAuth;
+    #[cfg(feature = "bedrock")]
     use codex_model_provider_info::AwsAuthRefreshConfig;
+    #[cfg(feature = "bedrock")]
     use codex_model_provider_info::AwsCredentialExportConfig;
+    #[cfg(feature = "bedrock")]
     use codex_model_provider_info::ModelProviderAwsAuthInfo;
     use codex_model_provider_info::WireApi;
     use codex_model_provider_info::create_oss_provider_with_base_url;
+    #[cfg(feature = "bedrock")]
     use codex_models_manager::ModelsManagerConfig;
     use codex_models_manager::manager::RefreshStrategy;
     use codex_protocol::account::PlanType;
@@ -535,6 +543,7 @@ mod tests {
     use codex_protocol::openai_models::ModelInfo;
     use codex_protocol::openai_models::ModelsResponse;
     use codex_protocol::protocol::SessionSource;
+    #[cfg(feature = "bedrock")]
     use codex_utils_redacted_string::RedactedString;
     use pretty_assertions::assert_eq;
     use serde_json::json;
@@ -547,6 +556,7 @@ mod tests {
 
     use super::*;
     use crate::auth::AgentIdentitySessionFallback;
+    #[cfg(feature = "bedrock")]
     use crate::shared_state::process_shared_state;
 
     fn provider_info_with_command_auth() -> ModelProviderInfo {
@@ -764,6 +774,7 @@ mod tests {
         assert!(auth_manager.has_external_auth());
     }
 
+    #[cfg(feature = "bedrock")]
     #[test]
     fn create_model_provider_does_not_use_openai_auth_manager_for_amazon_bedrock_provider() {
         let provider = create_model_provider(
@@ -781,6 +792,7 @@ mod tests {
         assert!(provider.auth_manager().is_none());
     }
 
+    #[cfg(feature = "bedrock")]
     #[tokio::test]
     async fn shared_bedrock_auth_refresh_is_reused_only_for_matching_configuration() {
         const TEST_NAME: &str = "provider::tests::shared_bedrock_auth_refresh_is_reused_only_for_matching_configuration";
@@ -1013,6 +1025,7 @@ printf '%s\n' '{"AccessKeyId":"exported","SecretAccessKey":"secret"}'
         assert!(shared_state.aws_auth_recovery(&aws).is_some());
     }
 
+    #[cfg(feature = "bedrock")]
     #[tokio::test]
     async fn create_model_provider_uses_managed_auth_for_amazon_bedrock_provider() {
         let auth = bedrock_api_key_auth();
@@ -1114,6 +1127,7 @@ printf '%s\n' '{"AccessKeyId":"exported","SecretAccessKey":"secret"}'
         );
     }
 
+    #[cfg(feature = "bedrock")]
     #[test]
     fn amazon_bedrock_provider_returns_bedrock_account_state() {
         let provider = create_model_provider(
@@ -1132,6 +1146,7 @@ printf '%s\n' '{"AccessKeyId":"exported","SecretAccessKey":"secret"}'
         );
     }
 
+    #[cfg(feature = "bedrock")]
     #[tokio::test]
     async fn amazon_bedrock_provider_creates_static_models_manager() {
         let provider = create_model_provider(
@@ -1220,6 +1235,7 @@ printf '%s\n' '{"AccessKeyId":"exported","SecretAccessKey":"secret"}'
         assert_eq!(default_model.model, "openai.gpt-5.6-sol");
     }
 
+    #[cfg(feature = "bedrock")]
     #[tokio::test]
     async fn configured_bedrock_catalog_only_allows_default_service_tier() {
         let configured_model = codex_models_manager::bundled_models_response()

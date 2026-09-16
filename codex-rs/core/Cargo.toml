@@ -11,6 +11,9 @@ path = "src/lib.rs"
 [lints]
 workspace = true
 
+[features]
+bedrock = ["codex-model-provider/bedrock"]
+
 [dependencies]
 anyhow = { workspace = true }
 arc-swap = { workspace = true }

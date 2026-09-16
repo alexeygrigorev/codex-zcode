@@ -67,6 +67,7 @@ mod exec;
 mod exec_policy;
 #[cfg(not(target_os = "windows"))]
 mod extension_sandbox;
+#[cfg(feature = "bedrock")]
 mod external_auth;
 mod fork_thread;
 mod git_enrichment;

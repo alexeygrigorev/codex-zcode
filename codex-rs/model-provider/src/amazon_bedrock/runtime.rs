@@ -1,3 +1,4 @@
+#[cfg(feature = "bedrock")]
 use codex_aws_auth::AwsAuthConfig;
 use codex_login::CodexAuth;
 use codex_model_provider_info::ModelProviderAwsAuthInfo;
@@ -10,6 +11,7 @@ use super::mantle::region_from_config;
 
 const BEDROCK_RUNTIME_SERVICE_NAME: &str = "bedrock";
 
+#[cfg(feature = "bedrock")]
 pub(super) fn aws_auth_config(aws: &ModelProviderAwsAuthInfo) -> AwsAuthConfig {
     AwsAuthConfig {
         profile: aws.profile.clone(),
@@ -31,6 +33,6 @@ pub(super) async fn bedrock_runtime_base_url(
     Ok(base_url(&region))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "bedrock"))]
 #[path = "runtime_tests.rs"]
 mod tests;

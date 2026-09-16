@@ -63,6 +63,7 @@ mod doctor;
 #[cfg(test)]
 #[path = "exec_server_args_tests.rs"]
 mod exec_server_args_tests;
+#[cfg(feature = "bedrock")]
 mod exec_server_auth;
 mod exec_server_telemetry;
 mod marketplace_cmd;
@@ -1953,6 +1954,7 @@ async fn run_exec_server_command(
         .await?;
         let direct_transport = cmd.remote_transport == ExecServerRemoteTransport::Direct;
         let (_otel, telemetry) = exec_server_telemetry::init(Some(&config));
+        #[cfg(feature = "bedrock")]
         let auth_provider = if cmd.aws_sigv4 {
             exec_server_auth::aws_sigv4_auth_provider(codex_aws_auth::AwsAuthConfig {
                 profile: cmd.aws_profile,
@@ -1960,6 +1962,13 @@ async fn run_exec_server_command(
                 service: cmd.aws_service,
             })
             .await?
+        } else {
+            load_exec_server_remote_auth_provider(&config, &base_url, cmd.use_agent_identity_auth)
+                .await?
+        };
+        #[cfg(not(feature = "bedrock"))]
+        let auth_provider = if cmd.aws_sigv4 {
+            anyhow::bail!("--aws-sigv4 requires a build with the `bedrock` feature")
         } else {
             load_exec_server_remote_auth_provider(&config, &base_url, cmd.use_agent_identity_auth)
                 .await?

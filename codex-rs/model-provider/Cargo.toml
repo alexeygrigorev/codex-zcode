@@ -16,7 +16,7 @@ workspace = true
 chrono = { workspace = true }
 codex-api = { workspace = true }
 codex-agent-identity = { workspace = true }
-codex-aws-auth = { workspace = true }
+codex-aws-auth = { workspace = true, optional = true }
 codex-http-client = { workspace = true }
 codex-feedback = { workspace = true }
 codex-login = { workspace = true }
@@ -31,6 +31,9 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "process", "sync", "time"] }
 tracing = { workspace = true, features = ["log"] }
+
+[features]
+bedrock = ["dep:codex-aws-auth"]
 
 [dev-dependencies]
 base64 = { workspace = true }

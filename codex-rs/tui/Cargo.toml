@@ -21,6 +21,9 @@ doctest = false
 [lints]
 workspace = true
 
+[features]
+bedrock = ["codex-model-provider/bedrock"]
+
 [dependencies]
 codex-build-info = { workspace = true }
 anyhow = { workspace = true }

@@ -1,3 +1,4 @@
+#[cfg(feature = "bedrock")]
 use codex_aws_auth::AwsAuthConfig;
 use codex_login::CodexAuth;
 use codex_model_provider_info::ModelProviderAwsAuthInfo;
@@ -9,21 +10,8 @@ use super::auth::BedrockAuthSource;
 use super::auth::resolve_region;
 
 const BEDROCK_MANTLE_SERVICE_NAME: &str = "bedrock-mantle";
-const BEDROCK_MANTLE_SUPPORTED_REGIONS: [&str; 12] = [
-    "us-east-2",
-    "us-east-1",
-    "us-west-2",
-    "ap-southeast-3",
-    "ap-south-1",
-    "ap-northeast-1",
-    "eu-central-1",
-    "eu-west-1",
-    "eu-west-2",
-    "eu-south-1",
-    "eu-north-1",
-    "sa-east-1",
-];
 
+#[cfg(feature = "bedrock")]
 pub(super) fn aws_auth_config(aws: &ModelProviderAwsAuthInfo) -> AwsAuthConfig {
     AwsAuthConfig {
         profile: aws.profile.clone(),
@@ -40,13 +28,8 @@ pub(super) fn region_from_config(aws: &ModelProviderAwsAuthInfo) -> Option<Strin
         .map(str::to_string)
 }
 
-/// Returns whether Amazon Bedrock Mantle is available in `region`.
-pub fn is_supported_amazon_bedrock_region(region: &str) -> bool {
-    BEDROCK_MANTLE_SUPPORTED_REGIONS.contains(&region)
-}
-
 pub(super) fn base_url(region: &str) -> Result<String> {
-    if is_supported_amazon_bedrock_region(region) {
+    if crate::bedrock_regions::is_supported_amazon_bedrock_region(region) {
         Ok(format!("https://bedrock-mantle.{region}.api.aws/openai/v1"))
     } else {
         Err(CodexErr::Fatal(format!(
@@ -88,6 +71,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "bedrock")]
     #[test]
     fn aws_auth_config_uses_profile_and_mantle_service() {
         assert_eq!(
@@ -105,6 +89,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "bedrock")]
     #[test]
     fn aws_auth_config_uses_configured_region() {
         assert_eq!(

@@ -1,6 +1,8 @@
 mod auth;
+#[cfg(feature = "bedrock")]
 mod auth_refresh;
 mod catalog;
+#[cfg(feature = "bedrock")]
 mod credential_export;
 mod error;
 mod mantle;
@@ -39,14 +41,16 @@ use crate::provider::ProviderAuthRecoveryMessages;
 use crate::provider::ProviderCapabilities;
 use crate::provider::ProviderUnauthorizedRecovery;
 use crate::provider::RemoteCompactionSupport;
+#[cfg(feature = "bedrock")]
 use crate::shared_state::process_shared_state;
 use auth::resolve_provider_auth as resolve_bedrock_provider_auth;
+#[cfg(feature = "bedrock")]
 pub(crate) use auth_refresh::AwsAuthRecovery;
 use catalog::normalize_bedrock_catalog;
 pub(crate) use catalog::static_model_catalog;
+#[cfg(feature = "bedrock")]
 pub(crate) use credential_export::AwsCredentialExport;
 use mantle::bedrock_mantle_runtime_base_url;
-pub use mantle::is_supported_amazon_bedrock_region;
 use runtime::bedrock_runtime_base_url;
 use runtime_catalog::static_runtime_model_catalog;
 
@@ -63,7 +67,9 @@ pub(crate) struct AmazonBedrockModelProvider {
     aws: ModelProviderAwsAuthInfo,
     endpoint: BedrockEndpoint,
     auth_manager: Option<Arc<AuthManager>>,
+    #[cfg(feature = "bedrock")]
     credential_export: Option<Arc<AwsCredentialExport>>,
+    #[cfg(feature = "bedrock")]
     auth_recovery: Option<Arc<AwsAuthRecovery>>,
 }
 
@@ -87,17 +93,20 @@ impl AmazonBedrockModelProvider {
                 auth_refresh: None,
             });
         let auth_source = auth::auth_source(&provider_info, auth_manager.as_deref(), std::env::var);
+        #[cfg(feature = "bedrock")]
         let credential_export = if auth_source == auth::BedrockAuthSource::CredentialExport {
             process_shared_state().aws_credential_export(&aws)
         } else {
             None
         };
+        #[cfg(feature = "bedrock")]
         let uses_aws_sdk_auth = matches!(
             auth_source,
             auth::BedrockAuthSource::CredentialExport
                 | auth::BedrockAuthSource::ConfiguredAwsProfile
                 | auth::BedrockAuthSource::AwsSdk
         );
+        #[cfg(feature = "bedrock")]
         let auth_recovery = if uses_aws_sdk_auth && aws.auth_refresh.is_some() {
             process_shared_state().aws_auth_recovery(&aws)
         } else {
@@ -109,7 +118,9 @@ impl AmazonBedrockModelProvider {
             aws,
             endpoint,
             auth_manager,
+            #[cfg(feature = "bedrock")]
             credential_export,
+            #[cfg(feature = "bedrock")]
             auth_recovery,
         }
     }
@@ -137,6 +148,7 @@ impl AmazonBedrockModelProvider {
             })
     }
 
+    #[cfg(feature = "bedrock")]
     fn uses_aws_auth_recovery(&self) -> bool {
         let source = self.auth_source();
         source == auth::BedrockAuthSource::CredentialExport
@@ -145,6 +157,11 @@ impl AmazonBedrockModelProvider {
                     source,
                     auth::BedrockAuthSource::ConfiguredAwsProfile | auth::BedrockAuthSource::AwsSdk
                 ))
+    }
+
+    #[cfg(not(feature = "bedrock"))]
+    fn uses_aws_auth_recovery(&self) -> bool {
+        false
     }
 
     async fn auth(&self) -> Option<CodexAuth> {
@@ -256,10 +273,17 @@ impl ModelProvider for AmazonBedrockModelProvider {
     }
 
     fn is_recoverable_auth_error(&self, error: &TransportError) -> bool {
-        matches!(
+        let unauthorized = matches!(
             error,
             TransportError::Http { status, .. } if *status == http::StatusCode::UNAUTHORIZED
-        ) || (self.uses_aws_auth_recovery() && error::is_refreshable_auth_error(error))
+        );
+        #[cfg(feature = "bedrock")]
+        {
+            if !unauthorized {
+                return self.uses_aws_auth_recovery() && error::is_refreshable_auth_error(error);
+            }
+        }
+        unauthorized
     }
 
     fn auth_recovery_messages(&self) -> Option<ProviderAuthRecoveryMessages> {
@@ -274,45 +298,54 @@ impl ModelProvider for AmazonBedrockModelProvider {
         &self,
     ) -> ModelProviderFuture<'_, Result<ProviderUnauthorizedRecovery>> {
         Box::pin(async move {
-            if !self.uses_aws_auth_recovery() {
+            #[cfg(not(feature = "bedrock"))]
+            {
+                let _ = self;
                 return Ok(ProviderUnauthorizedRecovery::NotConfigured);
             }
 
-            // Hold the cache guard across both steps so concurrent callers share recovery.
-            let export_refresh = if let Some(exporter) = &self.credential_export {
-                let refresh = exporter.begin_refresh().await;
-                if refresh.is_none() {
-                    // Another caller completed recovery while we were waiting.
-                    return Ok(ProviderUnauthorizedRecovery::Recovered);
+            #[cfg(feature = "bedrock")]
+            {
+                if !self.uses_aws_auth_recovery() {
+                    return Ok(ProviderUnauthorizedRecovery::NotConfigured);
                 }
-                refresh
-            } else {
-                None
-            };
-            let result: std::io::Result<()> = async {
-                if let Some(recovery) = &self.auth_recovery {
-                    recovery.refresh().await?;
-                }
-                if let Some(exporter) = export_refresh {
-                    exporter.refresh().await?;
-                }
-                Ok(())
-            }
-            .await;
-            result.map_err(|error| {
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::InvalidData
-                        | std::io::ErrorKind::InvalidInput
-                        | std::io::ErrorKind::NotFound
-                        | std::io::ErrorKind::PermissionDenied
-                ) {
-                    CodexErr::InvalidRequest(error.to_string())
+
+                // Hold the cache guard across both steps so concurrent callers share recovery.
+                let export_refresh = if let Some(exporter) = &self.credential_export {
+                    let refresh = exporter.begin_refresh().await;
+                    if refresh.is_none() {
+                        // Another caller completed recovery while we were waiting.
+                        return Ok(ProviderUnauthorizedRecovery::Recovered);
+                    }
+                    refresh
                 } else {
-                    CodexErr::Io(error)
+                    None
+                };
+                let result: std::io::Result<()> = async {
+                    if let Some(recovery) = &self.auth_recovery {
+                        recovery.refresh().await?;
+                    }
+                    if let Some(exporter) = export_refresh {
+                        exporter.refresh().await?;
+                    }
+                    Ok(())
                 }
-            })?;
-            Ok(ProviderUnauthorizedRecovery::Recovered)
+                .await;
+                result.map_err(|error| {
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::InvalidData
+                            | std::io::ErrorKind::InvalidInput
+                            | std::io::ErrorKind::NotFound
+                            | std::io::ErrorKind::PermissionDenied
+                    ) {
+                        CodexErr::InvalidRequest(error.to_string())
+                    } else {
+                        CodexErr::Io(error)
+                    }
+                })?;
+                Ok(ProviderUnauthorizedRecovery::Recovered)
+            }
         })
     }
 

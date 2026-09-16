@@ -1,25 +1,40 @@
+#[cfg(feature = "bedrock")]
 use super::super::bedrock_auth::BedrockProviderConfig;
+#[cfg(feature = "bedrock")]
 use super::super::bedrock_auth::configure_bedrock_provider;
+#[cfg(feature = "bedrock")]
 use super::super::bedrock_auth::ensure_user_model_provider_can_be_bedrock;
 use super::AccountRequestProcessor;
+#[cfg(feature = "bedrock")]
 use crate::error_code::internal_error;
 use crate::error_code::invalid_request;
+#[cfg(feature = "bedrock")]
 use codex_app_server_protocol::AwsCredentialType;
+#[cfg(feature = "bedrock")]
 use codex_app_server_protocol::BedrockAwsProfile;
 use codex_app_server_protocol::BedrockDiscoverParams;
+#[cfg(feature = "bedrock")]
 use codex_app_server_protocol::BedrockDiscoverResponse;
+#[cfg(feature = "bedrock")]
 use codex_app_server_protocol::BedrockEnvironmentCredential;
 use codex_app_server_protocol::BedrockSetupParams;
+#[cfg(feature = "bedrock")]
 use codex_app_server_protocol::BedrockSetupResponse;
 use codex_app_server_protocol::ClientResponsePayload;
 use codex_app_server_protocol::JSONRPCErrorError;
+#[cfg(feature = "bedrock")]
 use codex_login::CodexAuth;
+#[cfg(feature = "bedrock")]
 use codex_model_provider::is_supported_amazon_bedrock_region;
 
+#[cfg(feature = "bedrock")]
 const AWS_ACCESS_KEY_ID: &str = "AWS_ACCESS_KEY_ID";
+#[cfg(feature = "bedrock")]
 const AWS_SECRET_ACCESS_KEY: &str = "AWS_SECRET_ACCESS_KEY";
+#[cfg(feature = "bedrock")]
 const AWS_BEARER_TOKEN_BEDROCK: &str = "AWS_BEARER_TOKEN_BEDROCK";
 
+#[cfg(feature = "bedrock")]
 impl AccountRequestProcessor {
     pub(crate) async fn bedrock_discover(
         &self,
@@ -135,6 +150,28 @@ impl AccountRequestProcessor {
     }
 }
 
+#[cfg(not(feature = "bedrock"))]
+impl AccountRequestProcessor {
+    pub(crate) async fn bedrock_discover(
+        &self,
+        _params: BedrockDiscoverParams,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        Err(invalid_request(
+            "Amazon Bedrock setup requires a build with the `bedrock` feature.",
+        ))
+    }
+
+    pub(crate) async fn bedrock_setup(
+        &self,
+        _params: BedrockSetupParams,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        Err(invalid_request(
+            "Amazon Bedrock setup requires a build with the `bedrock` feature.",
+        ))
+    }
+}
+
+#[cfg(feature = "bedrock")]
 fn non_empty_env_var(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()
