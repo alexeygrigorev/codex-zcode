@@ -1214,6 +1214,10 @@ async fn live_app_server_sub_agent_activity_renders_once() {
     let cells = drain_insert_history(&mut rx);
     assert_eq!(cells.len(), 1);
     let rendered = lines_to_single_string(&cells[0]);
+    let rendered =
+        regex_lite::Regex::new(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+            .expect("valid uuid regex")
+            .replace_all(&rendered, "<agent-thread-id>");
     assert_chatwidget_snapshot!("app_server_sub_agent_activity_renders_once", rendered);
 }
 
