@@ -455,9 +455,6 @@ impl App {
             .update_search_dir(self.config.cwd.to_path_buf());
         let notify = &self.local_settings.tui.notification_settings;
         tui.set_notification_settings(notify.method, notify.condition);
-        if let Err(error) = tui.clear_ambient_pet_image() {
-            tracing::warn!(%error, "failed to clear ambient pet image");
-        }
         let attach_widget = App::replace_chat_widget_with_app_server_thread;
         let (lineage, message) = (ThreadAttachPresentation::SessionLineage, None);
         if let Err(error) = attach_widget(self, tui, started, lineage, message).await {

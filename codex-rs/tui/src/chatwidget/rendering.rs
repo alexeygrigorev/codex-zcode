@@ -130,7 +130,7 @@ impl ChatWidget {
                 .as_renderable_with_composer_right_reserve(/*composer_right_reserve*/ 0);
         }
 
-        let active_cell_right_reserve = self.ambient_pet_wrap_reserved_cols();
+        let active_cell_right_reserve = 0;
         let active_cell_renderable = match &self.transcript.active_cell {
             Some(cell) => RenderableItem::Owned(Box::new(TranscriptAreaRenderable {
                 child: cell.as_ref(),

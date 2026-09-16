@@ -40,8 +40,6 @@ impl From<&Config> for LocalSettings {
                 status_line_use_colors: config.tui_status_line_use_colors,
                 terminal_title: config.tui_terminal_title.clone(),
                 theme: config.tui_theme.clone(),
-                pet: config.tui_pet.clone(),
-                pet_anchor: config.tui_pet_anchor,
                 session_picker_view: Some(config.tui_session_picker_view),
                 resume_cwd: config.tui_resume_cwd,
                 keymap: config.tui_keymap.clone(),
