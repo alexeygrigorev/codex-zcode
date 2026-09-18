@@ -219,7 +219,16 @@ stream_max_retries = 0
         request["text"]["format"]["schema"]["required"],
         serde_json::json!(["summary", "next_action"])
     );
-    assert_eq!(request["tools"], serde_json::json!([]));
+    // Recap requests must stay bounded, so besides the fork's always-on
+    // baseline tools nothing else may leak into the tool list.
+    let tools = request["tools"].as_array().expect("tools array");
+    assert_eq!(
+        tools
+            .iter()
+            .map(|tool| tool["name"].as_str().expect("tool name"))
+            .collect::<Vec<_>>(),
+        vec!["zai_search", "zcode_prompt"]
+    );
 
     app_server.shutdown().await?;
     model_server.shutdown().await;
