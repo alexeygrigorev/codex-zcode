@@ -39,8 +39,16 @@ pub(crate) struct GoalRuntimeConfig {
 
 pub(crate) enum ActiveGoalStopReason {
     TurnError,
+    /// The user interrupted the turn, so the goal should wait instead of being
+    /// continued automatically.
+    TurnInterrupted,
+    /// Goal continuations repeatedly produced no successful action, so there is
+    /// no actionable next step to keep pursuing the goal with.
+    NoProgress,
     UsageLimit,
-    ExecutionUnavailable { expected_goal_id: String },
+    ExecutionUnavailable {
+        expected_goal_id: String,
+    },
     EmptyResponse,
 }
 
@@ -302,6 +310,25 @@ impl GoalRuntimeHandle {
         let (event_name, status, expected_goal_id) = match reason {
             ActiveGoalStopReason::TurnError => {
                 ("turn-error", codex_state::ThreadGoalStatus::Blocked, None)
+            }
+            ActiveGoalStopReason::TurnInterrupted => (
+                "turn-interrupt",
+                codex_state::ThreadGoalStatus::Paused,
+                None,
+            ),
+            ActiveGoalStopReason::NoProgress => {
+                let Some(expected_goal_id) = self.inner.accounting_state.no_progress_goal(turn_id)
+                else {
+                    return Ok(());
+                };
+                if accounting_goal_id != expected_goal_id {
+                    return Ok(());
+                }
+                (
+                    "no-progress",
+                    codex_state::ThreadGoalStatus::Blocked,
+                    Some(expected_goal_id),
+                )
             }
             ActiveGoalStopReason::UsageLimit => (
                 "usage-limit",

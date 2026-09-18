@@ -33,6 +33,7 @@ struct GoalAccountingInner {
     consecutive_execution_failure_turns: u8,
     automatic_goal_turn_id: Option<String>,
     consecutive_empty_turns: u8,
+    consecutive_no_progress_turns: u8,
     last_accounted_descendant_token_usage: i64,
 }
 
@@ -127,6 +128,7 @@ impl GoalAccountingState {
                 turn.successful_tool = true;
                 inner.execution_failure_goal_id = None;
                 inner.consecutive_execution_failure_turns = 0;
+                inner.consecutive_no_progress_turns = 0;
             }
             ToolCallOutcome::Failed {
                 handler_executed: true,
@@ -211,6 +213,7 @@ impl GoalAccountingState {
         let mut inner = self.inner();
         inner.automatic_goal_turn_id = None;
         inner.consecutive_empty_turns = 0;
+        inner.consecutive_no_progress_turns = 0;
     }
 
     /// Evaluated under the goal-state permit after automatic admission records its turn ID.
@@ -227,6 +230,26 @@ impl GoalAccountingState {
         }
         inner.consecutive_empty_turns = inner.consecutive_empty_turns.saturating_add(1);
         (inner.consecutive_empty_turns >= 3).then_some(goal_id)
+    }
+
+    /// Mirrors the empty-response breaker for continuations that stay active but
+    /// never act: three goal continuations in a row without a successful tool call
+    /// mean there is no actionable next step, so the caller stops the goal instead
+    /// of spinning. Successful tool calls and turns the user drove themselves reset
+    /// the streak, and only continuation turns count toward it.
+    ///
+    /// Evaluated under the goal-state permit during turn-stop evaluation.
+    pub(crate) fn no_progress_goal(&self, turn_id: &str) -> Option<String> {
+        let mut inner = self.inner();
+        let automatic = inner.automatic_goal_turn_id.as_deref() == Some(turn_id);
+        let turn = inner.turns.get_mut(turn_id)?;
+        let goal_id = turn.active_goal_id.clone()?;
+        if turn.successful_tool || !automatic {
+            inner.consecutive_no_progress_turns = 0;
+            return None;
+        }
+        inner.consecutive_no_progress_turns = inner.consecutive_no_progress_turns.saturating_add(1);
+        (inner.consecutive_no_progress_turns >= 3).then_some(goal_id)
     }
 
     /// Acquires the per-thread progress-accounting permit.
@@ -294,6 +317,7 @@ impl GoalAccountingState {
             if inner.current_turn_id.as_deref() == Some(turn_id) {
                 if inner.wall_clock.active_goal_id.as_deref() != Some(goal_id.as_str()) {
                     inner.consecutive_empty_turns = 0;
+                    inner.consecutive_no_progress_turns = 0;
                     inner.last_accounted_descendant_token_usage =
                         self.descendant_token_usage.load(Ordering::Relaxed);
                 }
@@ -323,6 +347,7 @@ impl GoalAccountingState {
             turn.reset_baseline_to_current();
             inner.automatic_goal_turn_id = None;
             inner.consecutive_empty_turns = 0;
+            inner.consecutive_no_progress_turns = 0;
             inner.last_accounted_descendant_token_usage =
                 self.descendant_token_usage.load(Ordering::Relaxed);
         }
@@ -338,6 +363,7 @@ impl GoalAccountingState {
         }
         if inner.wall_clock.active_goal_id.as_deref() != Some(goal_id.as_str()) {
             inner.consecutive_empty_turns = 0;
+            inner.consecutive_no_progress_turns = 0;
             inner.last_accounted_descendant_token_usage =
                 self.descendant_token_usage.load(Ordering::Relaxed);
         }
@@ -356,6 +382,7 @@ impl GoalAccountingState {
         inner.consecutive_execution_failure_turns = 0;
         inner.automatic_goal_turn_id = None;
         inner.consecutive_empty_turns = 0;
+        inner.consecutive_no_progress_turns = 0;
         Some(turn_id)
     }
 
@@ -372,6 +399,7 @@ impl GoalAccountingState {
         inner.consecutive_execution_failure_turns = 0;
         inner.automatic_goal_turn_id = None;
         inner.consecutive_empty_turns = 0;
+        inner.consecutive_no_progress_turns = 0;
     }
 
     pub(crate) fn progress_snapshot(&self, turn_id: &str) -> Option<GoalProgressSnapshot> {
@@ -542,6 +570,7 @@ impl Default for GoalAccountingInner {
             consecutive_execution_failure_turns: 0,
             automatic_goal_turn_id: None,
             consecutive_empty_turns: 0,
+            consecutive_no_progress_turns: 0,
             last_accounted_descendant_token_usage: 0,
         }
     }

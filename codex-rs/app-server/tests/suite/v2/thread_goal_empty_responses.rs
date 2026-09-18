@@ -27,7 +27,13 @@ use tokio::time::timeout;
 async fn empty_goal_continuations_block_after_three_without_activity(
     recovery: Option<&str>,
 ) -> Result<()> {
-    let turns = if recovery.is_some() { 6 } else { 3 };
+    // Prose-only continuations reset the empty-response breaker but count
+    // toward the no-progress breaker, so those variants still block at turn 3;
+    // a real tool call resets both breakers and the variant survives to turn 6.
+    let turns = match recovery {
+        Some("tool") => 6,
+        _ => 3,
+    };
     let mut scripts = Vec::new();
     for turn in 1..=turns {
         let mut id = format!("response-{turn}");

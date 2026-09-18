@@ -266,3 +266,79 @@ fn token_usage(
         codex_rollout_budget_units: None,
     }
 }
+
+#[test]
+fn no_progress_continuations_block_after_three_turns_without_successful_tools() {
+    let text_final = TurnItem::AgentMessage(AgentMessageItem {
+        id: "text".into(),
+        content: vec![AgentMessageContent::Text {
+            text: "Still working on it".into(),
+        }],
+        phase: Some(MessagePhase::FinalAnswer),
+        memory_citation: None,
+        delivery: None,
+        questions: None,
+    });
+    for (interruption, blocking_turn) in [
+        ("none", Some(3)),
+        ("user", Some(6)),
+        ("tool", Some(6)),
+        ("failed tool", Some(3)),
+        ("goal", Some(5)),
+        ("manual", None),
+    ] {
+        let state = GoalAccountingState::default();
+        let turns = blocking_turn.unwrap_or(6);
+        let mut streak: u8 = 0;
+        for turn in 1..=turns {
+            let turn_id = format!("turn-{turn}");
+            let goal_id = if interruption == "goal" && turn >= 3 {
+                "new"
+            } else {
+                "goal"
+            };
+            let goal_changed = interruption == "goal" && turn == 3;
+            let tool_success = interruption == "tool" && turn == 3;
+            state.start_turn(&turn_id, ModeKind::Default, &TokenUsage::default());
+            state.mark_turn_goal_active(&turn_id, goal_id);
+            state.record_item(&turn_id, &text_final);
+            if interruption == "failed tool" {
+                state.record_tool_outcome(
+                    &turn_id,
+                    &ToolName::plain("exec"),
+                    ToolCallOutcome::Failed {
+                        handler_executed: true,
+                    },
+                );
+            }
+            if tool_success {
+                state.record_tool_outcome(
+                    &turn_id,
+                    &ToolName::plain("shell"),
+                    ToolCallOutcome::Completed { success: true },
+                );
+            }
+            // Admission can finish after output arrives, but before turn-stop evaluation.
+            let automatic = interruption != "manual" && !(interruption == "user" && turn == 3);
+            if automatic {
+                state.mark_goal_continuation(turn_id.clone());
+            }
+
+            if goal_changed {
+                streak = 0;
+            }
+            if tool_success || !automatic {
+                streak = 0;
+            } else {
+                streak += 1;
+            }
+            let expected = (automatic && streak >= 3).then(|| goal_id.to_string());
+            assert_eq!(
+                expected,
+                state.no_progress_goal(&turn_id),
+                "interruption: {interruption}, turn: {turn}",
+            );
+            state.finish_turn(&turn_id);
+        }
+    }
+}

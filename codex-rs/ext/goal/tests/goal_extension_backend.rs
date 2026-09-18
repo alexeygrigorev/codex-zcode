@@ -24,6 +24,7 @@ use codex_extension_api::ToolCallSource;
 use codex_extension_api::ToolExecutor;
 use codex_extension_api::ToolFinishInput;
 use codex_extension_api::ToolPayload;
+use codex_extension_api::TurnAbortInput;
 use codex_extension_api::TurnErrorInput;
 use codex_extension_api::TurnStartInput;
 use codex_extension_api::TurnStopInput;
@@ -47,6 +48,7 @@ use codex_protocol::protocol::ThreadGoalStatus;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TokenUsageInfo;
 use codex_protocol::protocol::TruncationPolicy;
+use codex_protocol::protocol::TurnAbortReason;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use tempfile::TempDir;
@@ -853,6 +855,230 @@ async fn turn_error_blocks_goal() -> anyhow::Result<()> {
         .await?
         .ok_or_else(|| anyhow::anyhow!("goal should exist"))?;
     assert_eq!(codex_state::ThreadGoalStatus::Blocked, goal.status);
+    Ok(())
+}
+
+#[tokio::test]
+async fn turn_interrupt_pauses_active_goal_and_freezes_accounting() -> anyhow::Result<()> {
+    let runtime = test_runtime().await?;
+    let thread_id = test_thread_id()?;
+    seed_thread_metadata(runtime.as_ref(), thread_id).await?;
+    let harness = GoalExtensionHarness::new(runtime.clone(), thread_id).await?;
+    harness.start_turn("turn-1", &TokenUsage::default()).await;
+
+    let tools = harness.tools();
+    tool_by_name(&tools, "create_goal")
+        .handle(tool_call(
+            "create_goal",
+            "call-create-goal",
+            json!({ "objective": "ship goal extension backend" }),
+        ))
+        .await?;
+    harness.sink.clear();
+
+    harness
+        .record_token_usage(
+            "turn-1",
+            &token_usage(
+                /*input_tokens*/ 20, /*cached_input_tokens*/ 5, /*output_tokens*/ 8,
+                /*reasoning_output_tokens*/ 2, /*total_tokens*/ 30,
+            ),
+        )
+        .await;
+    harness
+        .abort_turn("turn-1", TurnAbortReason::Interrupted)
+        .await;
+
+    let goal = runtime
+        .thread_goals()
+        .get_thread_goal(thread_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("goal should exist"))?;
+    assert_eq!(23, goal.tokens_used);
+    assert_eq!(codex_state::ThreadGoalStatus::Paused, goal.status);
+    assert_eq!(
+        vec![
+            CapturedGoalEvent {
+                event_id: "turn-1:turn-interrupt-progress".to_string(),
+                turn_id: Some("turn-1".to_string()),
+                status: ThreadGoalStatus::Active,
+                tokens_used: 23,
+            },
+            CapturedGoalEvent {
+                event_id: "turn-1:turn-interrupt".to_string(),
+                turn_id: Some("turn-1".to_string()),
+                status: ThreadGoalStatus::Paused,
+                tokens_used: 23,
+            },
+        ],
+        harness.sink.goal_events()
+    );
+    harness.sink.clear();
+
+    // The paused goal no longer accrues usage and does not re-engage later turns.
+    harness
+        .record_token_usage(
+            "turn-1",
+            &token_usage(
+                /*input_tokens*/ 40, /*cached_input_tokens*/ 5,
+                /*output_tokens*/ 10, /*reasoning_output_tokens*/ 2,
+                /*total_tokens*/ 52,
+            ),
+        )
+        .await;
+    harness
+        .notify_tool_finish("turn-1", "call-shell-after-interrupt", "shell")
+        .await;
+    harness.start_turn("turn-2", &TokenUsage::default()).await;
+    harness
+        .notify_tool_finish("turn-2", "call-shell-next-turn", "shell")
+        .await;
+    harness.stop_turn("turn-2").await;
+
+    assert_eq!(
+        Some(goal),
+        runtime.thread_goals().get_thread_goal(thread_id).await?
+    );
+    assert_eq!(Vec::<CapturedGoalEvent>::new(), harness.sink.goal_events());
+    Ok(())
+}
+
+#[tokio::test]
+async fn turn_abort_replaced_keeps_goal_active() -> anyhow::Result<()> {
+    let runtime = test_runtime().await?;
+    let thread_id = test_thread_id()?;
+    seed_thread_metadata(runtime.as_ref(), thread_id).await?;
+    let harness = GoalExtensionHarness::new(runtime.clone(), thread_id).await?;
+    harness.start_turn("turn-1", &TokenUsage::default()).await;
+
+    let tools = harness.tools();
+    tool_by_name(&tools, "create_goal")
+        .handle(tool_call(
+            "create_goal",
+            "call-create-goal",
+            json!({ "objective": "ship goal extension backend" }),
+        ))
+        .await?;
+    harness.sink.clear();
+
+    harness
+        .record_token_usage(
+            "turn-1",
+            &token_usage(
+                /*input_tokens*/ 20, /*cached_input_tokens*/ 5, /*output_tokens*/ 8,
+                /*reasoning_output_tokens*/ 2, /*total_tokens*/ 30,
+            ),
+        )
+        .await;
+    harness
+        .abort_turn("turn-1", TurnAbortReason::Replaced)
+        .await;
+
+    let goal = runtime
+        .thread_goals()
+        .get_thread_goal(thread_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("goal should exist"))?;
+    assert_eq!(23, goal.tokens_used);
+    assert_eq!(codex_state::ThreadGoalStatus::Active, goal.status);
+    assert_eq!(
+        vec![CapturedGoalEvent {
+            event_id: "turn-1:turn-abort".to_string(),
+            turn_id: Some("turn-1".to_string()),
+            status: ThreadGoalStatus::Active,
+            tokens_used: 23,
+        }],
+        harness.sink.goal_events()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn turn_interrupt_keeps_budget_limited_goal_untouched() -> anyhow::Result<()> {
+    let runtime = test_runtime().await?;
+    let thread_id = test_thread_id()?;
+    seed_thread_metadata(runtime.as_ref(), thread_id).await?;
+    let harness = GoalExtensionHarness::new(runtime.clone(), thread_id).await?;
+    harness.start_turn("turn-1", &TokenUsage::default()).await;
+
+    let tools = harness.tools();
+    tool_by_name(&tools, "create_goal")
+        .handle(tool_call(
+            "create_goal",
+            "call-create-goal",
+            json!({
+                "objective": "ship goal extension backend",
+                "token_budget": 25,
+            }),
+        ))
+        .await?;
+    harness.sink.clear();
+
+    harness
+        .record_token_usage(
+            "turn-1",
+            &token_usage(
+                /*input_tokens*/ 20, /*cached_input_tokens*/ 5,
+                /*output_tokens*/ 16, /*reasoning_output_tokens*/ 0,
+                /*total_tokens*/ 40,
+            ),
+        )
+        .await;
+    harness
+        .abort_turn("turn-1", TurnAbortReason::Interrupted)
+        .await;
+
+    let goal = runtime
+        .thread_goals()
+        .get_thread_goal(thread_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("goal should exist"))?;
+    assert_eq!(31, goal.tokens_used);
+    assert_eq!(codex_state::ThreadGoalStatus::BudgetLimited, goal.status);
+    assert_eq!(
+        vec![CapturedGoalEvent {
+            event_id: "turn-1:turn-interrupt-progress".to_string(),
+            turn_id: Some("turn-1".to_string()),
+            status: ThreadGoalStatus::BudgetLimited,
+            tokens_used: 31,
+        }],
+        harness.sink.goal_events()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_driven_turns_without_tools_do_not_block_goal() -> anyhow::Result<()> {
+    let runtime = test_runtime().await?;
+    let thread_id = test_thread_id()?;
+    seed_thread_metadata(runtime.as_ref(), thread_id).await?;
+    let harness = GoalExtensionHarness::new(runtime.clone(), thread_id).await?;
+
+    let tools = harness.tools();
+    tool_by_name(&tools, "create_goal")
+        .handle(tool_call(
+            "create_goal",
+            "call-create-goal",
+            json!({ "objective": "ship goal extension backend" }),
+        ))
+        .await?;
+    harness.sink.clear();
+
+    // Only goal continuations count toward the no-progress breaker, so
+    // user-driven turns never trip it.
+    for turn in 1..=3 {
+        let turn_id = format!("turn-{turn}");
+        harness.start_turn(&turn_id, &TokenUsage::default()).await;
+        harness.stop_turn(&turn_id).await;
+    }
+
+    let goal = runtime
+        .thread_goals()
+        .get_thread_goal(thread_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("goal should exist"))?;
+    assert_eq!(codex_state::ThreadGoalStatus::Active, goal.status);
+    assert_eq!(Vec::<CapturedGoalEvent>::new(), harness.sink.goal_events());
     Ok(())
 }
 
@@ -1780,6 +2006,20 @@ impl GoalExtensionHarness {
         for contributor in self.registry.turn_lifecycle_contributors() {
             contributor
                 .on_turn_stop(TurnStopInput {
+                    session_store: &self.session_store,
+                    thread_store: &self.thread_store,
+                    turn_store: &turn_store,
+                })
+                .await;
+        }
+    }
+
+    async fn abort_turn(&self, turn_id: &str, reason: TurnAbortReason) {
+        let turn_store = ExtensionData::new(turn_id);
+        for contributor in self.registry.turn_lifecycle_contributors() {
+            contributor
+                .on_turn_abort(TurnAbortInput {
+                    reason: reason.clone(),
                     session_store: &self.session_store,
                     thread_store: &self.thread_store,
                     turn_store: &turn_store,

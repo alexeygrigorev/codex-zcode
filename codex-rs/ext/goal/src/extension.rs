@@ -35,6 +35,7 @@ use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadGoalStatus;
 use codex_protocol::protocol::TokenUsageInfo;
+use codex_protocol::protocol::TurnAbortReason;
 
 use crate::accounting::BudgetLimitedGoalDisposition;
 use crate::accounting::GoalAccountingState;
@@ -327,6 +328,16 @@ where
                 return;
             }
             if let Err(err) = runtime
+                .stop_active_goal_for_turn(turn_id, ActiveGoalStopReason::NoProgress)
+                .await
+            {
+                input.thread_store.remove::<TurnStartOptions>();
+                tracing::warn!(
+                    "failed to stop goal after no-progress continuations for {turn_id}: {err}"
+                );
+                return;
+            }
+            if let Err(err) = runtime
                 .account_active_goal_progress(
                     turn_id,
                     &format!("{turn_id}:turn-stop"),
@@ -371,19 +382,40 @@ where
 
             let turn_id = input.turn_store.level_id();
             input.thread_store.remove::<TurnStartOptions>();
-            if let Err(err) = runtime
-                .account_active_goal_progress(
-                    turn_id,
-                    &format!("{turn_id}:turn-abort"),
-                    codex_state::GoalAccountingMode::ActiveOnly,
-                    BudgetLimitedGoalDisposition::ClearActive,
-                )
-                .await
-            {
-                tracing::warn!(
-                    "failed to account active goal progress after turn abort for {turn_id}: {err}"
-                );
-                return;
+            match input.reason {
+                // The user cancelled the turn: pause the goal so idle
+                // continuation cannot resume work they walked away from.
+                // Pause/resume keeps the persisted usage accounting intact.
+                TurnAbortReason::Interrupted => {
+                    if let Err(err) = runtime
+                        .stop_active_goal_for_turn(turn_id, ActiveGoalStopReason::TurnInterrupted)
+                        .await
+                    {
+                        tracing::warn!(
+                            "failed to pause active goal after interrupt for {turn_id}: {err}"
+                        );
+                        return;
+                    }
+                }
+                TurnAbortReason::Replaced | TurnAbortReason::ReviewEnded => {
+                    if let Err(err) = runtime
+                        .account_active_goal_progress(
+                            turn_id,
+                            &format!("{turn_id}:turn-abort"),
+                            codex_state::GoalAccountingMode::ActiveOnly,
+                            BudgetLimitedGoalDisposition::ClearActive,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            "failed to account active goal progress after turn abort for {turn_id}: {err}"
+                        );
+                        return;
+                    }
+                }
+                // The turn ended because the goal hit its budget; the
+                // BudgetLimited status must survive the abort untouched.
+                TurnAbortReason::BudgetLimited => {}
             }
             runtime.accounting_state().finish_turn(turn_id);
         })
