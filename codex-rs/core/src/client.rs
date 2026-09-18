@@ -262,6 +262,18 @@ const ZCODE_STDERR_TAIL_CAP: usize = 8 * 1024;
 /// mid-turn. Asking for bounded replies up front keeps turns completable.
 const ZCODE_REPLY_BUDGET_NOTE: &str = "\n\nOutput budget: the backend aborts the entire turn if one reply exceeds the model's maximum output length. Never paste file contents, command output, or long reports into a reply - write files and report via tool calls, and keep the final reply focused (under ~300 words) unless the user explicitly asked for more detail.";
 
+/// Startup respawn budget for ZCode invocations killed by SQLite lock
+/// contention on the harness's shared session database.
+///
+/// The harness CLI opens that database with a 5 s busy timeout, so a lock
+/// held longer than that kills the invocation before any output. The
+/// respawns extend the tolerated lock hold to roughly a minute, past the
+/// session-level stream retry backoff (200 ms..3.2 s) that would otherwise
+/// surface the failure to the user.
+const ZCODE_DB_LOCK_MAX_RETRIES: u32 = 6;
+const ZCODE_DB_LOCK_INITIAL_DELAY_MS: u64 = 1_000;
+const ZCODE_DB_LOCK_MAX_DELAY_MS: u64 = 30_000;
+
 /// Builds the persisted arguments string for a ZCode tool call from the
 /// authoritative `tool_call.input` payload.
 ///
@@ -317,6 +329,23 @@ fn zcode_tool_args_from_accumulated(zcode_name: &str, accumulated: &str) -> Stri
         }
         Err(_) => r#"{"_error":"tool input invalid; dropped to protect transcript"}"#.to_string(),
     }
+}
+
+/// Recognizes the SQLite lock errors the harness CLI prints on stderr when
+/// its shared session database is write-locked past its own busy timeout.
+fn zcode_stderr_is_db_lock(stderr: &str) -> bool {
+    stderr.contains("database is locked") || stderr.contains("database is busy")
+}
+
+/// Trimmed UTF-8 snapshot of the bounded ZCode stderr tail.
+fn zcode_stderr_tail(stderr_tail: &std::sync::Mutex<Vec<u8>>) -> String {
+    String::from_utf8_lossy(
+        &stderr_tail
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
+    .trim()
+    .to_string()
 }
 
 /// Removes a ZCode prompt temp file when it goes out of scope.
@@ -2941,79 +2970,146 @@ impl ModelClientSession {
             // Prompt goes via a temp file and is re-injected into argv
             // in-process by the loader, so long transcripts cannot hit
             // execve E2BIG ("Argument list too long").
-            let mut command = Command::new(&runtime.node);
-            command
-                .arg("-e")
-                .arg(ZCODE_PROMPT_LOADER)
-                .arg(&runtime.cjs)
-                .arg(prompt_file)
-                .args([
-                    "--output-format",
-                    "stream-json",
-                    "--mode",
-                    "yolo",
-                    "--cwd",
-                    &cwd,
-                ])
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .kill_on_drop(true);
-            let child = command.spawn();
+            use tokio::io::AsyncBufReadExt;
+            use tokio::io::BufReader;
 
-            let mut child = match child {
-                Ok(child) => child,
-                Err(e) => {
+            // The harness CLI opens its shared SQLite session database with
+            // a hard-coded 5 s busy timeout, so when another process (the
+            // desktop harness itself, or a concurrent session) holds the
+            // write lock longer, the invocation dies at startup with
+            // `Error: database is locked` and no output. Respawn with
+            // backoff while nothing has been forwarded downstream; the
+            // failure is transient and the session-level stream retries
+            // give up far too early.
+            let mut db_lock_attempts: u32 = 0;
+            let (mut child, mut lines, stderr_tail, first_line, startup_status) = 'startup: loop {
+                let mut command = Command::new(&runtime.node);
+                command
+                    .arg("-e")
+                    .arg(ZCODE_PROMPT_LOADER)
+                    .arg(&runtime.cjs)
+                    .arg(prompt_file)
+                    .args([
+                        "--output-format",
+                        "stream-json",
+                        "--mode",
+                        "yolo",
+                        "--cwd",
+                        &cwd,
+                    ])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .kill_on_drop(true);
+                let mut child = match command.spawn() {
+                    Ok(child) => child,
+                    Err(e) => {
+                        let _ = tx
+                            .send(Err(ApiError::Stream(format!(
+                                "could not launch ZCode: {e}"
+                            ))))
+                            .await;
+                        return;
+                    }
+                };
+
+                let Some(stdout) = child.stdout.take() else {
                     let _ = tx
-                        .send(Err(ApiError::Stream(format!(
-                            "could not launch ZCode: {e}"
-                        ))))
+                        .send(Err(ApiError::Stream(
+                            "ZCode did not expose stdout".to_string(),
+                        )))
                         .await;
                     return;
-                }
-            };
+                };
 
-            let Some(stdout) = child.stdout.take() else {
-                let _ = tx
-                    .send(Err(ApiError::Stream(
-                        "ZCode did not expose stdout".to_string(),
-                    )))
-                    .await;
-                return;
-            };
-
-            // Drain stderr into a bounded tail so the failure reason (crash
-            // stack, provider error) survives for the exit-status error
-            // message instead of being discarded.
-            let stderr_tail = Arc::new(std::sync::Mutex::new(Vec::new()));
-            if let Some(stderr) = child.stderr.take() {
-                let stderr_tail = Arc::clone(&stderr_tail);
-                tokio::spawn(async move {
-                    use tokio::io::AsyncReadExt;
-                    let mut stderr = stderr;
-                    let mut chunk = [0u8; 4096];
-                    loop {
-                        match stderr.read(&mut chunk).await {
-                            Ok(0) | Err(_) => break,
-                            Ok(read) => {
-                                let mut tail = stderr_tail
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                tail.extend_from_slice(&chunk[..read]);
-                                if tail.len() > ZCODE_STDERR_TAIL_CAP {
-                                    let excess = tail.len() - ZCODE_STDERR_TAIL_CAP;
-                                    tail.drain(..excess);
+                // Drain stderr into a bounded tail so the failure reason (crash
+                // stack, provider error) survives for the exit-status error
+                // message instead of being discarded.
+                let stderr_tail = Arc::new(std::sync::Mutex::new(Vec::new()));
+                let stderr_drain = child.stderr.take().map(|stderr| {
+                    let stderr_tail = Arc::clone(&stderr_tail);
+                    tokio::spawn(async move {
+                        use tokio::io::AsyncReadExt;
+                        let mut stderr = stderr;
+                        let mut chunk = [0u8; 4096];
+                        loop {
+                            match stderr.read(&mut chunk).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(read) => {
+                                    let mut tail = stderr_tail
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                    tail.extend_from_slice(&chunk[..read]);
+                                    if tail.len() > ZCODE_STDERR_TAIL_CAP {
+                                        let excess = tail.len() - ZCODE_STDERR_TAIL_CAP;
+                                        tail.drain(..excess);
+                                    }
                                 }
                             }
                         }
-                    }
+                    })
                 });
-            }
+                let mut lines = BufReader::new(stdout).lines();
 
-            use tokio::io::AsyncBufReadExt;
-            use tokio::io::BufReader;
-            let reader = BufReader::new(stdout);
-            let mut lines = reader.lines();
+                // Race the first stdout line against an early exit: any
+                // first line means startup succeeded, while exiting with no
+                // output at all is the startup-failure shape. `biased` keeps
+                // the line branch winning when both are ready so buffered
+                // output is never skipped.
+                enum StartupSignal {
+                    FirstLine(String),
+                    Exit(std::io::Result<std::process::ExitStatus>),
+                }
+                let signal = tokio::select! {
+                    biased;
+                    first_line = lines.next_line() => match first_line {
+                        Ok(Some(line)) => StartupSignal::FirstLine(line),
+                        // Stdout closed before the first line; only the exit
+                        // status can tell a startup failure from a clean
+                        // empty stream, so wait for it here.
+                        _ => StartupSignal::Exit(child.wait().await),
+                    },
+                    status = child.wait() => StartupSignal::Exit(status),
+                };
+                match signal {
+                    StartupSignal::FirstLine(line) => {
+                        break (child, lines, stderr_tail, Some(line), None);
+                    }
+                    StartupSignal::Exit(status) => {
+                        // stderr can still be in flight when the child is
+                        // reaped; give the drain task until stderr EOFs
+                        // (right after exit, unless a nested process
+                        // inherited the pipe) so the lock check sees the
+                        // actual reason.
+                        if let Some(drain) = stderr_drain {
+                            let _ = tokio::time::timeout(Duration::from_millis(500), drain).await;
+                        }
+                        let stderr_text = zcode_stderr_tail(&stderr_tail);
+                        if let Ok(status) = &status
+                            && !status.success()
+                            && db_lock_attempts < ZCODE_DB_LOCK_MAX_RETRIES
+                            && zcode_stderr_is_db_lock(&stderr_text)
+                        {
+                            db_lock_attempts += 1;
+                            let delay = Duration::from_millis(
+                                (ZCODE_DB_LOCK_INITIAL_DELAY_MS << (db_lock_attempts - 1))
+                                    .min(ZCODE_DB_LOCK_MAX_DELAY_MS),
+                            );
+                            warn!(
+                                "ZCode harness database is locked; respawning \
+                                 (attempt {db_lock_attempts}/{ZCODE_DB_LOCK_MAX_RETRIES}) \
+                                 in {delay:?}"
+                            );
+                            tokio::time::sleep(delay).await;
+                            continue 'startup;
+                        }
+                        // Exited without emitting a line; run the regular
+                        // finalization below with the status already
+                        // collected (`child.wait()` must not run twice).
+                        break (child, lines, stderr_tail, None, Some(status));
+                    }
+                }
+            };
             let mut response_text = String::new();
             // Text streamed since the currently open message item started;
             // reset at every tool boundary so each segment can be finalized
@@ -3029,7 +3125,13 @@ impl ModelClientSession {
             let mut completed_tool_ids: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
 
-            while let Ok(Some(line)) = lines.next_line().await {
+            // The startup race above may have consumed the first line; replay
+            // it before reading the rest of the stream.
+            let mut pending_line = first_line;
+            while let Some(line) = match pending_line.take() {
+                Some(line) => Some(line),
+                None => lines.next_line().await.ok().flatten(),
+            } {
                 if line.trim().is_empty() {
                     continue;
                 }
@@ -3366,17 +3468,14 @@ impl ModelClientSession {
                 }
             }
 
-            let status = child.wait().await;
+            let status = match startup_status {
+                Some(status) => status,
+                None => child.wait().await,
+            };
             // Byte length before the final-text replacement and the move
             // into the Message item; an estimate is fine for output tokens.
             let reply_bytes = response_text.len();
-            let stderr_text = String::from_utf8_lossy(
-                &stderr_tail
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner),
-            )
-            .trim()
-            .to_string();
+            let stderr_text = zcode_stderr_tail(&stderr_tail);
             match (status, failed) {
                 (Ok(status), None) if status.success() => {
                     // Finalize the reply from the text actually streamed: the

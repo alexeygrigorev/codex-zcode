@@ -2151,6 +2151,21 @@ if (prompt.includes("ZCODEFAKE=segments")) {
 } else if (prompt.includes("ZCODEFAKE=goal-marker")) {
   emit({ type: "model.streaming", payload: { kind: "text_delta", delta: "All work is done.\n[GOAL:COMPLETE]" } });
   emit({ type: "result", response: "All work is done.\n[GOAL:COMPLETE]" });
+} else if (prompt.includes("ZCODEFAKE=db-lock-retry:")) {
+  const key = prompt.split("ZCODEFAKE=db-lock-retry:")[1].split("\n")[0].trim();
+  const marker = `${require("os").tmpdir()}/zcode-fake-dblock-${key}`;
+  if (require("fs").existsSync(marker)) {
+    emit({ type: "session.updated", sessionId: "sess-fake" });
+    emit({ type: "model.streaming", payload: { kind: "text_delta", delta: "recovered after lock" } });
+    emit({ type: "result", response: "recovered after lock" });
+  } else {
+    require("fs").writeFileSync(marker, "1");
+    require("fs").writeSync(2, "Error: database is locked (traceId: fake-attempt)\n");
+    process.exit(1);
+  }
+} else if (prompt.includes("ZCODEFAKE=hard-fail")) {
+  require("fs").writeSync(2, "Error: something else broke\n");
+  process.exit(3);
 } else {
   emit({ type: "model.streaming", payload: { kind: "text_delta", delta: "spawned unexpectedly" } });
   emit({ type: "result", response: "spawned unexpectedly" });
@@ -2513,4 +2528,110 @@ async fn zcode_real_tool_continuation_still_invokes_the_runtime() {
         completed_message_texts(&events),
         vec!["watched reply".to_string()]
     );
+}
+
+#[tokio::test]
+async fn zcode_stream_respawns_when_harness_database_is_locked() {
+    if !node_available() {
+        // The fake-runtime tests spawn `node`; nothing to verify without it.
+        return;
+    }
+    let cjs_path = write_fake_zcode_runtime();
+    let key = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be after the epoch")
+            .as_nanos()
+    );
+    let marker = std::env::temp_dir().join(format!("zcode-fake-dblock-{key}"));
+    let prompt = Prompt {
+        input: vec![zcode_user_message(&format!(
+            "ZCODEFAKE=db-lock-retry:{key}"
+        ))],
+        ..Default::default()
+    };
+    let mut stream = super::ModelClientSession::stream_zcode(
+        super::ZcodeRuntime {
+            node: "node".to_string(),
+            cjs: cjs_path.to_string_lossy().into_owned(),
+        },
+        &prompt,
+    )
+    .await
+    .expect("stream_zcode should launch the fake runtime");
+
+    let mut events = Vec::new();
+    while let Some(event) = stream.rx_event.recv().await {
+        events.push(event.expect("the respawn should recover the stream"));
+    }
+    let _ = std::fs::remove_file(&cjs_path);
+    let _ = std::fs::remove_file(&marker);
+
+    // The first spawn died on the lock error before any event was
+    // forwarded; the respawn must surface the normal event sequence only.
+    assert_eq!(events.len(), 4, "unexpected event sequence: {events:?}");
+    assert_eq!(
+        completed_message_texts(&events),
+        vec!["recovered after lock".to_string()]
+    );
+    assert!(matches!(
+        &events[3],
+        ResponseEvent::Completed {
+            end_turn: Some(true),
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn zcode_stream_reports_non_lock_startup_failure_without_retry() {
+    if !node_available() {
+        // The fake-runtime tests spawn `node`; nothing to verify without it.
+        return;
+    }
+    let cjs_path = write_fake_zcode_runtime();
+    let prompt = Prompt {
+        input: vec![zcode_user_message("ZCODEFAKE=hard-fail")],
+        ..Default::default()
+    };
+    let mut stream = super::ModelClientSession::stream_zcode(
+        super::ZcodeRuntime {
+            node: "node".to_string(),
+            cjs: cjs_path.to_string_lossy().into_owned(),
+        },
+        &prompt,
+    )
+    .await
+    .expect("stream_zcode should launch the fake runtime");
+
+    let mut events = Vec::new();
+    while let Some(event) = stream.rx_event.recv().await {
+        events.push(event);
+    }
+    let _ = std::fs::remove_file(&cjs_path);
+
+    // Only lock errors respawn; every other startup failure is reported as
+    // before, with the exit status and the stderr reason in the message.
+    assert_eq!(events.len(), 1, "unexpected event sequence: {events:?}");
+    match &events[0] {
+        Err(ApiError::Stream(message)) => {
+            assert!(message.contains("exit status: 3"), "{message}");
+            assert!(message.contains("something else broke"), "{message}");
+        }
+        other => panic!("expected a stream error, got {other:?}"),
+    }
+}
+
+#[test]
+fn zcode_db_lock_classifier_matches_sqlite_lock_stderr_only() {
+    assert!(super::zcode_stderr_is_db_lock(
+        "Error: database is locked (traceId: cd8d18b2-30d4-4f30-be94-727cfbbdb763)"
+    ));
+    assert!(super::zcode_stderr_is_db_lock("Error: database is busy"));
+    assert!(!super::zcode_stderr_is_db_lock(
+        "Error: database disk image is malformed"
+    ));
+    assert!(!super::zcode_stderr_is_db_lock(""));
 }
