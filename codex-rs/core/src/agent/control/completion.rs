@@ -9,6 +9,7 @@ use crate::agent::api::AgentTurnOutcome;
 use crate::agent_communication::AgentCommunicationContext;
 use crate::agent_communication::AgentCommunicationKind;
 use crate::session_prefix::format_inter_agent_completion_message;
+use crate::tools::handlers::multi_agents_common::sub_agent_message_preview;
 use codex_protocol::AgentPath;
 use codex_protocol::items::SubAgentActivityItem;
 use codex_protocol::protocol::AgentStatus;
@@ -48,6 +49,12 @@ impl LocalAgentControl {
         if matches!(status, AgentStatus::Completed(_))
             && let Some(parent_turn_id) = outcome.parent_turn_id
         {
+            let completion_preview = match &status {
+                AgentStatus::Completed(message) => {
+                    message.as_deref().and_then(sub_agent_message_preview)
+                }
+                _ => None,
+            };
             let initiating_thread_id = match outcome.initiating_agent_path.as_ref() {
                 Some(initiating_agent_path) if initiating_agent_path != &parent_agent_path => {
                     self.resolve_agent_reference(
@@ -75,6 +82,7 @@ impl LocalAgentControl {
                             kind: SubAgentActivityKind::Completed,
                             agent_thread_id: outcome.thread_id,
                             agent_path: child_agent_path.clone(),
+                            message_preview: completion_preview,
                         },
                     )
                     .await
