@@ -79,10 +79,72 @@ fn warm_bridge_enabled_from_value(value: Option<&str>) -> bool {
     matches!(value.map(str::trim), Some("1") | Some("true") | Some("yes"))
 }
 
+/// A rejected request, keeping the zod issue detail the core attaches to
+/// `Invalid params` rejections so version drift can be retried and logged.
+#[derive(Debug, Clone)]
+pub(crate) struct ProtocolRequestError {
+    pub(crate) message: String,
+    /// Root-level keys the core flagged as unrecognized, if it did.
+    pub(crate) unrecognized_keys: Vec<String>,
+}
+
+impl ProtocolRequestError {
+    fn plain(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            unrecognized_keys: Vec::new(),
+        }
+    }
+
+    fn from_protocol_error(error: &serde_json::Value) -> Self {
+        let message = error
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("unknown ZCode Protocol error");
+        let mut parsed = Self::plain(message);
+        // Zod rejections embed their issue array as JSON in `data.message`.
+        if error.get("code").and_then(serde_json::Value::as_i64) == Some(-32602)
+            && let Some(issues) = error
+                .pointer("/data/message")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|issues| serde_json::from_str::<serde_json::Value>(issues).ok())
+            && let Some(items) = issues.as_array()
+        {
+            parsed.unrecognized_keys = items
+                .iter()
+                .filter(|issue| {
+                    issue.get("code").and_then(serde_json::Value::as_str)
+                        == Some("unrecognized_keys")
+                })
+                // Only root-level unknown keys are safely strippable; nested
+                // ones point at params we do not rebuild.
+                .filter(|issue| {
+                    issue
+                        .get("path")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(std::vec::Vec::is_empty)
+                })
+                .filter_map(|issue| issue.get("keys"))
+                .filter_map(serde_json::Value::as_array)
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string)
+                .collect();
+        }
+        parsed
+    }
+}
+
+impl std::fmt::Display for ProtocolRequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
 #[derive(Default)]
 struct WarmState {
     next_id: i64,
-    pending: HashMap<i64, oneshot::Sender<Result<serde_json::Value, String>>>,
+    pending: HashMap<i64, oneshot::Sender<Result<serde_json::Value, ProtocolRequestError>>>,
 }
 
 /// One warm `app-server --stdio` child plus its per-thread session.
@@ -253,7 +315,7 @@ impl ZcodeWarmBridge {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         for (_, sender) in state.pending.drain() {
-            let _ = sender.send(Err(reason.to_string()));
+            let _ = sender.send(Err(ProtocolRequestError::plain(reason)));
         }
     }
 
@@ -281,12 +343,10 @@ impl ZcodeWarmBridge {
             };
             let outcome = match (msg.get("result"), msg.get("error")) {
                 (Some(result), _) => Ok(result.clone()),
-                (_, Some(error)) => Err(error
-                    .get("message")
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("unknown ZCode Protocol error")
-                    .to_string()),
-                _ => Err(format!("malformed ZCode Protocol response for id {id}")),
+                (_, Some(error)) => Err(ProtocolRequestError::from_protocol_error(error)),
+                _ => Err(ProtocolRequestError::plain(format!(
+                    "malformed ZCode Protocol response for id {id}"
+                ))),
             };
             let _ = sender.send(outcome);
             return;
@@ -344,9 +404,11 @@ impl ZcodeWarmBridge {
         &self,
         method: &str,
         params: serde_json::Value,
-    ) -> Result<serde_json::Value, String> {
+    ) -> Result<serde_json::Value, ProtocolRequestError> {
         if self.is_dead() {
-            return Err("ZCode warm app-server is no longer running".to_string());
+            return Err(ProtocolRequestError::plain(
+                "ZCode warm app-server is no longer running",
+            ));
         }
         let (id, rx) = {
             let mut state = self
@@ -360,26 +422,66 @@ impl ZcodeWarmBridge {
             (id, rx)
         };
         let frame = serde_json::json!({ "id": id, "method": method, "params": params });
-        let line = serde_json::to_string(&frame)
-            .map_err(|e| format!("could not serialize {method} request: {e}"))?;
+        let line = serde_json::to_string(&frame).map_err(|e| {
+            ProtocolRequestError::plain(format!("could not serialize {method} request: {e}"))
+        })?;
         if let Err(e) = self.write_line(line).await {
             self.state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .pending
                 .remove(&id);
-            return Err(format!(
+            return Err(ProtocolRequestError::plain(format!(
                 "could not send {method} to ZCode warm app-server: {e}"
-            ));
+            )));
         }
         match tokio::time::timeout(self.request_timeout, rx).await {
             Ok(Ok(Ok(result))) => Ok(result),
-            Ok(Ok(Err(message))) => Err(format!("{method} failed: {message}")),
-            Ok(Err(_dropped)) => Err(format!("{method} wait aborted: reader exited")),
+            Ok(Ok(Err(mut error))) => {
+                error.message = format!("{method} failed: {}", error.message);
+                Err(error)
+            }
+            Ok(Err(_dropped)) => Err(ProtocolRequestError::plain(format!(
+                "{method} wait aborted: reader exited"
+            ))),
             Err(_) => {
                 self.kill(&format!("{method} timed out"));
-                Err(format!("{method} timed out"))
+                Err(ProtocolRequestError::plain(format!("{method} timed out")))
             }
+        }
+    }
+
+    /// Sends a request, retrying once without unrecognized keys when the
+    /// core's zod schema rejects our params.
+    ///
+    /// The desktop app auto-updates zcode.cjs under us, so its protocol
+    /// schema can drift without a code change on our side; the desktop host
+    /// answers the same drift by stripping the flagged fields and retrying.
+    /// Drift is logged loudly so the protocol change gets noticed.
+    async fn request_with_compat_retry(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        match self.request(method, params.clone()).await {
+            Ok(result) => Ok(result),
+            Err(error) if !error.unrecognized_keys.is_empty() => {
+                let mut stripped = params;
+                if let Some(object) = stripped.as_object_mut() {
+                    for key in &error.unrecognized_keys {
+                        object.remove(key);
+                    }
+                }
+                warn!(
+                    "ZCode Protocol drift: {method} rejected unrecognized keys {:?}; \
+                     retrying without them",
+                    error.unrecognized_keys
+                );
+                self.request(method, stripped)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+            Err(error) => Err(error.to_string()),
         }
     }
 
@@ -390,7 +492,7 @@ impl ZcodeWarmBridge {
             return Ok(session_id.to_string());
         }
         let created = self
-            .request(
+            .request_with_compat_retry(
                 "session/create",
                 serde_json::json!({
                     "workspace": {
@@ -412,7 +514,7 @@ impl ZcodeWarmBridge {
                 )
             })?
             .to_string();
-        self.request(
+        self.request_with_compat_retry(
             "session/subscribe",
             serde_json::json!({
                 "sessionId": session_id,
@@ -448,7 +550,7 @@ impl ZcodeWarmBridge {
         let collector_timeout = event_timeout();
         tokio::spawn(async move {
             let send = send_bridge
-                .request(
+                .request_with_compat_retry(
                     "session/send",
                     serde_json::json!({ "sessionId": send_session, "content": send_content }),
                 )
@@ -571,9 +673,9 @@ impl ZcodeWarmBridge {
                                 )))
                                 .await
                                 .is_err()
-                            {
-                                return;
-                            }
+                        {
+                            return;
+                        }
                         let token_usage = token_usage_from_turn_payload(&payload);
                         let _ = tx
                             .send(Ok(codex_api::ResponseEvent::Completed {

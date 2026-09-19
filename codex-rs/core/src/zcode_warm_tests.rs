@@ -32,6 +32,10 @@ fn assistant_message(text: &str) -> ResponseItem {
 /// the callback responder would hang the session handshake and time the test
 /// out.
 fn write_fake_server() -> PathBuf {
+    write_fake_server_with(/*rejects_unknown_create_keys*/ false)
+}
+
+fn write_fake_server_with(rejects_unknown_create_keys: bool) -> PathBuf {
     let fixture = std::env::temp_dir().join(format!(
         "zcode-warm-fake-{}.cjs",
         uuid::Uuid::new_v4().simple()
@@ -46,6 +50,20 @@ function write(obj) { process.stdout.write(JSON.stringify(obj) + "\n"); }
 function emit(params) { write({ method: "session/event", params }); }
 function handle(msg) {
   const respond = (result) => write({ id: msg.id, result });
+  if (REJECT_DRIFT && msg.method === "session/create" && msg.params[DRIFT_KEY] !== undefined) {
+    stats("drift-reject");
+    write({
+      id: msg.id,
+      error: {
+        code: -32602,
+        message: "Invalid params",
+        data: { name: "ZodError", message: JSON.stringify([
+          { code: "unrecognized_keys", path: [], keys: [DRIFT_KEY], message: "Unrecognized key" },
+        ]) },
+      },
+    });
+    return;
+  }
   switch (msg.method) {
     case "session/create":
       respond({ session: { sessionId: "sess_fake" }, protocol: { name: "ZCode Protocol", version: 1 } });
@@ -78,6 +96,8 @@ function handle(msg) {
       write({ id: msg.id, error: { code: -32601, message: "unhandled " + msg.method } });
   }
 }
+const DRIFT_KEY = "titleGenerationEnabled";
+const REJECT_DRIFT = %REJECT_DRIFT%;
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => {
   buffer += chunk;
@@ -113,7 +133,18 @@ process.stdin.on("data", (chunk) => {
   }
 });
 "#;
-    std::fs::write(&fixture, script).expect("write fake app-server fixture");
+    std::fs::write(
+        &fixture,
+        script.replace(
+            "%REJECT_DRIFT%",
+            if rejects_unknown_create_keys {
+                "true"
+            } else {
+                "false"
+            },
+        ),
+    )
+    .expect("write fake app-server fixture");
     fixture
 }
 
@@ -261,5 +292,52 @@ async fn warm_turn_without_deltas_uses_final_response() {
         }
     };
     assert_eq!(final_text, "nodelta please!");
+    bridge.kill("test end");
+}
+
+#[tokio::test]
+async fn compat_retry_strips_unrecognized_keys_and_retries_once() {
+    let fixture = write_fake_server_with(/*rejects_unknown_create_keys*/ true);
+    let bridge =
+        ZcodeWarmBridge::spawn(&test_runtime(&fixture), "/tmp").expect("spawn fake app-server");
+
+    let session_id = bridge
+        .ensure_session("/tmp")
+        .await
+        .expect("session created");
+    assert_eq!(session_id, "sess_fake");
+
+    // The first create was rejected over the dropped flag, the retry passed.
+    // The fake counts the attempt in its dispatcher, so the rejected create
+    // also logs "create".
+    let stats_text = std::fs::read_to_string(stats_path(&fixture)).expect("stats written");
+    let rejects = stats_text
+        .lines()
+        .filter(|line| *line == "drift-reject")
+        .count();
+    let creates = stats_text.lines().filter(|line| *line == "create").count();
+    assert_eq!(rejects, 1, "the drift rejection is retried exactly once");
+    assert_eq!(creates, 2, "the retried create succeeds");
+    bridge.kill("test end");
+}
+
+#[tokio::test]
+async fn compat_retry_does_not_retry_unrelated_rejections() {
+    let fixture = write_fake_server();
+    let bridge =
+        ZcodeWarmBridge::spawn(&test_runtime(&fixture), "/tmp").expect("spawn fake app-server");
+
+    // A failed callback answer forces the handshake error path without any
+    // unrecognized keys, so there must be exactly one create attempt.
+    bridge
+        .ensure_session("/tmp")
+        .await
+        .expect("session created");
+    let stats_text = std::fs::read_to_string(stats_path(&fixture)).expect("stats written");
+    assert_eq!(
+        stats_text.lines().filter(|line| *line == "create").count(),
+        1,
+        "healthy handshakes do not retry"
+    );
     bridge.kill("test end");
 }
