@@ -132,6 +132,7 @@ use crate::feedback_tags;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::subagent_header_value;
 use crate::util::emit_feedback_auth_recovery_tags;
+use crate::zcode_process;
 use codex_feedback::FeedbackRequestTags;
 use codex_feedback::emit_feedback_request_tags_with_auth_env;
 use codex_login::auth::AgentIdentityAuthPolicy;
@@ -640,6 +641,16 @@ fn zcode_turn_failure_error(message: &str, stderr_tail: &str) -> ApiError {
     } else {
         ApiError::Stream(message.to_string())
     }
+}
+
+/// Builds the error surfaced when the ZCode stream goes silent past the
+/// idle timeout. A wedge is environmental rather than deterministic, so it
+/// stays a retryable stream error: the session-level retry respawns a fresh
+/// child.
+fn zcode_stall_error(idle: Duration) -> ApiError {
+    ApiError::Stream(format!(
+        "ZCode turn stalled: no stream output for {idle:?}; terminating the process tree"
+    ))
 }
 
 /// Builds the token usage Codex records for one completed ZCode invocation.
@@ -2787,6 +2798,12 @@ impl ModelClientSession {
     /// Spawns `node zcode.cjs --prompt ... --output-format stream-json` and
     /// maps NDJSON streaming events to Codex response events.
     /// This is fast (~8s) compared to the app-server approach.
+    ///
+    /// The turn is bounded: the NDJSON stream may stay silent for at most
+    /// `ZCODE_STREAM_IDLE_TIMEOUT_SECS` (default 15 minutes) before the turn
+    /// is failed as stalled, and stalled or aborted invocations are torn down
+    /// in stages (graceful termination request, grace period, process-tree
+    /// kill) so spawned shells never strand.
     async fn stream_zcode(
         runtime: ZcodeRuntime,
         prompt: &Prompt,
@@ -2982,6 +2999,10 @@ impl ModelClientSession {
             // failure is transient and the session-level stream retries
             // give up far too early.
             let mut db_lock_attempts: u32 = 0;
+            // Inactivity bound for the NDJSON stream; a silent child is
+            // either running a long tool or wedged, and past the window it
+            // is presumed wedged.
+            let idle_timeout = zcode_process::zcode_idle_timeout();
             let (mut child, mut lines, stderr_tail, first_line, startup_status) = 'startup: loop {
                 let mut command = Command::new(&runtime.node);
                 command
@@ -3001,6 +3022,11 @@ impl ModelClientSession {
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
                     .kill_on_drop(true);
+                // Own process group so the staged teardown can kill the
+                // shells the CLI spawned together with it instead of
+                // stranding them.
+                #[cfg(unix)]
+                command.process_group(0);
                 let mut child = match command.spawn() {
                     Ok(child) => child,
                     Err(e) => {
@@ -3059,6 +3085,7 @@ impl ModelClientSession {
                 enum StartupSignal {
                     FirstLine(String),
                     Exit(std::io::Result<std::process::ExitStatus>),
+                    Stalled(Duration),
                 }
                 let signal = tokio::select! {
                     biased;
@@ -3070,10 +3097,23 @@ impl ModelClientSession {
                         _ => StartupSignal::Exit(child.wait().await),
                     },
                     status = child.wait() => StartupSignal::Exit(status),
+                    idle = zcode_process::idle_elapsed(idle_timeout) => {
+                        StartupSignal::Stalled(idle)
+                    }
                 };
                 match signal {
                     StartupSignal::FirstLine(line) => {
                         break (child, lines, stderr_tail, Some(line), None);
+                    }
+                    StartupSignal::Stalled(idle) => {
+                        // A child that produces neither output nor an exit is
+                        // wedged; the DB-lock respawn loop is only for quick
+                        // startup exits, so fail the turn instead.
+                        warn!("ZCode startup produced no stream output for {idle:?}; terminating");
+                        let _ = tx.send(Err(zcode_stall_error(idle))).await;
+                        let _ = zcode_process::dispose_and_wait_once(&mut child).await;
+                        drop(prompt_guard);
+                        return;
                     }
                     StartupSignal::Exit(status) => {
                         // stderr can still be in flight when the child is
@@ -3128,9 +3168,19 @@ impl ModelClientSession {
             // The startup race above may have consumed the first line; replay
             // it before reading the rest of the stream.
             let mut pending_line = first_line;
+            // Set when the stream went silent past the idle window; the turn
+            // is failed and the child torn down below.
+            let mut stalled: Option<Duration> = None;
             while let Some(line) = match pending_line.take() {
                 Some(line) => Some(line),
-                None => lines.next_line().await.ok().flatten(),
+                None => match zcode_process::next_stream_line(&mut lines, idle_timeout).await {
+                    zcode_process::ZcodeStreamLine::Line(line) => Some(line),
+                    zcode_process::ZcodeStreamLine::Eof => None,
+                    zcode_process::ZcodeStreamLine::Stalled(idle) => {
+                        stalled = Some(idle);
+                        None
+                    }
+                },
             } {
                 if line.trim().is_empty() {
                     continue;
@@ -3435,8 +3485,9 @@ impl ModelClientSession {
             // they would vanish silently; with the old code they were emitted
             // eagerly from raw deltas (the 421 KiB poisoning path). Emit a
             // capped, validated fallback instead. Skip when the turn already
-            // failed (session.error) so a failed turn does not sprout tools.
-            if failed.is_none() {
+            // failed (session.error) or stalled so a dead turn does not
+            // sprout half-formed tools.
+            if failed.is_none() && stalled.is_none() {
                 for (tool_call_id, pending) in std::mem::take(&mut pending_tools) {
                     if completed_tool_ids.contains(&tool_call_id) {
                         continue;
@@ -3468,10 +3519,29 @@ impl ModelClientSession {
                 }
             }
 
+            // A dropped receiver means the consumer aborted the turn; tear
+            // the still-running invocation down instead of letting it burn
+            // tokens unseen until it exits on its own.
+            let aborted = tx.is_closed();
+            if let Some(idle) = stalled {
+                warn!("ZCode stream went silent for {idle:?}; terminating the invocation");
+                let _ = tx.send(Err(zcode_stall_error(idle))).await;
+            }
             let status = match startup_status {
                 Some(status) => status,
+                None if stalled.is_some() || aborted => {
+                    zcode_process::dispose_and_wait_once(&mut child).await
+                }
+                // The stream ended on its own; the child is on its way out.
                 None => child.wait().await,
             };
+            if stalled.is_some() {
+                // The stall error already went out above; skip the
+                // completion/exit-status mapping, which would send a second,
+                // less specific error.
+                drop(prompt_guard);
+                return;
+            }
             // Byte length before the final-text replacement and the move
             // into the Message item; an estimate is fine for output tokens.
             let reply_bytes = response_text.len();
