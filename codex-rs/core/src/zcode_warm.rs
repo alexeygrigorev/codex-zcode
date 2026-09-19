@@ -15,6 +15,12 @@
 //! tool execution leaves Codex's sandbox and approval flow; that trade is
 //! why the experiment is not the default wire.
 //!
+//! `ZCODE_WARM_MODE=build` opts into the gated variant of the experiment:
+//! the session is created in `build` mode so the core asks before risky
+//! actions via `interaction/*` callbacks. The bridge has no human on the
+//! other end, so it denies every request and logs it — measuring how far a
+//! gated core gets and what a real approval bridge would need (issue #25).
+//!
 //! Envelope (JSON-RPC minus the `jsonrpc` member):
 //! `{"id", "method", "params"}` requests, bare `{"method", "params"}`
 //! notifications, `{"id", "result"}` / `{"id", "error"}` responses. The core
@@ -50,6 +56,48 @@ use crate::zcode_process;
 
 /// Env var enabling the warm bridge (`ZCODE_WARM=1`).
 const WARM_BRIDGE_ENV_VAR: &str = "ZCODE_WARM";
+
+/// Env var selecting the warm session mode (`ZCODE_WARM_MODE`): `yolo` (the
+/// default, ungated core-side execution) or `build` (the core asks before
+/// risky actions; the bridge denies).
+const WARM_MODE_ENV_VAR: &str = "ZCODE_WARM_MODE";
+
+/// How the warm session balances gating against tool access.
+///
+/// `Yolo` is today's behavior: the core executes everything itself and
+/// permission callbacks never fire. `Build` creates the session in `build`
+/// mode so the core requests permission through `interaction/*` callbacks;
+/// the bridge answers every request with a denial and logs it, since there
+/// is no interactive approver on the Codex side of the wire.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WarmMode {
+    Yolo,
+    Build,
+}
+
+impl WarmMode {
+    /// The `mode` value sent in `session/create`.
+    fn wire_session_mode(self) -> &'static str {
+        match self {
+            WarmMode::Yolo => "yolo",
+            WarmMode::Build => "build",
+        }
+    }
+}
+
+/// Resolves [`WarmMode`] from the `ZCODE_WARM_MODE` value; unknown values
+/// stay on the default ungated mode.
+pub(crate) fn warm_mode_from_value(value: Option<&str>) -> WarmMode {
+    match value.map(str::trim) {
+        Some("build") => WarmMode::Build,
+        _ => WarmMode::Yolo,
+    }
+}
+
+/// [`warm_mode_from_value`] against the process environment.
+pub(crate) fn warm_mode_from_env() -> WarmMode {
+    warm_mode_from_value(std::env::var(WARM_MODE_ENV_VAR).ok().as_deref())
+}
 
 /// Consecutive startup/protocol failures tolerated before the warm bridge is
 /// abandoned for the rest of the Codex thread and every turn falls back to
@@ -154,9 +202,10 @@ struct WarmState {
 /// included).
 pub(crate) struct ZcodeWarmBridge {
     state: StdMutex<WarmState>,
-    /// Owned here because writes await; a tokio mutex guard is Send, so the
-    /// reader task may hold it across `write_all`.
-    stdin: tokio::sync::Mutex<Option<tokio::process::ChildStdin>>,
+    /// Frames for the child's stdin. A dedicated writer task owns the pipe
+    /// and is the only place that awaits on writes, so no mutex guard is
+    /// ever held across an await point (workspace clippy denies that).
+    stdin: mpsc::UnboundedSender<String>,
     child: StdMutex<Child>,
     /// Saved at spawn: the child leads its own process group, so this id
     /// stays valid for group kills even after the direct child exits.
@@ -164,10 +213,13 @@ pub(crate) struct ZcodeWarmBridge {
     stderr_tail: Arc<StdMutex<Vec<u8>>>,
     /// Fan-out of `session/event` notification params to turn collectors.
     events: broadcast::Sender<serde_json::Value>,
-    session_id: tokio::sync::Mutex<Option<String>>,
+    /// Created once per bridge; concurrent first turns share the handshake
+    /// and failed attempts leave the cell empty for a retry.
+    session_id: tokio::sync::OnceCell<String>,
     dead: Arc<AtomicBool>,
     consecutive_failures: AtomicU32,
     request_timeout: Duration,
+    mode: WarmMode,
 }
 
 impl std::fmt::Debug for ZcodeWarmBridge {
@@ -184,7 +236,11 @@ impl std::fmt::Debug for ZcodeWarmBridge {
 
 impl ZcodeWarmBridge {
     /// Spawns the app-server child and starts its reader task.
-    pub(crate) fn spawn(runtime: &ZcodeRuntime, workspace_path: &str) -> io::Result<Arc<Self>> {
+    pub(crate) fn spawn(
+        runtime: &ZcodeRuntime,
+        workspace_path: &str,
+        mode: WarmMode,
+    ) -> io::Result<Arc<Self>> {
         let mut command = Command::new(&runtime.node);
         command
             .arg(&runtime.cjs)
@@ -237,17 +293,34 @@ impl ZcodeWarmBridge {
 
         let (events, _) = broadcast::channel(4096);
         let dead = Arc::new(AtomicBool::new(false));
+        let (stdin_tx, mut stdin_rx) = mpsc::unbounded_channel::<String>();
+        // The writer task owns the child's stdin for its whole lifetime;
+        // losing the pipe only surfaces to senders on the next frame.
+        tokio::spawn(async move {
+            let mut stdin = stdin;
+            while let Some(line) = stdin_rx.recv().await {
+                let write_error = match stdin.write_all(line.as_bytes()).await {
+                    Err(e) => Some(e),
+                    Ok(()) => stdin.flush().await.err(),
+                };
+                if let Some(e) = write_error {
+                    warn!("ZCode warm app-server stdin write failed: {e}");
+                    break;
+                }
+            }
+        });
         let bridge = Arc::new(Self {
             state: StdMutex::new(WarmState::default()),
-            stdin: tokio::sync::Mutex::new(Some(stdin)),
+            stdin: stdin_tx,
             child: StdMutex::new(child),
             process_group_pid,
             stderr_tail,
             events,
-            session_id: tokio::sync::Mutex::new(None),
+            session_id: tokio::sync::OnceCell::new(),
             dead: Arc::clone(&dead),
             consecutive_failures: AtomicU32::new(0),
             request_timeout: REQUEST_TIMEOUT,
+            mode,
         });
 
         // The reader holds the bridge only weakly: when the thread's last
@@ -328,7 +401,8 @@ impl ZcodeWarmBridge {
         };
         let id = msg.get("id").cloned();
         if let (Some(id), Some(method)) = (id.clone(), msg.get("method").and_then(|m| m.as_str())) {
-            self.answer_callback(id, method).await;
+            let params = msg.get("params").unwrap_or(&serde_json::Value::Null);
+            self.answer_callback(id, method, params).await;
             return;
         }
         if let Some(id) = id {
@@ -361,12 +435,73 @@ impl ZcodeWarmBridge {
     /// Answers core-to-host callback requests the way the desktop host does;
     /// unknown callbacks get a protocol error so the core fails fast instead
     /// of waiting out its request timeout.
-    async fn answer_callback(&self, id: serde_json::Value, method: &str) {
+    ///
+    /// In gated mode the `interaction/*` requests are answered with denials
+    /// (the wire result schemas are strict: permission answers carry
+    /// `decision`, user-input answers carry `action`), and each request is
+    /// logged with a bounded input preview so the experiment shows exactly
+    /// what the gated core wanted to do.
+    async fn answer_callback(
+        &self,
+        id: serde_json::Value,
+        method: &str,
+        params: &serde_json::Value,
+    ) {
         let frame = match method {
             "session/requestRuntimePreferences" => {
                 serde_json::json!({
                     "id": id,
                     "result": {"nativeSearchEnhancementsEnabled": false},
+                })
+            }
+            "interaction/requestPermission" if self.mode == WarmMode::Build => {
+                let input_preview = params
+                    .get("input")
+                    .map(serde_json::to_string)
+                    .and_then(Result::ok)
+                    .map(|input| input.chars().take(200).collect::<String>())
+                    .unwrap_or_default();
+                warn!(
+                    "ZCode warm permission request denied: tool={} risk={} reason={} input={}",
+                    params
+                        .get("toolName")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown"),
+                    params
+                        .get("riskLevel")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown"),
+                    params
+                        .get("reason")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or(""),
+                    input_preview,
+                );
+                serde_json::json!({
+                    "id": id,
+                    "result": {
+                        "decision": "deny",
+                        "reason": "Denied by the Codex host: the warm ZCode bridge has no \
+                                   interactive approver",
+                    },
+                })
+            }
+            "interaction/requestUserInput" if self.mode == WarmMode::Build => {
+                let prompt = params
+                    .get("prompt")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .chars()
+                    .take(200)
+                    .collect::<String>();
+                warn!("ZCode warm user-input request declined: prompt={prompt}");
+                serde_json::json!({
+                    "id": id,
+                    "result": {
+                        "action": "decline",
+                        "reason": "Declined by the Codex host: the warm ZCode bridge has no \
+                                   interactive approver",
+                    },
                 })
             }
             other => {
@@ -382,22 +517,19 @@ impl ZcodeWarmBridge {
         };
         match serde_json::to_string(&frame) {
             Ok(line) => {
-                let _ = self.write_line(line).await;
+                let _ = self.write_line(line);
             }
             Err(e) => warn!("could not serialize callback response: {e}"),
         }
     }
 
-    async fn write_line(&self, mut line: String) -> io::Result<()> {
+    fn write_line(&self, mut line: String) -> io::Result<()> {
         if !line.ends_with('\n') {
             line.push('\n');
         }
-        let mut stdin = self.stdin.lock().await;
-        let Some(stdin) = stdin.as_mut() else {
-            return Err(io::Error::other("ZCode warm app-server stdin is closed"));
-        };
-        stdin.write_all(line.as_bytes()).await?;
-        stdin.flush().await
+        self.stdin
+            .send(line)
+            .map_err(|_| io::Error::other("ZCode warm app-server stdin is closed"))
     }
 
     async fn request(
@@ -425,7 +557,7 @@ impl ZcodeWarmBridge {
         let line = serde_json::to_string(&frame).map_err(|e| {
             ProtocolRequestError::plain(format!("could not serialize {method} request: {e}"))
         })?;
-        if let Err(e) = self.write_line(line).await {
+        if let Err(e) = self.write_line(line) {
             self.state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -486,44 +618,47 @@ impl ZcodeWarmBridge {
     }
 
     /// Creates (once) and subscribes to the per-thread session.
+    ///
+    /// The `OnceCell` makes concurrent first turns share one handshake while
+    /// keeping no lock guard across the awaited requests.
     pub(crate) async fn ensure_session(&self, workspace_path: &str) -> Result<String, String> {
-        let mut cached = self.session_id.lock().await;
-        if let Some(session_id) = cached.as_deref() {
-            return Ok(session_id.to_string());
-        }
-        let created = self
-            .request_with_compat_retry(
-                "session/create",
-                serde_json::json!({
-                    "workspace": {
-                        "workspacePath": workspace_path,
-                        "workspaceKey": workspace_path,
-                    },
-                    "mode": "yolo",
-                    "titleGenerationEnabled": false,
-                }),
-            )
-            .await?;
-        let session_id = created
-            .pointer("/session/sessionId")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| {
-                format!(
-                    "session/create response carried no sessionId: {}",
-                    serde_json::to_string(&created).unwrap_or_default()
+        self.session_id
+            .get_or_try_init(|| async {
+                let created = self
+                    .request_with_compat_retry(
+                        "session/create",
+                        serde_json::json!({
+                            "workspace": {
+                                "workspacePath": workspace_path,
+                                "workspaceKey": workspace_path,
+                            },
+                            "mode": self.mode.wire_session_mode(),
+                            "titleGenerationEnabled": false,
+                        }),
+                    )
+                    .await?;
+                let session_id = created
+                    .pointer("/session/sessionId")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        format!(
+                            "session/create response carried no sessionId: {}",
+                            serde_json::to_string(&created).unwrap_or_default()
+                        )
+                    })?
+                    .to_string();
+                self.request_with_compat_retry(
+                    "session/subscribe",
+                    serde_json::json!({
+                        "sessionId": session_id,
+                        "deliveryKind": "desktop-continuous",
+                    }),
                 )
-            })?
-            .to_string();
-        self.request_with_compat_retry(
-            "session/subscribe",
-            serde_json::json!({
-                "sessionId": session_id,
-                "deliveryKind": "desktop-continuous",
-            }),
-        )
-        .await?;
-        *cached = Some(session_id.clone());
-        Ok(session_id)
+                .await?;
+                Ok(session_id)
+            })
+            .await
+            .cloned()
     }
 
     /// Sends one user turn and returns the mapped Codex event stream.

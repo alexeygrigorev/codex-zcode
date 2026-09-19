@@ -2950,13 +2950,17 @@ impl ModelClientSession {
             {
                 Arc::clone(bridge)
             } else {
-                let bridge =
-                    zcode_warm::ZcodeWarmBridge::spawn(runtime, &workspace_path).map_err(|e| {
-                        state
-                            .zcode_warm_spawn_failures
-                            .fetch_add(1, Ordering::Relaxed);
-                        format!("could not launch warm app-server: {e}")
-                    })?;
+                let bridge = zcode_warm::ZcodeWarmBridge::spawn(
+                    runtime,
+                    &workspace_path,
+                    zcode_warm::warm_mode_from_env(),
+                )
+                .map_err(|e| {
+                    state
+                        .zcode_warm_spawn_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                    format!("could not launch warm app-server: {e}")
+                })?;
                 *slot = Some(Arc::clone(&bridge));
                 bridge
             }
