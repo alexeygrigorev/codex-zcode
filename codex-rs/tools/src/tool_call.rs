@@ -1,6 +1,7 @@
 use crate::FunctionCallError;
 use crate::ToolName;
 use crate::ToolPayload;
+use crate::model_completion::SharedModelCompletion;
 use codex_extension_items::ExtensionItem;
 use codex_file_system::ExecutorFileSystem;
 use codex_file_system::FileSystemSandboxContext;
@@ -114,6 +115,7 @@ pub struct ToolCall<'call> {
     pub truncation_policy: TruncationPolicy,
     pub source: ToolCallSource,
     pub conversation_history: ConversationHistory,
+    pub model_completion: SharedModelCompletion,
     pub turn_item_emitter: Arc<dyn TurnItemEmitter>,
     pub environments: Vec<ToolEnvironment<'call>>,
     pub payload: ToolPayload,

@@ -24,6 +24,7 @@ use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::handlers::apply_granted_turn_permissions;
 use crate::tools::lifecycle::extension_tool_call_source;
+use crate::tools::model_completion::CoreModelCompletion;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
 use crate::turn_metadata::ExecutionMetadata;
@@ -208,6 +209,10 @@ async fn to_extension_call(invocation: &ToolInvocation) -> ExtensionToolCall<'_>
         truncation_policy: settings.model_info.truncation_policy.into(),
         source: extension_tool_call_source(invocation.source.clone()),
         conversation_history,
+        model_completion: Arc::new(CoreModelCompletion {
+            session: Arc::downgrade(&invocation.session),
+            turn: Arc::downgrade(&invocation.turn),
+        }),
         turn_item_emitter: Arc::new(CoreTurnItemEmitter {
             session: Arc::downgrade(&invocation.session),
             turn: Arc::downgrade(&invocation.turn),

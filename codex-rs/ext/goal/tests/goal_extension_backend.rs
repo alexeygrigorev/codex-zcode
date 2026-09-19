@@ -14,6 +14,7 @@ use codex_extension_api::ExtensionEventSink;
 use codex_extension_api::ExtensionRegistryBuilder;
 use codex_extension_api::ExtensionWarning;
 use codex_extension_api::FunctionCallError;
+use codex_extension_api::NoopModelCompletion;
 use codex_extension_api::NoopTurnItemEmitter;
 use codex_extension_api::ThreadResumeInput;
 use codex_extension_api::ThreadStartInput;
@@ -237,13 +238,15 @@ async fn installed_goal_tools_only_replace_complete_goal() -> anyhow::Result<()>
     );
 
     let update_tool = tool_by_name(&tools, "update_goal");
-    update_tool
-        .handle(tool_call(
+    let completion = ToolCall {
+        model_completion: Arc::new(StubJudge { message: "PASS" }),
+        ..tool_call(
             "update_goal",
             "call-complete-goal",
             json!({ "status": "complete" }),
-        ))
-        .await?;
+        )
+    };
+    update_tool.handle(completion).await?;
 
     let invocation = tool_call(
         "create_goal",
@@ -566,11 +569,14 @@ async fn subagent_usage_resets_when_root_goal_is_replaced() -> anyhow::Result<()
             &input_token_usage(/*input_tokens*/ 25),
         )
         .await;
-    let completion = tool_call(
-        "update_goal",
-        "call-complete-first-goal",
-        json!({ "status": "complete" }),
-    );
+    let completion = ToolCall {
+        model_completion: Arc::new(StubJudge { message: "PASS" }),
+        ..tool_call(
+            "update_goal",
+            "call-complete-first-goal",
+            json!({ "status": "complete" }),
+        )
+    };
     let completed = tool_by_name(&tools, "update_goal")
         .handle(completion.clone())
         .await?;
@@ -2156,6 +2162,7 @@ fn tool_call(tool_name: &str, call_id: &str, arguments: serde_json::Value) -> To
         truncation_policy: TruncationPolicy::Bytes(1024),
         source: ToolCallSource::Direct,
         conversation_history: codex_extension_api::ConversationHistory::default(),
+        model_completion: Arc::new(NoopModelCompletion),
         turn_item_emitter: Arc::new(NoopTurnItemEmitter),
         environments: Vec::new(),
         payload: ToolPayload::Function {
@@ -2287,4 +2294,205 @@ fn protocol_status(status: codex_state::ThreadGoalStatus) -> ThreadGoalStatus {
         codex_state::ThreadGoalStatus::BudgetLimited => ThreadGoalStatus::BudgetLimited,
         codex_state::ThreadGoalStatus::Complete => ThreadGoalStatus::Complete,
     }
+}
+
+struct StubJudge {
+    message: &'static str,
+}
+
+impl codex_extension_api::ModelCompletion for StubJudge {
+    fn complete<'a>(
+        &'a self,
+        _request: codex_extension_api::CompletionRequest,
+    ) -> codex_extension_api::ModelCompletionFuture<'a> {
+        Box::pin(std::future::ready(Ok(
+            codex_extension_api::CompletionOutput {
+                message: self.message.to_string(),
+            },
+        )))
+    }
+}
+
+#[tokio::test]
+async fn update_goal_complete_stays_active_when_judge_rejects() -> anyhow::Result<()> {
+    let runtime = test_runtime().await?;
+    let thread_id = test_thread_id()?;
+    seed_thread_metadata(runtime.as_ref(), thread_id).await?;
+    let harness = GoalExtensionHarness::new(runtime.clone(), thread_id).await?;
+    let tools = harness.tools();
+
+    tool_by_name(&tools, "create_goal")
+        .handle(tool_call(
+            "create_goal",
+            "call-create-goal",
+            json!({ "objective": "ship the feature" }),
+        ))
+        .await?;
+
+    let completion = ToolCall {
+        model_completion: Arc::new(StubJudge {
+            message: "FAIL: the feature is not implemented yet",
+        }),
+        ..tool_call(
+            "update_goal",
+            "call-complete-goal",
+            json!({ "status": "complete" }),
+        )
+    };
+    let err = match tool_by_name(&tools, "update_goal").handle(completion).await {
+        Ok(_) => panic!("unverified completion should fail"),
+        Err(err) => err,
+    };
+    assert_eq!(
+        FunctionCallError::RespondToModel(
+            "the goal stays active because the completion review did not pass: the feature is not implemented yet"
+                .to_string()
+        ),
+        err
+    );
+
+    let goal = runtime
+        .thread_goals()
+        .get_thread_goal(thread_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("goal should exist"))?;
+    assert_eq!(codex_state::ThreadGoalStatus::Active, goal.status);
+    Ok(())
+}
+
+#[tokio::test]
+async fn update_goal_complete_fails_closed_without_verification_model() -> anyhow::Result<()> {
+    let runtime = test_runtime().await?;
+    let thread_id = test_thread_id()?;
+    seed_thread_metadata(runtime.as_ref(), thread_id).await?;
+    let harness = GoalExtensionHarness::new(runtime.clone(), thread_id).await?;
+    let tools = harness.tools();
+
+    tool_by_name(&tools, "create_goal")
+        .handle(tool_call(
+            "create_goal",
+            "call-create-goal",
+            json!({ "objective": "ship the feature" }),
+        ))
+        .await?;
+
+    let completion = ToolCall {
+        model_completion: Arc::new(NoopModelCompletion),
+        ..tool_call(
+            "update_goal",
+            "call-complete-goal",
+            json!({ "status": "complete" }),
+        )
+    };
+    let err = match tool_by_name(&tools, "update_goal").handle(completion).await {
+        Ok(_) => panic!("missing verification model should fail closed"),
+        Err(err) => err,
+    };
+    assert_eq!(
+        FunctionCallError::RespondToModel(
+            "the goal stays active because completion could not be verified: verification model call failed: host model completion is unavailable"
+                .to_string()
+        ),
+        err
+    );
+
+    let goal = runtime
+        .thread_goals()
+        .get_thread_goal(thread_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("goal should exist"))?;
+    assert_eq!(codex_state::ThreadGoalStatus::Active, goal.status);
+    Ok(())
+}
+
+#[tokio::test]
+async fn update_goal_complete_fails_closed_on_unparseable_judge_answer() -> anyhow::Result<()> {
+    let runtime = test_runtime().await?;
+    let thread_id = test_thread_id()?;
+    seed_thread_metadata(runtime.as_ref(), thread_id).await?;
+    let harness = GoalExtensionHarness::new(runtime.clone(), thread_id).await?;
+    let tools = harness.tools();
+
+    tool_by_name(&tools, "create_goal")
+        .handle(tool_call(
+            "create_goal",
+            "call-create-goal",
+            json!({ "objective": "ship the feature" }),
+        ))
+        .await?;
+
+    let completion = ToolCall {
+        model_completion: Arc::new(StubJudge {
+            message: "The goal looks mostly done.",
+        }),
+        ..tool_call(
+            "update_goal",
+            "call-complete-goal",
+            json!({ "status": "complete" }),
+        )
+    };
+    let err = match tool_by_name(&tools, "update_goal").handle(completion).await {
+        Ok(_) => panic!("unparseable judge answer should fail closed"),
+        Err(err) => err,
+    };
+    assert_eq!(
+        FunctionCallError::RespondToModel(
+            "the goal stays active because completion could not be verified: verification model answer was not PASS or FAIL: The goal looks mostly done."
+                .to_string()
+        ),
+        err
+    );
+
+    let goal = runtime
+        .thread_goals()
+        .get_thread_goal(thread_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("goal should exist"))?;
+    assert_eq!(codex_state::ThreadGoalStatus::Active, goal.status);
+    Ok(())
+}
+
+#[tokio::test]
+async fn update_goal_complete_skips_verification_for_completed_goal() -> anyhow::Result<()> {
+    let runtime = test_runtime().await?;
+    let thread_id = test_thread_id()?;
+    seed_thread_metadata(runtime.as_ref(), thread_id).await?;
+    let harness = GoalExtensionHarness::new(runtime.clone(), thread_id).await?;
+    let tools = harness.tools();
+
+    tool_by_name(&tools, "create_goal")
+        .handle(tool_call(
+            "create_goal",
+            "call-create-goal",
+            json!({ "objective": "ship the feature" }),
+        ))
+        .await?;
+
+    let first = ToolCall {
+        model_completion: Arc::new(StubJudge { message: "PASS" }),
+        ..tool_call(
+            "update_goal",
+            "call-complete-goal",
+            json!({ "status": "complete" }),
+        )
+    };
+    tool_by_name(&tools, "update_goal").handle(first).await?;
+
+    let repeat = ToolCall {
+        model_completion: Arc::new(NoopModelCompletion),
+        ..tool_call(
+            "update_goal",
+            "call-complete-goal-again",
+            json!({ "status": "complete" }),
+        )
+    };
+    tool_by_name(&tools, "update_goal").handle(repeat).await?;
+
+    let goal = runtime
+        .thread_goals()
+        .get_thread_goal(thread_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("goal should exist"))?;
+    assert_eq!(codex_state::ThreadGoalStatus::Complete, goal.status);
+    Ok(())
 }

@@ -19,6 +19,7 @@ use codex_extension_api::ExtensionMetrics;
 use codex_extension_api::ExtensionRegistryBuilder;
 use codex_extension_api::ExtensionWarning;
 use codex_extension_api::FunctionCallError;
+use codex_extension_api::NoopModelCompletion;
 use codex_extension_api::NoopTurnItemEmitter;
 use codex_extension_api::PreviousWorldStateSection;
 use codex_extension_api::RenderedWorldStateFragment;
@@ -1652,6 +1653,7 @@ async fn skills_list_only_returns_model_visible_bounded_metadata() -> TestResult
         truncation_policy: TruncationPolicy::Bytes(10_000),
         source: ToolCallSource::Direct,
         conversation_history: ConversationHistory::default(),
+        model_completion: Arc::new(NoopModelCompletion),
         turn_item_emitter: Arc::new(NoopTurnItemEmitter),
         environments: Vec::new(),
         payload: payload.clone(),
@@ -1812,6 +1814,7 @@ async fn skills_list_only_returns_model_visible_bounded_metadata() -> TestResult
             truncation_policy: TruncationPolicy::Bytes(2_000),
             source: ToolCallSource::Direct,
             conversation_history: ConversationHistory::default(),
+            model_completion: Arc::new(NoopModelCompletion),
             turn_item_emitter: Arc::new(NoopTurnItemEmitter),
             environments: Vec::new(),
             payload: insufficient_budget_payload,
@@ -1917,6 +1920,7 @@ async fn orchestrator_catalog_snapshot_caches_failure() -> TestResult {
                 truncation_policy: TruncationPolicy::Bytes(64),
                 source: ToolCallSource::Direct,
                 conversation_history: ConversationHistory::default(),
+                model_completion: Arc::new(NoopModelCompletion),
                 turn_item_emitter: Arc::new(NoopTurnItemEmitter),
                 environments: Vec::new(),
                 payload: ToolPayload::Function {

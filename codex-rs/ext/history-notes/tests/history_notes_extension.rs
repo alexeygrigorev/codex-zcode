@@ -9,6 +9,7 @@ use codex_extension_api::ConversationHistory;
 use codex_extension_api::ExtensionData;
 use codex_extension_api::ExtensionRegistry;
 use codex_extension_api::ExtensionRegistryBuilder;
+use codex_extension_api::NoopModelCompletion;
 use codex_extension_api::NoopTurnItemEmitter;
 use codex_extension_api::PromptFragment;
 use codex_extension_api::PromptSlot;
@@ -431,6 +432,7 @@ fn tool_call(tool_name: ToolName, arguments: serde_json::Value) -> ToolCall<'sta
         truncation_policy: TruncationPolicy::Bytes(1024),
         source: ToolCallSource::Direct,
         conversation_history: ConversationHistory::default(),
+        model_completion: Arc::new(NoopModelCompletion),
         turn_item_emitter: Arc::new(NoopTurnItemEmitter),
         environments: Vec::new(),
         payload: ToolPayload::Function {

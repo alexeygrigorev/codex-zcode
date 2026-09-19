@@ -26,6 +26,8 @@ use crate::spec::UPDATE_GOAL_TOOL_NAME;
 use crate::spec::create_create_goal_tool;
 use crate::spec::create_get_goal_tool;
 use crate::spec::create_update_goal_tool;
+use crate::verifier::CompletionVerdict;
+use crate::verifier::verify_goal_completion;
 
 #[derive(Clone)]
 pub(crate) struct GoalToolExecutor {
@@ -253,6 +255,40 @@ impl GoalToolExecutor {
                 "update_goal can only mark the existing goal complete, blocked, or paused at the user's explicit request; resume, budget-limited, and usage-limited status changes are controlled by the user or system"
                     .to_string(),
             ));
+        }
+
+        if args.status == ThreadGoalStatus::Complete {
+            let existing_goal = self
+                .state_db
+                .thread_goals()
+                .get_thread_goal(self.thread_id)
+                .await
+                .map_err(|err| {
+                    FunctionCallError::RespondToModel(format!("failed to read goal: {err}"))
+                })?;
+            if let Some(existing_goal) = existing_goal
+                && existing_goal.status != codex_state::ThreadGoalStatus::Complete
+            {
+                match verify_goal_completion(
+                    &invocation.model_completion,
+                    existing_goal.objective.as_str(),
+                    &invocation.conversation_history,
+                )
+                .await
+                {
+                    Ok(CompletionVerdict::Passed) => {}
+                    Ok(CompletionVerdict::NotPassed(reason)) => {
+                        return Err(FunctionCallError::RespondToModel(format!(
+                            "the goal stays active because the completion review did not pass: {reason}"
+                        )));
+                    }
+                    Err(err) => {
+                        return Err(FunctionCallError::RespondToModel(format!(
+                            "the goal stays active because completion could not be verified: {err}"
+                        )));
+                    }
+                }
+            }
         }
 
         self.account_active_goal_progress(

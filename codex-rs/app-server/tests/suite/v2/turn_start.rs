@@ -1638,6 +1638,8 @@ async fn turn_profile_tracks_blocking_tool_and_follow_up_sampling() -> Result<()
             responses::ev_completed(&response_id),
         ])
     }));
+    // update_goal completion is verified by one extra tool-less model call.
+    responses.push(create_final_assistant_message_sse_response("PASS")?);
     responses.push(create_final_assistant_message_sse_response("Done")?);
     let server = create_mock_responses_server_sequence(responses).await;
 

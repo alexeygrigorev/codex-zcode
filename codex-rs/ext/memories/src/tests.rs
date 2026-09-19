@@ -4,6 +4,7 @@ use std::sync::Arc;
 use codex_extension_api::ContextContributor;
 use codex_extension_api::ExtensionData;
 use codex_extension_api::ExtensionRegistryBuilder;
+use codex_extension_api::NoopModelCompletion;
 use codex_extension_api::NoopTurnItemEmitter;
 use codex_extension_api::PromptSlot;
 use codex_extension_api::ToolCall;
@@ -229,6 +230,7 @@ async fn add_ad_hoc_note_tool_creates_note_file() {
             truncation_policy: TruncationPolicy::Bytes(1024),
             source: ToolCallSource::Direct,
             conversation_history: codex_extension_api::ConversationHistory::default(),
+            model_completion: Arc::new(NoopModelCompletion),
             turn_item_emitter: Arc::new(NoopTurnItemEmitter),
             environments: Vec::new(),
             payload: payload.clone(),
@@ -275,6 +277,7 @@ async fn add_ad_hoc_note_tool_rejects_paths_as_filenames() {
             truncation_policy: TruncationPolicy::Bytes(1024),
             source: ToolCallSource::Direct,
             conversation_history: codex_extension_api::ConversationHistory::default(),
+            model_completion: Arc::new(NoopModelCompletion),
             turn_item_emitter: Arc::new(NoopTurnItemEmitter),
             environments: Vec::new(),
             payload,
@@ -322,6 +325,7 @@ async fn read_tool_reads_memory_file() {
             truncation_policy: TruncationPolicy::Bytes(1024),
             source: ToolCallSource::Direct,
             conversation_history: codex_extension_api::ConversationHistory::default(),
+            model_completion: Arc::new(NoopModelCompletion),
             turn_item_emitter: Arc::new(NoopTurnItemEmitter),
             environments: Vec::new(),
             payload: payload.clone(),
@@ -439,6 +443,7 @@ async fn search_tool_accepts_multiple_queries() {
             truncation_policy: TruncationPolicy::Bytes(1024),
             source: ToolCallSource::Direct,
             conversation_history: codex_extension_api::ConversationHistory::default(),
+            model_completion: Arc::new(NoopModelCompletion),
             turn_item_emitter: Arc::new(NoopTurnItemEmitter),
             environments: Vec::new(),
             payload: payload.clone(),
@@ -515,6 +520,7 @@ async fn search_tool_accepts_windowed_all_match_mode() {
             truncation_policy: TruncationPolicy::Bytes(1024),
             source: ToolCallSource::Direct,
             conversation_history: codex_extension_api::ConversationHistory::default(),
+            model_completion: Arc::new(NoopModelCompletion),
             turn_item_emitter: Arc::new(NoopTurnItemEmitter),
             environments: Vec::new(),
             payload: payload.clone(),
@@ -571,6 +577,7 @@ async fn search_tool_rejects_legacy_single_query() {
             truncation_policy: TruncationPolicy::Bytes(1024),
             source: ToolCallSource::Direct,
             conversation_history: codex_extension_api::ConversationHistory::default(),
+            model_completion: Arc::new(NoopModelCompletion),
             turn_item_emitter: Arc::new(NoopTurnItemEmitter),
             environments: Vec::new(),
             payload,
