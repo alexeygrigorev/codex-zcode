@@ -80,6 +80,7 @@ use codex_model_provider_info::OLLAMA_OSS_PROVIDER_ID;
 use codex_model_provider_info::WireApi;
 use codex_models_manager::bundled_models_response;
 use codex_network_proxy::NetworkMode;
+use codex_prompts::ResolvedMessage;
 use codex_protocol::config_types::ModelProviderAuthInfo;
 use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 use codex_protocol::config_types::ServiceTier;
@@ -90,7 +91,6 @@ use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE;
 use codex_protocol::models::ManagedFileSystemPermissions;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::SandboxEnforcement;
-use codex_protocol::openai_models::MultiAgentRoleMessages;
 use codex_protocol::permissions::FileSystemAccessMode;
 use codex_protocol::permissions::FileSystemPath;
 use codex_protocol::permissions::FileSystemSandboxEntry;
@@ -634,6 +634,7 @@ async fn load_config_resolves_code_mode_config() -> std::io::Result<()> {
 [features.code_mode]
 enabled = true
 default_exec_yield_time_ms = 10000
+experimental_show_cell_overhead = true
 excluded_tool_namespaces = ["mcp__codex_apps", "multi_agent_v1"]
 direct_only_tool_namespaces = ["mcp__history", "mcp__notes"]
 
@@ -651,6 +652,7 @@ disable_in_process_fallback = true
     .await?;
 
     assert_eq!(config.code_mode.default_exec_yield_time_ms, 10_000);
+    assert!(config.code_mode.experimental_show_cell_overhead);
     assert_eq!(
         config.code_mode.excluded_tool_namespaces,
         vec!["mcp__codex_apps".to_string(), "multi_agent_v1".to_string()]
@@ -1249,6 +1251,7 @@ fn config_toml_deserializes_model_availability_nux() {
         Tui {
             notification_settings: TuiNotificationSettings::default(),
             animations: true,
+            screen_reader_detection_done: None,
             whimsy: true,
             show_tooltips: true,
             show_server_version_notice: true,
@@ -1895,7 +1898,6 @@ async fn network_proxy_feature_matrix_preserves_sandbox_network_semantics() -> s
                 }),
                 windows: Some(WindowsToml {
                     sandbox: Some(WindowsSandboxModeToml::Elevated),
-                    sandbox_private_desktop: None,
                 }),
                 features,
                 ..Default::default()
@@ -2050,6 +2052,10 @@ respect_system_proxy = true
             .outbound_proxy_policy(),
         codex_http_client::OutboundProxyPolicy::ReqwestDefault
     );
+    assert!(
+        resolve_bootstrap_http_client_factory(&configured, Some(&disabled))?
+            .allows_system_proxy_fallback()
+    );
 
     let configured = ConfigToml::default();
     let enabled = Sourced::new(
@@ -2068,6 +2074,115 @@ respect_system_proxy = true
             .outbound_proxy_policy(),
         codex_http_client::OutboundProxyPolicy::RespectSystemProxy
     );
+    assert!(
+        !resolve_bootstrap_http_client_factory(&configured, Some(&enabled))?
+            .allows_system_proxy_fallback()
+    );
+    assert!(
+        resolve_bootstrap_http_client_factory(&configured, /*feature_requirements*/ None)?
+            .allows_system_proxy_fallback()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn system_proxy_fallback_config_matches_bootstrap() -> std::io::Result<()> {
+    for (features, expected_fallback, expected_policy) in [
+        (
+            "",
+            true,
+            codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+        ),
+        (
+            "respect_system_proxy = false",
+            true,
+            codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+        ),
+        (
+            "system_proxy_fallback = false",
+            false,
+            codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+        ),
+        (
+            "respect_system_proxy = true",
+            false,
+            codex_http_client::OutboundProxyPolicy::RespectSystemProxy,
+        ),
+        (
+            "respect_system_proxy = true\nsystem_proxy_fallback = false",
+            false,
+            codex_http_client::OutboundProxyPolicy::RespectSystemProxy,
+        ),
+    ] {
+        let codex_home = TempDir::new()?;
+        std::fs::write(
+            codex_home.path().join(CONFIG_TOML_FILE),
+            format!("[features]\n{features}\n"),
+        )?;
+        let config = ConfigBuilder::without_managed_config_for_tests()
+            .codex_home(codex_home.path().to_path_buf())
+            .build()
+            .await?;
+        let bootstrap = ConfigToml {
+            features: Some(toml::from_str(features).expect("valid feature configuration")),
+            ..Default::default()
+        };
+        let factory =
+            resolve_bootstrap_http_client_factory(&bootstrap, /*feature_requirements*/ None)?;
+        assert_eq!(
+            factory.allows_system_proxy_fallback(),
+            expected_fallback,
+            "{features}"
+        );
+        assert_eq!(
+            factory.outbound_proxy_policy(),
+            expected_policy,
+            "{features}"
+        );
+        assert_eq!(config.http_client_factory(), factory, "{features}");
+        assert_eq!(
+            config.auth_route_config().http_client_factory(),
+            &factory,
+            "{features}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn system_proxy_fallback_honors_feature_requirements() -> std::io::Result<()> {
+    for (configured, required) in [(true, false), (false, true)] {
+        let cfg = ConfigToml {
+            features: Some(
+                toml::from_str(&format!("system_proxy_fallback = {configured}"))
+                    .expect("valid features"),
+            ),
+            ..Default::default()
+        };
+        let requirements = Sourced::new(
+            FeatureRequirementsToml {
+                entries: BTreeMap::from([("system_proxy_fallback".to_string(), required)]),
+            },
+            RequirementSource::Unknown,
+        );
+        let bootstrap = resolve_bootstrap_http_client_factory(&cfg, Some(&requirements))?;
+        assert_eq!(bootstrap.allows_system_proxy_fallback(), required);
+        let codex_home = TempDir::new()?;
+        std::fs::write(
+            codex_home.path().join(CONFIG_TOML_FILE),
+            format!("[features]\nsystem_proxy_fallback = {configured}\n"),
+        )?;
+        let config = ConfigBuilder::without_managed_config_for_tests()
+            .codex_home(codex_home.path().to_path_buf())
+            .cloud_config_bundle(
+                CloudConfigBundleFixture::loader_with_enterprise_requirement(format!(
+                    "[features]\nsystem_proxy_fallback = {required}\n"
+                )),
+            )
+            .build()
+            .await?;
+        assert_eq!(config.http_client_factory(), bootstrap);
+    }
     Ok(())
 }
 
@@ -3542,7 +3657,6 @@ async fn implicit_builtin_workspace_profile_preserves_sandbox_workspace_write_se
             }),
             windows: Some(WindowsToml {
                 sandbox: Some(WindowsSandboxModeToml::Elevated),
-                sandbox_private_desktop: None,
             }),
             ..Default::default()
         },
@@ -3607,7 +3721,6 @@ async fn implicit_builtin_workspace_profile_preserves_add_dir_metadata_carveouts
             )])),
             windows: Some(WindowsToml {
                 sandbox: Some(WindowsSandboxModeToml::Elevated),
-                sandbox_private_desktop: None,
             }),
             ..Default::default()
         },
@@ -4221,6 +4334,7 @@ fn tui_config_missing_notifications_field_defaults_to_enabled() {
         Tui {
             notification_settings: TuiNotificationSettings::default(),
             animations: true,
+            screen_reader_detection_done: None,
             whimsy: true,
             show_tooltips: true,
             show_server_version_notice: true,
@@ -5429,10 +5543,13 @@ async fn rebuild_with_session_layers_refreshes_requirements() -> std::io::Result
         thread_layer_stack,
     )
     .await?;
+    let zsh_path = refreshed_config.zsh_path.clone();
     let config = Config::rebuild_with_session_layers(
         &thread_config.config_layer_stack,
         thread_config.cwd.to_path_buf(),
-        &refreshed_config,
+        &refreshed_config.config_layer_stack,
+        refreshed_config.codex_home.clone(),
+        zsh_path.map(AbsolutePathBuf::try_from).transpose()?,
     )
     .await?;
 
@@ -5554,10 +5671,13 @@ async fn rebuild_with_session_layers_refreshes_plugin_derived_mcp_config() -> an
         thread_layer_stack,
     )
     .await?;
+    let zsh_path = refreshed_config.zsh_path.clone();
     let config = Config::rebuild_with_session_layers(
         &thread_config.config_layer_stack,
         thread_config.cwd.to_path_buf(),
-        &refreshed_config,
+        &refreshed_config.config_layer_stack,
+        refreshed_config.codex_home.clone(),
+        zsh_path.map(AbsolutePathBuf::try_from).transpose()?,
     )
     .await?;
     let plugins_manager =
@@ -11788,12 +11908,13 @@ max_concurrent_threads_per_session = 17
 
     let config = resolve_multi_agent_v2_config(&config_toml);
     let concurrency_guidance = "There are 17 available concurrency slots, meaning that up to 17 agents can be active at once, including you.";
+    let messages = ResolvedModelMessages::bundled().multi_agent();
     assert!(config.wait_agent_enabled);
     for wait_agent_enabled in [true, false] {
         let mut config = config.clone();
         config.wait_agent_enabled = wait_agent_enabled;
         let usage_hints = resolve_usage_hints(
-            &config, /*catalog*/ None, /*omit_update_plan_instructions*/ false,
+            &config, messages, /*omit_update_plan_instructions*/ false,
         );
         for hint in [usage_hints.root, usage_hints.subagent] {
             let hint = hint.expect("default usage hints should be present").body();
@@ -11805,12 +11926,12 @@ max_concurrent_threads_per_session = 17
         }
     }
 
+    let mut empty_messages = messages;
+    empty_messages.root = ResolvedMessage::Catalog("");
+    empty_messages.subagent = ResolvedMessage::Catalog("");
     let usage_hints = resolve_usage_hints(
         &config,
-        Some(&MultiAgentRoleMessages {
-            root: Some(String::new()),
-            subagent: Some(String::new()),
-        }),
+        empty_messages,
         /*omit_update_plan_instructions*/ false,
     );
     assert!(usage_hints.root.is_none() && usage_hints.subagent.is_none());
@@ -11838,13 +11959,11 @@ expose_spawn_agent_model_overrides = true
         config.subagent_usage_hint_text.as_deref(),
         Some("## `update_plan`\nSubagent guidance.")
     );
+    let mut messages = ResolvedModelMessages::bundled().multi_agent();
+    messages.root = ResolvedMessage::Catalog("Catalog root base.");
+    messages.subagent = ResolvedMessage::Catalog("Catalog subagent base.");
     let usage_hints = resolve_usage_hints(
-        &config,
-        Some(&MultiAgentRoleMessages {
-            root: Some("Catalog root base.".to_string()),
-            subagent: Some("Catalog subagent base.".to_string()),
-        }),
-        /*omit_update_plan_instructions*/ true,
+        &config, messages, /*omit_update_plan_instructions*/ true,
     );
     assert_eq!(
         (
@@ -11865,12 +11984,13 @@ fn multi_agent_v2_exposes_model_overrides_by_default() {
 
     let mut config = resolve_multi_agent_v2_config(&config_toml);
     assert!(config.expose_spawn_agent_model_overrides);
+    let messages = ResolvedModelMessages::bundled().multi_agent();
     let usage_hints = resolve_usage_hints(
-        &config, /*catalog*/ None, /*omit_update_plan_instructions*/ false,
+        &config, messages, /*omit_update_plan_instructions*/ false,
     );
     config.expose_spawn_agent_model_overrides = false;
     let usage_hints_without_model_overrides = resolve_usage_hints(
-        &config, /*catalog*/ None, /*omit_update_plan_instructions*/ false,
+        &config, messages, /*omit_update_plan_instructions*/ false,
     );
 
     for (hint, hint_without_model_overrides) in [
@@ -11980,12 +12100,12 @@ subagent_usage_hint_text = ""
         .build()
         .await?;
 
+    let mut messages = ResolvedModelMessages::bundled().multi_agent();
+    messages.root = ResolvedMessage::Catalog("catalog root");
+    messages.subagent = ResolvedMessage::Catalog("catalog subagent");
     let usage_hints = resolve_usage_hints(
         &config.multi_agent_v2,
-        Some(&MultiAgentRoleMessages {
-            root: Some("catalog root".to_string()),
-            subagent: Some("catalog subagent".to_string()),
-        }),
+        messages,
         /*omit_update_plan_instructions*/ false,
     );
     assert_eq!(
@@ -12967,9 +13087,6 @@ allow_login_shell = true
 
 [feedback]
 enabled = true
-
-[windows]
-sandbox_private_desktop = true
 "#,
     )?;
 
@@ -12985,9 +13102,6 @@ allow_login_shell = false
 
 [feedback]
 enabled = false
-
-[windows]
-sandbox_private_desktop = false
 "#,
         required_sqlite_home.display(),
         required_log_dir.display(),
@@ -13001,7 +13115,6 @@ sandbox_private_desktop = false
     assert!(!config.check_for_update_on_startup);
     assert!(!config.permissions.allow_login_shell);
     assert!(!config.feedback_enabled);
-    assert!(!config.permissions.windows_sandbox_private_desktop);
     assert!(config.startup_warnings.iter().any(|warning| {
         warning.contains("Configured value for `check_for_update_on_startup` is overridden")
     }));

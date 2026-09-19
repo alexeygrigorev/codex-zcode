@@ -3,6 +3,7 @@ mod amazon_bedrock;
 mod auth;
 mod bearer_auth_provider;
 mod bedrock_regions;
+mod combined_auth;
 mod models_endpoint;
 mod models_identity;
 mod provider;

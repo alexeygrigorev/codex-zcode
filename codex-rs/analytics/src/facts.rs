@@ -187,6 +187,8 @@ pub struct TurnResolvedConfigFact {
     pub turn_id: String,
     pub thread_id: String,
     pub turn_metadata: Arc<dyn TurnAnalyticsMetadata>,
+    /// Observed active plugin inventory. None is unknown; Some([]) is observed empty.
+    pub active_plugin_ids_at_turn_start: Option<Vec<String>>,
     pub num_input_images: usize,
     pub submission_type: Option<TurnSubmissionType>,
     pub ephemeral: bool,
@@ -463,6 +465,7 @@ pub enum CompactionPhase {
     StandaloneTurn,
     PreTurn,
     MidTurn,
+    PostTurn,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -572,6 +575,9 @@ pub(crate) enum AnalyticsFact {
     ServerRequestAborted {
         completed_at_ms: u64,
         request_id: RequestId,
+    },
+    RealtimeHandoffRequested {
+        thread_id: String,
     },
     Notification(Box<ServerNotification>),
     // Facts that do not naturally exist on the app-server protocol surface, or

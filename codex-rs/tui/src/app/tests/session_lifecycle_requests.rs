@@ -678,6 +678,7 @@ async fn delete_current_thread_navigates_only_after_success() -> Result<()> {
     for target in [
         AppServerTarget::Embedded,
         AppServerTarget::LocalDaemon {
+            allow_embedded_fallback: true,
             endpoint: endpoint.clone(),
         },
         AppServerTarget::Remote { endpoint },
@@ -984,6 +985,7 @@ async fn archive_current_thread_returns_shared_servers_to_agents() -> Result<()>
     let endpoint = crate::resolve_remote_addr("ws://127.0.0.1:4500")?;
     for target in [
         AppServerTarget::LocalDaemon {
+            allow_embedded_fallback: true,
             endpoint: endpoint.clone(),
         },
         AppServerTarget::Remote { endpoint },
@@ -1089,11 +1091,12 @@ async fn local_daemon_registers_approval_gated_mcp_tools_for_both_start_paths() 
         codex_home.path().join("config.toml"),
         "web_search = \"disabled\"\n",
     )?;
-    let (mut app_server, mut requests, mut proxy) = start_recording_app_server(
+    // Keep the large lifecycle futures off the Windows test thread's stack.
+    let (mut app_server, mut requests, mut proxy) = Box::pin(start_recording_app_server(
         &app.config,
         /*blocked_thread_list*/ None,
         /*failed_thread_name*/ None,
-    )
+    ))
     .await?;
     app_server
         .start_dynamic_tool_mcp(
@@ -1188,14 +1191,13 @@ async fn local_daemon_registers_approval_gated_mcp_tools_for_both_start_paths() 
         ThreadHistoryMode::Legacy,
         "Approved task source",
     )?;
-    app_server
-        .resume_thread(
-            &app.local_settings,
-            app.config.clone(),
-            delegation_source,
-            crate::app_server_session::ResumeModelSettings::RestoreFromThread,
-        )
-        .await?;
+    Box::pin(app_server.resume_thread(
+        &app.local_settings,
+        app.config.clone(),
+        delegation_source,
+        crate::app_server_session::ResumeModelSettings::RestoreFromThread,
+    ))
+    .await?;
     let resumed = recorded_params(&requests, "thread/resume")
         .pop()
         .expect("resumed task request");
@@ -1203,14 +1205,13 @@ async fn local_daemon_registers_approval_gated_mcp_tools_for_both_start_paths() 
         resumed["config"]["mcp_servers.codex_tui"],
         starts[0]["config"]["mcp_servers.codex_tui"]
     );
-    app_server
-        .resume_thread(
-            &app.local_settings,
-            app.config.clone(),
-            delegation_source,
-            crate::app_server_session::ResumeModelSettings::PreserveExistingThread,
-        )
-        .await?;
+    Box::pin(app_server.resume_thread(
+        &app.local_settings,
+        app.config.clone(),
+        delegation_source,
+        crate::app_server_session::ResumeModelSettings::PreserveExistingThread,
+    ))
+    .await?;
     let reattached = recorded_params(&requests, "thread/resume")
         .pop()
         .expect("reattached task request");
@@ -1218,8 +1219,7 @@ async fn local_daemon_registers_approval_gated_mcp_tools_for_both_start_paths() 
         reattached["config"]["mcp_servers.codex_tui"],
         starts[0]["config"]["mcp_servers.codex_tui"]
     );
-    app_server
-        .fork_thread(&app.local_settings, app.config.clone(), delegation_source)
+    Box::pin(app_server.fork_thread(&app.local_settings, app.config.clone(), delegation_source))
         .await?;
     let forked = recorded_params(&requests, "thread/fork")
         .pop()
@@ -1270,12 +1270,13 @@ async fn local_daemon_registers_approval_gated_mcp_tools_for_both_start_paths() 
         paused.contains("TUI is reconnecting; tool was not sent"),
         "{paused}"
     );
-    let (replacement, replacement_requests, replacement_proxy) = start_recording_app_server(
-        &app.config,
-        /*blocked_thread_list*/ None,
-        /*failed_thread_name*/ None,
-    )
-    .await?;
+    let (replacement, replacement_requests, replacement_proxy) =
+        Box::pin(start_recording_app_server(
+            &app.config,
+            /*blocked_thread_list*/ None,
+            /*failed_thread_name*/ None,
+        ))
+        .await?;
     let (new_tx, new_rx) = mpsc::unbounded_channel();
     let new_sender = AppEventSender::new(new_tx);
     drop(events);
@@ -2624,6 +2625,7 @@ async fn underfilled_scrollback_fetches_older_pages_without_opening_the_transcri
             &app.config,
             &app.local_settings,
             started.session.model.as_str(),
+            started.session.model.as_str(),
             &started.session,
             /*is_first_event*/ false,
             Some("This is a test announcement".to_string()),
@@ -2743,14 +2745,13 @@ async fn paginated_workflows_never_request_full_thread_history() -> Result<()> {
     .await?;
 
     app_server.remember_thread_history_mode(paginated_thread_id, ThreadHistoryMode::Legacy);
-    let resumed = app_server
-        .resume_thread(
-            &app.local_settings,
-            app.config.clone(),
-            paginated_thread_id,
-            crate::app_server_session::ResumeModelSettings::RestoreFromThread,
-        )
-        .await?;
+    let resumed = Box::pin(app_server.resume_thread(
+        &app.local_settings,
+        app.config.clone(),
+        paginated_thread_id,
+        crate::app_server_session::ResumeModelSettings::RestoreFromThread,
+    ))
+    .await?;
     assert_eq!(resumed.session.thread_id, paginated_thread_id);
     assert!(recorded_params(&requests, "thread/read").is_empty());
     let resume_requests = recorded_params(&requests, "thread/resume");
@@ -2764,18 +2765,16 @@ async fn paginated_workflows_never_request_full_thread_history() -> Result<()> {
     )
     .await?;
     assert!(!cells.is_empty());
-    app_server
-        .fork_thread(&app.local_settings, app.config.clone(), paginated_thread_id)
+    Box::pin(app_server.fork_thread(&app.local_settings, app.config.clone(), paginated_thread_id))
         .await?;
     let mut side_config = app.config.clone();
     side_config.ephemeral = true;
-    app_server
-        .fork_side_thread(
-            &crate::local_settings::LocalSettings::from(&side_config),
-            side_config,
-            paginated_thread_id,
-        )
-        .await?;
+    Box::pin(app_server.fork_side_thread(
+        &crate::local_settings::LocalSettings::from(&side_config),
+        side_config,
+        paginated_thread_id,
+    ))
+    .await?;
 
     let paginated_reads = recorded_params(&requests, "thread/read");
     assert!(!paginated_reads.is_empty());
@@ -2901,6 +2900,7 @@ async fn agents_overview_seeds_loaded_threads_when_recent_listing_is_unavailable
         .await?;
         let started = app_server.start_thread(&app.config).await?;
         app.app_server_target = AppServerTarget::LocalDaemon {
+            allow_embedded_fallback: true,
             endpoint: crate::RemoteAppServerEndpoint::UnixSocket {
                 socket_path: test_path_buf("/tmp/unused.sock").abs(),
             },
@@ -3674,7 +3674,10 @@ terminal_visualization_instructions = true
         .set_times(std::fs::FileTimes::new().set_modified(
             std::time::SystemTime::now() - std::time::Duration::from_secs(8 * 24 * 60 * 60),
         ))?;
-    codex_rollout::spawn_rollout_compression_worker(home.clone());
+    codex_rollout::spawn_rollout_compression_worker(
+        home.clone(),
+        codex_rollout::RolloutCompressionTrigger::Startup,
+    );
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         while saved_path.exists() || !saved_path.with_extension("jsonl.zst").is_file() {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -4328,15 +4331,16 @@ fn session_lifecycle_avoids_redundant_subagent_metadata_reads() -> Result<()> {
                     render_bottom_popup(&app.chat_widget, /*width*/ 80)
                         .replace(&root_thread_id.to_string(), "[root]")
                         .replace(&child_thread_id.to_string(), "[child]"),
-                    @r###"
-                      Subagents
-                      Select an agent to watch. ⌥ + ← previous, ⌥ + → next.
+                    @"
+                  Subagents
+                  Select an agent to watch. ⌥+← previous, ⌥+→ next.
 
-                    › 1. • Main [default] (current)  [root]
-                      2. • /root/worker              [child]
 
-                      Press enter to confirm or esc to go back
-                    "###
+                › 1. • Main [default] (current)  [root]
+                  2. • /root/worker              [child]
+
+                  enter select · esc back
+                "
                 );
                 assert_eq!(take_backfill_counts(&requests), (0, 0));
                 tokio::time::timeout(Duration::from_secs(5), started_rx).await??;
@@ -4433,6 +4437,7 @@ async fn external_writer_escape_preserves_snapshot_and_explicit_quits() -> Resul
     let endpoint = crate::resolve_remote_addr("ws://127.0.0.1:4500")?;
     for target in [
         AppServerTarget::LocalDaemon {
+            allow_embedded_fallback: true,
             endpoint: endpoint.clone(),
         },
         AppServerTarget::Remote { endpoint },
@@ -4616,6 +4621,7 @@ async fn command_center_read_only_open_requests_and_failure_preservation() -> Re
         )
         .await?;
         app.app_server_target = AppServerTarget::LocalDaemon {
+            allow_embedded_fallback: true,
             endpoint: crate::resolve_remote_addr("ws://127.0.0.1:4500")?,
         };
         let current = Box::pin(server.start_thread(&app.config)).await?;
@@ -4648,9 +4654,10 @@ async fn command_center_read_only_open_requests_and_failure_preservation() -> Re
                   Unable to complete action
                   Couldn't load this conversation. Please try again.
 
+
                 › 1. Return to command center
 
-                  Press enter to confirm or esc to go back
+                  enter select · esc back
                 ");
             }
             assert_eq!(app.current_displayed_thread_id(), Some(current_id));

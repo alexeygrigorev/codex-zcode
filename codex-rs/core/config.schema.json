@@ -155,6 +155,13 @@
           ],
           "description": "Per-account approval settings keyed by link ID."
         },
+        "omit_tools_from": {
+          "description": "Model-facing surfaces from which this connector's tools must be omitted, in addition to any server-level omissions. `None` leaves lower-priority configuration unchanged; an empty list clears connector-level omissions.",
+          "items": {
+            "$ref": "#/definitions/ToolExposureSurface"
+          },
+          "type": "array"
+        },
         "open_world_enabled": {
           "description": "Whether tools with `open_world_hint = true` are allowed for this app.",
           "type": "boolean"
@@ -523,6 +530,10 @@
             "type": "string"
           },
           "type": "array"
+        },
+        "experimental_show_cell_overhead": {
+          "description": "Show handler duration, code-mode host duration, and harness overhead in each code-mode cell response. Experimental: this option and the response format may change or be removed.",
+          "type": "boolean"
         }
       },
       "type": "object"
@@ -748,6 +759,9 @@
               "$ref": "#/definitions/FeatureToml_for_CurrentTimeReminderConfigToml"
             },
             "cwd_relative_turn_diffs": {
+              "type": "boolean"
+            },
+            "daemon_auto_start": {
               "type": "boolean"
             },
             "default_mode_request_user_input": {
@@ -1021,6 +1035,9 @@
               "type": "boolean"
             },
             "step_model_switching": {
+              "type": "boolean"
+            },
+            "system_proxy_fallback": {
               "type": "boolean"
             },
             "telepathy": {
@@ -1552,6 +1569,91 @@
         "api"
       ],
       "type": "string"
+    },
+    "GatewayOAuthConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "authorization_url": {
+          "type": "string"
+        },
+        "client_id": {
+          "type": "string"
+        },
+        "delivery": {
+          "$ref": "#/definitions/GatewayOAuthDelivery"
+        },
+        "redirect_port": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "resource": {
+          "type": "string"
+        },
+        "scopes": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "token_url": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "authorization_url",
+        "client_id",
+        "delivery",
+        "token_url"
+      ],
+      "type": "object"
+    },
+    "GatewayOAuthDelivery": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "enum": [
+                "header"
+              ],
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "scheme": {
+              "default": "Bearer",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "name"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "enum": [
+                "cookie"
+              ],
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "name"
+          ],
+          "type": "object"
+        }
+      ]
     },
     "GhostSnapshotToml": {
       "additionalProperties": false,
@@ -2435,12 +2537,24 @@
           "description": "Value to use with `Authorization: Bearer <token>` header. Use of this config is discouraged in favor of `env_key` for security reasons, but this may be necessary when using this programmatically.",
           "type": "string"
         },
+        "gateway_oauth": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/GatewayOAuthConfig"
+            }
+          ],
+          "description": "Secondary OAuth credentials required by the provider's gateway."
+        },
         "http_headers": {
           "additionalProperties": {
             "type": "string"
           },
           "description": "Additional HTTP headers to include in requests to this provider where the (key, value) pairs are the header name and value.",
           "type": "object"
+        },
+        "model_catalog_url": {
+          "description": "Optional full URL for a Codex-native model catalog. When unset, OpenAI discovery uses the Codex backend unless `base_url` overrides the inference endpoint.",
+          "type": "string"
         },
         "name": {
           "default": "",
@@ -2710,6 +2824,7 @@
       "additionalProperties": false,
       "properties": {
         "allow_local_binding": {
+          "description": "Permits local servers and direct host-loopback connections and skips the proxy's additional private-network destination checks. Proxy domain rules still apply. Defaults to true for MXC, which cannot enforce false; otherwise defaults to false.",
           "type": "boolean"
         },
         "allow_upstream_proxy": {
@@ -2788,6 +2903,7 @@
       "additionalProperties": false,
       "properties": {
         "allow_local_binding": {
+          "description": "Permits local servers and direct host-loopback connections and skips the proxy's additional private-network destination checks. Proxy domain rules still apply. Defaults to true for MXC, which cannot enforce false; otherwise defaults to false.",
           "type": "boolean"
         },
         "allow_upstream_proxy": {
@@ -4132,6 +4248,7 @@
               "previous_permission_mode": null,
               "prompt_stack_back": null,
               "skip_question": null,
+              "toggle_voice": null,
               "toggle_voice_mute": null
             },
             "composer": {
@@ -4333,6 +4450,10 @@
           "default": null,
           "description": "Working directory to use when resuming or forking a session. When unset, prompt if the current and session directories differ."
         },
+        "screen_reader_detection_done": {
+          "description": "Records the one-time screen-reader detection attempt. Either value skips detection.",
+          "type": "boolean"
+        },
         "session_picker_view": {
           "allOf": [
             {
@@ -4344,7 +4465,7 @@
         },
         "show_server_version_notice": {
           "default": true,
-          "description": "Show an informational notice when the connected app server is an older stable release. Defaults to `true`; this does not control compatibility errors or version status.",
+          "description": "Show informational notices about connected app server version differences. Defaults to `true`; this does not control compatibility errors or version status.",
           "type": "boolean"
         },
         "show_tooltips": {
@@ -4623,6 +4744,14 @@
             }
           ],
           "description": "Skip the focused question."
+        },
+        "toggle_voice": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/KeybindingsSpec"
+            }
+          ],
+          "description": "Start or stop a voice conversation."
         },
         "toggle_voice_mute": {
           "allOf": [
@@ -4983,6 +5112,7 @@
             "previous_permission_mode": null,
             "prompt_stack_back": null,
             "skip_question": null,
+            "toggle_voice": null,
             "toggle_voice_mute": null
           }
         },
@@ -6042,7 +6172,8 @@
     "WindowsSandboxModeToml": {
       "enum": [
         "elevated",
-        "unelevated"
+        "unelevated",
+        "mxc"
       ],
       "type": "string"
     },
@@ -6051,10 +6182,6 @@
       "properties": {
         "sandbox": {
           "$ref": "#/definitions/WindowsSandboxModeToml"
-        },
-        "sandbox_private_desktop": {
-          "description": "Defaults to `true`. Set to `false` to launch the final sandboxed child process on `Winsta0\\\\Default` instead of a private desktop.",
-          "type": "boolean"
         }
       },
       "type": "object"
@@ -6365,6 +6492,9 @@
         "cwd_relative_turn_diffs": {
           "type": "boolean"
         },
+        "daemon_auto_start": {
+          "type": "boolean"
+        },
         "default_mode_request_user_input": {
           "type": "boolean"
         },
@@ -6636,6 +6766,9 @@
           "type": "boolean"
         },
         "step_model_switching": {
+          "type": "boolean"
+        },
+        "system_proxy_fallback": {
           "type": "boolean"
         },
         "telepathy": {
@@ -6933,6 +7066,13 @@
         }
       ],
       "description": "Optional path to a file containing model instructions that will override the built-in instructions for the selected model. Users are STRONGLY DISCOURAGED from using this field, as deviating from the instructions sanctioned by Codex will likely degrade model performance."
+    },
+    "model_post_turn_compact_threshold_percent": {
+      "description": "Percentage of the usable context window that triggers compaction after a final response. Existing auto-compaction limits still apply. Omitted or zero disables turn-end compaction; valid values are 0–100.",
+      "format": "uint8",
+      "maximum": 100.0,
+      "minimum": 0.0,
+      "type": "integer"
     },
     "model_provider": {
       "description": "Provider to use from the model_providers map.",

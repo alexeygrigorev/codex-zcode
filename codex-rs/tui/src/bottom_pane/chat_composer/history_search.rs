@@ -16,7 +16,8 @@
 //! latest history entry by itself. Typing or pasting a query restarts traversal from newest to oldest,
 //! repeated Ctrl+R/Up and Ctrl+S/Down move between unique matches, `Enter` accepts the current
 //! preview as an editable draft, and `Esc` or Ctrl+C restores the exact draft that existed before
-//! search started.
+//! search started. Buffered keys are integrated before that snapshot without reclassifying them as
+//! an explicit paste. Only accepting a nonempty preview dismisses any unused Astra sparkle opportunity.
 
 use std::ops::Range;
 
@@ -110,14 +111,14 @@ impl ChatComposer {
 
     /// Opens footer-owned reverse history search without previewing history yet.
     ///
-    /// Entering search mode first flushes pending paste-burst text, then snapshots the full
-    /// composer draft, clears any file/search popup state, and resets history traversal. The first
-    /// visible match is produced only after the footer query becomes non-empty, which keeps Ctrl+R
-    /// from replacing an empty composer with the latest prompt before the user has searched for
-    /// anything.
+    /// Entering search mode first integrates already-classified paste-burst text with
+    /// [`Self::apply_paste`], then snapshots the full composer draft, clears any file/search popup
+    /// state, and resets history traversal. The first visible match is produced only after the
+    /// footer query becomes non-empty, which keeps Ctrl+R from replacing an empty composer with
+    /// the latest prompt before the user has searched for anything.
     pub(super) fn begin_history_search(&mut self) -> (InputResult, bool) {
         if let Some(pasted) = self.draft.paste_burst.flush_before_modified_input() {
-            self.handle_paste(pasted);
+            self.apply_paste(pasted);
         }
         self.draft.paste_burst.clear_window_after_non_char();
 
@@ -206,6 +207,9 @@ impl ChatComposer {
                     .is_some_and(|search| matches!(search.status, HistorySearchStatus::Match))
                 {
                     self.history_search = None;
+                    if !self.is_empty() {
+                        self.dismiss_sparkle();
+                    }
                     self.history.reset_search();
                     self.footer.mode = reset_mode_after_activity(self.footer.mode);
                     self.move_cursor_to_end();
@@ -259,7 +263,7 @@ impl ChatComposer {
             if let Some(search) = self.history_search.as_mut() {
                 search.status = HistorySearchStatus::Idle;
             }
-            self.restore_draft(original_draft);
+            self.with_sparkle_history_preview(|composer| composer.restore_draft(original_draft));
             return InputResult::None;
         }
         let result = self.history.search(
@@ -282,7 +286,7 @@ impl ChatComposer {
         search.status = HistorySearchStatus::Searching;
         let query = search.query.clone();
         let original_draft = search.original_draft.clone();
-        self.restore_draft(original_draft);
+        self.with_sparkle_history_preview(|composer| composer.restore_draft(original_draft));
         if query.is_empty() {
             self.history.reset_search();
             if let Some(search) = self.history_search.as_mut() {
@@ -311,7 +315,7 @@ impl ChatComposer {
         };
         self.history.reset_navigation();
         self.footer.mode = reset_mode_after_activity(self.footer.mode);
-        self.restore_draft(search.original_draft);
+        self.with_sparkle_history_preview(|composer| composer.restore_draft(search.original_draft));
         self.vim_history = search.original_vim_history;
         self.draft
             .textarea
@@ -333,7 +337,7 @@ impl ChatComposer {
                 if let Some(search) = self.history_search.as_mut() {
                     search.status = HistorySearchStatus::Match;
                 }
-                self.apply_history_entry(entry);
+                self.with_sparkle_history_preview(|composer| composer.apply_history_entry(entry));
             }
             HistorySearchResult::Pending => {
                 if let Some(search) = self.history_search.as_mut() {
@@ -358,10 +362,19 @@ impl ChatComposer {
                     };
                 }
                 if let Some(original_draft) = original_draft {
-                    self.restore_draft(original_draft);
+                    self.with_sparkle_history_preview(|composer| {
+                        composer.restore_draft(original_draft)
+                    });
                 }
             }
         }
+    }
+
+    fn with_sparkle_history_preview(&mut self, preview: impl FnOnce(&mut Self)) {
+        let previous = self.sparkle.history_preview;
+        self.sparkle.history_preview = true;
+        preview(self);
+        self.sparkle.history_preview = previous;
     }
 
     /// Builds the footer line shown while reverse history search is active.
@@ -394,7 +407,7 @@ impl ChatComposer {
     }
 
     fn history_search_action_key_span(key: KeyCode) -> Span<'static> {
-        Span::from(key_hint::plain(key)).cyan().bold().not_dim()
+        Span::from(key_hint::plain(key))
     }
 
     /// Returns byte ranges that should be highlighted in the current composer preview.
@@ -887,63 +900,79 @@ mod tests {
 
     #[test]
     fn history_search_footer_action_hints_are_emphasized() {
-        let (tx, _rx) = unbounded_channel::<AppEvent>();
-        let sender = AppEventSender::new(tx);
-        let mut composer = ChatComposer::new(
-            /*has_input_focus*/ true,
-            sender,
-            /*enhanced_keys_supported*/ true,
-            "Ask Codex to do anything".to_string(),
-            /*disable_paste_burst*/ false,
+        crate::terminal_palette::with_test_default_colors(
+            crate::terminal_probe::DefaultColors {
+                fg: (240, 240, 240),
+                bg: (24, 24, 24),
+            },
+            || {
+                let (tx, _rx) = unbounded_channel::<AppEvent>();
+                let sender = AppEventSender::new(tx);
+                let mut composer = ChatComposer::new(
+                    /*has_input_focus*/ true,
+                    sender,
+                    /*enhanced_keys_supported*/ true,
+                    "Ask Codex to do anything".to_string(),
+                    /*disable_paste_burst*/ false,
+                );
+                composer
+                    .history
+                    .record_local_submission(HistoryEntry::new("cargo test".to_string()));
+
+                let _ = composer
+                    .handle_key_event(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+                let _ = composer
+                    .handle_key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+
+                let line = composer
+                    .history_search_footer_line()
+                    .expect("expected history search footer line");
+                assert_eq!(
+                    line.spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect::<Vec<_>>(),
+                    vec![
+                        "reverse-i-search: ",
+                        "c",
+                        "  ",
+                        "enter",
+                        " accept",
+                        " · ",
+                        "esc",
+                        " cancel"
+                    ]
+                );
+
+                let query_style = line.spans[1].style;
+                assert_eq!(query_style.fg, Some(ratatui::style::Color::Cyan));
+
+                let enter_style = line.spans[3].style;
+                assert_eq!(
+                    enter_style.fg,
+                    Some(crate::terminal_palette::rgb_color((240, 240, 240)))
+                );
+                assert!(enter_style.add_modifier.contains(Modifier::BOLD));
+                assert!(enter_style.sub_modifier.contains(Modifier::DIM));
+
+                let accept_style = line.spans[4].style;
+                assert!(accept_style.add_modifier.contains(Modifier::DIM));
+
+                let separator_style = line.spans[5].style;
+                assert!(separator_style.add_modifier.contains(Modifier::DIM));
+
+                let esc_style = line.spans[6].style;
+                assert_eq!(
+                    esc_style.fg,
+                    Some(crate::terminal_palette::rgb_color((240, 240, 240)))
+                );
+                assert!(esc_style.add_modifier.contains(Modifier::BOLD));
+                assert!(esc_style.sub_modifier.contains(Modifier::DIM));
+
+                let cancel_style = line.spans[7].style;
+                assert!(cancel_style.add_modifier.contains(Modifier::DIM));
+            },
         );
-        composer
-            .history
-            .record_local_submission(HistoryEntry::new("cargo test".to_string()));
-
-        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
-        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
-
-        let line = composer
-            .history_search_footer_line()
-            .expect("expected history search footer line");
-        assert_eq!(
-            line.spans
-                .iter()
-                .map(|span| span.content.as_ref())
-                .collect::<Vec<_>>(),
-            vec![
-                "reverse-i-search: ",
-                "c",
-                "  ",
-                "enter",
-                " accept",
-                " · ",
-                "esc",
-                " cancel"
-            ]
-        );
-
-        let query_style = line.spans[1].style;
-        assert_eq!(query_style.fg, Some(ratatui::style::Color::Cyan));
-
-        let enter_style = line.spans[3].style;
-        assert_eq!(enter_style.fg, Some(ratatui::style::Color::Cyan));
-        assert!(enter_style.add_modifier.contains(Modifier::BOLD));
-        assert!(enter_style.sub_modifier.contains(Modifier::DIM));
-
-        let accept_style = line.spans[4].style;
-        assert!(accept_style.add_modifier.contains(Modifier::DIM));
-
-        let separator_style = line.spans[5].style;
-        assert!(separator_style.add_modifier.contains(Modifier::DIM));
-
-        let esc_style = line.spans[6].style;
-        assert_eq!(esc_style.fg, Some(ratatui::style::Color::Cyan));
-        assert!(esc_style.add_modifier.contains(Modifier::BOLD));
-        assert!(esc_style.sub_modifier.contains(Modifier::DIM));
-
-        let cancel_style = line.spans[7].style;
-        assert!(cancel_style.add_modifier.contains(Modifier::DIM));
     }
 
     #[test]

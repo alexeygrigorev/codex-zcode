@@ -154,6 +154,7 @@ impl App {
         startup_elapsed_before_app: Duration,
         startup_bootstrap: Option<AppServerBootstrap>,
         startup_hooks_browser: Option<HooksListEntry>,
+        daemon_startup_warning: Option<String>,
         mut startup_draft: StartupDraftPump,
         managed_worktree: Option<crate::ManagedTuiWorktree>,
         daemon_cli_executable: Option<AbsolutePathBuf>,
@@ -698,6 +699,12 @@ impl App {
                     started.session.windows_sandbox_host
                 })
         };
+        // This launch warning belongs to the TUI, independent of picker/trust client replacement.
+        if let Some(warning) = daemon_startup_warning {
+            app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
+                history_cell::StartupWarningsCell::new(vec![warning]),
+            )));
+        }
         let file_search = FileSearchManager::new(config.cwd.to_path_buf(), app_event_tx.clone());
         let runtime_keymap =
             RuntimeKeymap::from_config(&local_settings.tui.keymap).map_err(|err| {
@@ -819,7 +826,7 @@ See the Codex keymap documentation for supported actions and examples."
         if initial_server_version_notice.is_none() {
             app.update_server_version_overview_notice(
                 CODEX_CLI_VERSION,
-                /*older_server*/ None,
+                /*server_version*/ None,
             );
         }
         if start_in_agents_overview {

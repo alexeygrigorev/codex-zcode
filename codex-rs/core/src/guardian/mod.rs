@@ -45,11 +45,8 @@ pub(crate) use approval_request::GuardianMcpAnnotations;
 pub(crate) use approval_request::GuardianNetworkAccessTrigger;
 #[cfg(test)]
 pub(crate) use approval_request::guardian_approval_request_to_json;
-pub(crate) use codex_guardian_reviewer::guardian_timeout_message;
 pub(crate) use decision::decide_approval;
 pub(crate) use decision::spawn_approval_decision;
-pub(crate) use prompt::BUNDLED_GUARDIAN_POLICY;
-pub(crate) use prompt::BUNDLED_GUARDIAN_POLICY_TEMPLATE;
 pub(crate) use prompt::guardian_truncate_text;
 pub(crate) use review::GuardianReviewOptions;
 pub(crate) use review::is_basic_session_source;
@@ -164,7 +161,7 @@ impl From<Arc<TurnContext>> for GuardianReviewContext {
                 .extension_data
                 .get::<codex_api::ResponseId>()
                 .map(|id| id.0.clone()),
-            environments: turn.environments.clone(),
+            environments: turn.initial_environments.clone(),
             model_info: Arc::clone(turn.model_info()),
             reasoning_effort: turn.reasoning_effort().cloned(),
             reasoning_summary: turn.reasoning_summary(),

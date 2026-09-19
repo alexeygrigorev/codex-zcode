@@ -736,6 +736,7 @@ async fn psp_feature_configures_first_party_routing() -> Result<()> {
     assert_eq!(
         config.http_client_factory(),
         HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault)
+            .with_system_proxy_fallback()
             .with_chatgpt_cookies([HeaderValue::from_static("oai-chat-psp=true")])
     );
     assert_eq!(
@@ -915,6 +916,7 @@ async fn write_value_supports_nested_app_paths() -> Result<()> {
             value: serde_json::json!({
                 "app1": {
                     "enabled": false,
+                    "omit_tools_from": ["deferred"],
                 },
             }),
             merge_strategy: MergeStrategy::Replace,
@@ -950,6 +952,9 @@ async fn write_value_supports_nested_app_paths() -> Result<()> {
                 "app1".to_string(),
                 AppConfig {
                     enabled: false,
+                    omit_tools_from: Some(vec![
+                        codex_protocol::config_types::ToolExposureSurface::Deferred
+                    ]),
                     approvals_reviewer: None,
                     destructive_enabled: None,
                     open_world_enabled: None,
@@ -1692,7 +1697,7 @@ async fn read_materializes_default_allow_login_shell() {
 }
 
 #[tokio::test]
-async fn write_value_allows_unmanaged_sibling_of_exact_requirement() {
+async fn write_value_allows_unmanaged_setting_with_exact_requirement() {
     let tmp = tempdir().expect("tempdir");
     let path = tmp.path().join(CONFIG_TOML_FILE);
     std::fs::write(&path, "").unwrap();
@@ -1703,8 +1708,7 @@ async fn write_value_allows_unmanaged_sibling_of_exact_requirement() {
         LoaderOverrides::without_managed_config_for_tests(),
         CloudConfigBundleFixture::loader_with_enterprise_requirement(
             r#"
-[windows]
-sandbox_private_desktop = false
+allow_login_shell = false
 "#,
         ),
     );
@@ -1718,7 +1722,7 @@ sandbox_private_desktop = false
             expected_version: None,
         })
         .await
-        .expect("unmanaged sibling should remain writable");
+        .expect("unmanaged setting should remain writable");
 
     assert!(
         std::fs::read_to_string(path)

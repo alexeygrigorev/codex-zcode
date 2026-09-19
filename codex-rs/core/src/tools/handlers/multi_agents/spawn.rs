@@ -2,12 +2,12 @@ use super::*;
 use crate::agent::child_config::SpawnConfigOptions;
 use crate::agent::child_config::SpawnConfigVersion;
 use crate::agent::child_config::prepare_agent_spawn_config;
-use crate::agent::control::SpawnAgentForkMode;
-use crate::agent::control::SpawnAgentOptions;
 use crate::agent::control::render_input_preview;
 use crate::agent::exceeds_thread_spawn_depth_limit;
 use crate::agent::next_thread_spawn_depth;
 use crate::agent::role::DEFAULT_ROLE_NAME;
+use crate::agent::types::SpawnAgentForkMode;
+use crate::agent::types::SpawnAgentOptions;
 use crate::tools::handlers::multi_agents_spec::SpawnAgentToolOptions;
 use crate::tools::handlers::multi_agents_spec::create_spawn_agent_tool_v1;
 use codex_tools::ToolSpec;
@@ -94,7 +94,7 @@ async fn handle_spawn_agent(
         .await;
     let prepared = prepare_agent_spawn_config(
         &session,
-        turn.as_ref(),
+        step_context.as_ref(),
         SpawnConfigOptions {
             version: SpawnConfigVersion::V1,
             full_history_fork: args.fork_context,

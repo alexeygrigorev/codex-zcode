@@ -2,6 +2,10 @@
 mod notification_tests;
 
 use super::mcp_refresh::McpRefresh;
+use super::step_context::StepInputs;
+
+#[path = "turn_start_mcp_tests.rs"]
+mod turn_start_mcp_tests;
 use super::step_settings::ResolvedStepSettings;
 use super::step_settings::StepSettings;
 use super::step_settings::StepSettingsUpdate;
@@ -60,6 +64,7 @@ use codex_model_provider_info::built_in_model_providers;
 use codex_models_manager::model_info;
 use codex_models_manager::test_support::construct_model_info_offline_for_tests;
 use codex_models_manager::test_support::get_model_offline_for_tests;
+use codex_prompts::render_model_instructions;
 use codex_protocol::AgentPath;
 use codex_protocol::ResponseItemId;
 use codex_protocol::SessionId;
@@ -86,6 +91,7 @@ use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::permissions::FileSystemSandboxPolicyContext;
 use codex_protocol::permissions::FileSystemSpecialPath;
 use codex_protocol::protocol::EnvironmentConfigState;
+use codex_protocol::protocol::InternalSessionSource;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::TurnEnvironmentSelections;
 use codex_protocol::request_permissions::PermissionGrantScope;
@@ -242,12 +248,15 @@ pub(crate) fn update_turn_settings_for_test(
     update(&mut settings);
     let settings = Arc::new(settings);
     turn.initial_settings = Arc::clone(&settings);
-    turn.current_settings.store(settings);
+    turn.next_step_input.store(Arc::new(StepInputs {
+        settings,
+        environments: turn.initial_environments.clone(),
+    }));
 }
 
 impl StepContext {
     pub(crate) fn for_test(turn: Arc<TurnContext>) -> Arc<Self> {
-        let environments = turn.environments.clone();
+        let environments = turn.initial_environments.clone();
         // Unit fixtures still customize the legacy Config directly.
         // Production capture instead takes the turn's current snapshot.
         let mut settings = turn.initial_settings.as_ref().clone();
@@ -350,11 +359,13 @@ async fn default_turn_context_assigns_missing_response_item_ids() {
     let (session, turn_context) = make_session_and_context().await;
     let response_item = user_message("hello");
 
-    let (items, _) = session.prepare_conversation_items_for_history(
-        &turn_context,
-        turn_context.model_info(),
-        std::slice::from_ref(&response_item),
-    );
+    let (items, _) = session
+        .prepare_conversation_items_for_history(
+            &turn_context,
+            turn_context.model_info(),
+            std::slice::from_ref(&response_item),
+        )
+        .await;
 
     assert!(
         items[0]
@@ -649,7 +660,8 @@ async fn request_mcp_server_elicitation_auto_accepts_when_auto_deny_is_enabled()
                 }),
             },
         )
-        .await;
+        .await
+        .expect("root thread elicitation should be accepted");
 
     assert_eq!(
         response.response,
@@ -661,6 +673,58 @@ async fn request_mcp_server_elicitation_auto_accepts_when_auto_deny_is_enabled()
     );
     assert!(!response.sent);
     assert!(rx.try_recv().is_err());
+}
+
+#[test_case(false; "interactive")]
+#[test_case(true; "auto_accept")]
+#[tokio::test]
+async fn request_mcp_server_elicitation_rejects_non_root_threads(auto_deny: bool) {
+    for source in [
+        SessionSource::SubAgent(SubAgentSource::Review),
+        SessionSource::Internal(InternalSessionSource::Guardian),
+    ] {
+        let (session, mut turn_context, rx) = make_session_and_context_with_rx().await;
+        Arc::get_mut(&mut turn_context)
+            .expect("turn context should not be shared")
+            .session_source = source;
+        *session.active_turn.lock().await = Some(ActiveTurn::default());
+        session
+            .services
+            .mcp_runtime
+            .set_elicitations_auto_deny(auto_deny);
+        let paused = session.subscribe_elicitation_pause_state();
+
+        let Err(error) = tokio::time::timeout(
+            Duration::from_secs(1),
+            session.request_mcp_server_elicitation(
+                turn_context.as_ref(),
+                "codex_apps".to_string(),
+                RequestId::String("request-1".into()),
+                ElicitationRequest::Url {
+                    meta: None,
+                    message: "Connect this app to continue.".to_string(),
+                    url: "https://example.com/connect".to_string(),
+                    elicitation_id: "connect-1".to_string(),
+                },
+            ),
+        )
+        .await
+        .expect("non-root elicitation must not wait for user input") else {
+            panic!("non-root elicitation must be rejected");
+        };
+
+        assert_eq!(
+            error.to_string(),
+            codex_mcp::MCP_ELICITATION_HANDOFF_MESSAGE
+        );
+        assert!(rx.try_recv().is_err());
+        assert!(!*paused.borrow());
+        assert!(
+            !paused
+                .has_changed()
+                .expect("elicitation service should remain available")
+        );
+    }
 }
 
 #[tokio::test]
@@ -737,6 +801,7 @@ fn test_model_client_session() -> crate::client::ModelClientSession {
         "test_originator".to_string(),
         /*model_verbosity*/ None,
         /*content_item_kinds_enabled*/ true,
+        /*reasoning_effort_override_enabled*/ false,
         /*enable_request_compression*/ false,
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
@@ -1482,7 +1547,7 @@ async fn danger_full_access_tool_attempts_do_not_enforce_managed_network() -> an
     orchestrator
         .run(
             &mut tool,
-            turn.environments
+            turn.initial_environments
                 .primary()
                 .expect("turn should have a primary environment"),
             &tool_ctx,
@@ -3224,7 +3289,7 @@ async fn turn_start_lifecycle_exposes_turn_metadata_and_token_baseline() {
         turn_level_id: String,
         turn_id: String,
         collaboration_mode: CollaborationMode,
-        token_usage_at_turn_start: TokenUsage,
+        token_usage_at_turn_start: Option<TokenUsage>,
         saw_session_store: bool,
         saw_thread_store: bool,
     }
@@ -3248,7 +3313,7 @@ async fn turn_start_lifecycle_exposes_turn_metadata_and_token_baseline() {
                         turn_level_id: input.turn_store.level_id().to_string(),
                         turn_id: input.turn_id.to_string(),
                         collaboration_mode: input.collaboration_mode.clone(),
-                        token_usage_at_turn_start: input.token_usage_at_turn_start.clone(),
+                        token_usage_at_turn_start: input.token_usage_at_turn_start.cloned(),
                         saw_session_store: input
                             .session_store
                             .get::<SessionTurnStartMarker>()
@@ -3295,7 +3360,7 @@ async fn turn_start_lifecycle_exposes_turn_metadata_and_token_baseline() {
         turn_level_id: turn_context.sub_id.clone(),
         turn_id: turn_context.sub_id.clone(),
         collaboration_mode: turn_context.collaboration_mode(),
-        token_usage_at_turn_start,
+        token_usage_at_turn_start: Some(token_usage_at_turn_start),
         saw_session_store: true,
         saw_thread_store: true,
     };
@@ -3957,6 +4022,7 @@ async fn set_rate_limits_retains_previous_credits() {
     };
     let session_configuration = SessionConfiguration {
         provider: create_model_provider(config.model_provider.clone(), /*auth_manager*/ None),
+        environments: Vec::new(),
         step_settings: Arc::new(StepSettings {
             collaboration_mode,
             reasoning_summary: config.model_reasoning_summary,
@@ -3970,13 +4036,12 @@ async fn set_rate_limits_retains_previous_credits() {
         base_instructions: config
             .base_instructions
             .clone()
-            .unwrap_or_else(|| model_info.get_model_instructions(config.personality)),
+            .unwrap_or_else(|| render_model_instructions(&model_info)),
         permission_profile_state: config.permissions.permission_profile_state().clone(),
         allow_login_shell: config.permissions.allow_login_shell,
         shell_environment_policy: config.permissions.shell_environment_policy.clone(),
         windows_sandbox_level: WindowsSandboxLevel::from_config(&config),
         windows_sandbox_type: config.permissions.windows_sandbox_type,
-        windows_sandbox_private_desktop: config.permissions.windows_sandbox_private_desktop,
         use_legacy_landlock: config.features.use_legacy_landlock(),
         legacy_fallback_cwd: config.cwd.clone(),
         runtime_workspace_roots: config.workspace_roots.clone(),
@@ -4079,6 +4144,7 @@ async fn set_rate_limits_updates_plan_type_when_present() {
     };
     let session_configuration = SessionConfiguration {
         provider: create_model_provider(config.model_provider.clone(), /*auth_manager*/ None),
+        environments: Vec::new(),
         step_settings: Arc::new(StepSettings {
             collaboration_mode,
             reasoning_summary: config.model_reasoning_summary,
@@ -4092,13 +4158,12 @@ async fn set_rate_limits_updates_plan_type_when_present() {
         base_instructions: config
             .base_instructions
             .clone()
-            .unwrap_or_else(|| model_info.get_model_instructions(config.personality)),
+            .unwrap_or_else(|| render_model_instructions(&model_info)),
         permission_profile_state: config.permissions.permission_profile_state().clone(),
         allow_login_shell: config.permissions.allow_login_shell,
         shell_environment_policy: config.permissions.shell_environment_policy.clone(),
         windows_sandbox_level: WindowsSandboxLevel::from_config(&config),
         windows_sandbox_type: config.permissions.windows_sandbox_type,
-        windows_sandbox_private_desktop: config.permissions.windows_sandbox_private_desktop,
         use_legacy_landlock: config.features.use_legacy_landlock(),
         legacy_fallback_cwd: config.cwd.clone(),
         runtime_workspace_roots: config.workspace_roots.clone(),
@@ -4251,20 +4316,23 @@ async fn turn_context_with_model_updates_model_fields() {
     });
     Arc::make_mut(&mut turn_context.config).service_tier =
         turn_context.initial_settings.service_tier.clone();
-    let captured = turn_context.current_settings.load_full();
-    let mut current_selection = captured.selected().clone();
+    let captured = turn_context.next_step_input.load_full();
+    let mut current_selection = captured.settings.selected().clone();
     current_selection.reasoning_summary = Some(ReasoningSummaryConfig::None);
     current_selection.service_tier = None;
     current_selection
         .collaboration_mode
         .settings
         .reasoning_effort = Some(ReasoningEffortConfig::High);
-    let current = Arc::new(ResolvedStepSettings::new(
-        Arc::new(current_selection),
-        Arc::clone(turn_context.model_info()),
-        /*fast_mode_enabled*/ true,
-    ));
-    turn_context.current_settings.store(Arc::clone(&current));
+    let current = Arc::new(StepInputs {
+        settings: Arc::new(ResolvedStepSettings::new(
+            Arc::new(current_selection),
+            Arc::clone(turn_context.model_info()),
+            /*fast_mode_enabled*/ true,
+        )),
+        environments: captured.environments.clone(),
+    });
+    turn_context.next_step_input.store(Arc::clone(&current));
     let updated = turn_context
         .with_model("gpt-5.5".to_string(), &session.services.models_manager)
         .await;
@@ -4299,19 +4367,22 @@ async fn turn_context_with_model_updates_model_fields() {
             Some(ServiceTier::Fast.request_value())
         ),
     );
-    assert!(Arc::ptr_eq(&captured, &turn_context.initial_settings));
+    assert!(Arc::ptr_eq(
+        &captured.settings,
+        &turn_context.initial_settings
+    ));
     assert!(Arc::ptr_eq(
         &current,
-        &turn_context.current_settings.load_full()
+        &turn_context.next_step_input.load_full()
     ));
-    assert!(!Arc::ptr_eq(&captured, &updated.initial_settings));
+    assert!(!Arc::ptr_eq(&captured.settings, &updated.initial_settings));
     assert!(Arc::ptr_eq(
         &updated.initial_settings,
-        &updated.current_settings.load_full()
+        &updated.next_step_input.load().settings
     ));
     assert!(!Arc::ptr_eq(
-        &updated.current_settings.load_full(),
-        &turn_context.current_settings.load_full()
+        &updated.next_step_input.load_full(),
+        &turn_context.next_step_input.load_full()
     ));
     assert_eq!(updated.config.model.as_deref(), Some("gpt-5.5"));
     assert_eq!(updated.collaboration_mode().model(), "gpt-5.5");
@@ -4572,14 +4643,6 @@ fn get_service_tier_drops_unsupported_configured_tier_when_fast_mode_enabled() {
     );
     assert_eq!(
         get_service_tier(
-            Some(ServiceTier::Flex.request_value().to_string()),
-            /*fast_mode_enabled*/ true,
-            &model_info,
-        ),
-        None
-    );
-    assert_eq!(
-        get_service_tier(
             Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string()),
             /*fast_mode_enabled*/ true,
             &model_info,
@@ -4589,7 +4652,22 @@ fn get_service_tier_drops_unsupported_configured_tier_when_fast_mode_enabled() {
 }
 
 #[test]
-fn get_service_tier_ignores_configured_tier_when_fast_mode_disabled() {
+fn get_service_tier_preserves_flex_without_catalog_support_or_fast_mode() {
+    let model_info = model_with_default_service_tier(/*default_service_tier*/ None);
+    for fast_mode_enabled in [false, true] {
+        assert_eq!(
+            get_service_tier(
+                Some(ServiceTier::Flex.request_value().to_string()),
+                fast_mode_enabled,
+                &model_info,
+            ),
+            Some(ServiceTier::Flex.request_value().to_string())
+        );
+    }
+}
+
+#[test]
+fn get_service_tier_ignores_non_flex_tiers_when_fast_mode_disabled() {
     let model_info = model_with_default_service_tier(Some(ServiceTier::Fast.request_value()));
 
     assert_eq!(
@@ -4691,6 +4769,7 @@ pub(crate) async fn make_session_configuration_for_tests() -> SessionConfigurati
 
     SessionConfiguration {
         provider: create_model_provider(config.model_provider.clone(), /*auth_manager*/ None),
+        environments: Vec::new(),
         step_settings: Arc::new(StepSettings {
             collaboration_mode,
             reasoning_summary: config.model_reasoning_summary,
@@ -4704,13 +4783,12 @@ pub(crate) async fn make_session_configuration_for_tests() -> SessionConfigurati
         base_instructions: config
             .base_instructions
             .clone()
-            .unwrap_or_else(|| model_info.get_model_instructions(config.personality)),
+            .unwrap_or_else(|| render_model_instructions(&model_info)),
         permission_profile_state: config.permissions.permission_profile_state().clone(),
         allow_login_shell: config.permissions.allow_login_shell,
         shell_environment_policy: config.permissions.shell_environment_policy.clone(),
         windows_sandbox_level: WindowsSandboxLevel::from_config(&config),
         windows_sandbox_type: config.permissions.windows_sandbox_type,
-        windows_sandbox_private_desktop: config.permissions.windows_sandbox_private_desktop,
         use_legacy_landlock: config.features.use_legacy_landlock(),
         legacy_fallback_cwd: config.cwd.clone(),
         runtime_workspace_roots: config.workspace_roots.clone(),
@@ -5597,7 +5675,7 @@ async fn permission_profile_updates_apply_to_next_turn_environment() {
     for apply_on_turn_start in [false, true] {
         let (session, active_turn) = make_session_and_context().await;
         let active_environment_config = active_turn
-            .environments
+            .initial_environments
             .primary()
             .expect("active turn environment")
             .config()
@@ -5629,7 +5707,7 @@ async fn permission_profile_updates_apply_to_next_turn_environment() {
             session.new_default_turn().await
         };
         let next_environment = next_turn
-            .environments
+            .initial_environments
             .primary()
             .expect("next turn environment");
         let mut expected_environment_config = active_environment_config.clone();
@@ -5643,7 +5721,7 @@ async fn permission_profile_updates_apply_to_next_turn_environment() {
         assert_eq!(next_environment.config(), &expected_environment_config);
         assert_eq!(
             active_turn
-                .environments
+                .initial_environments
                 .primary()
                 .expect("active turn environment")
                 .config(),
@@ -5678,7 +5756,7 @@ async fn relative_cwd_update_without_environments_resolves_under_session_cwd() {
 
     let state = session.state.lock().await;
     assert_eq!(state.session_configuration.cwd(), &updated_cwd);
-    assert!(session.services.turn_environments.selections().is_empty());
+    assert!(state.session_configuration.environments.is_empty());
 }
 
 #[tokio::test]
@@ -5708,7 +5786,7 @@ async fn environment_settings_preserve_explicit_primary_cwd() {
     let state = session.state.lock().await;
     assert_eq!(state.session_configuration.cwd(), &updated_cwd);
     assert_eq!(
-        session.services.turn_environments.selections()[0].cwd,
+        state.session_configuration.environments[0].cwd,
         PathUri::from_abs_path(&environment_cwd)
     );
 }
@@ -5741,7 +5819,13 @@ async fn absolute_cwd_update_with_turn_environment_is_allowed() {
     let turn_cwd = turn_context.cwd.clone();
     assert_eq!(turn_cwd, absolute_cwd);
     assert_eq!(turn_context.config.cwd, absolute_cwd);
-    assert_eq!(turn_context.environments.turn_environments().count(), 1);
+    assert_eq!(
+        turn_context
+            .initial_environments
+            .turn_environments()
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -5777,6 +5861,7 @@ async fn session_new_fails_when_zsh_fork_enabled_without_packaged_zsh() {
             config.model_provider.clone(),
             Some(Arc::clone(&auth_manager)),
         ),
+        environments: Vec::new(),
         step_settings: Arc::new(StepSettings {
             collaboration_mode,
             reasoning_summary: config.model_reasoning_summary,
@@ -5790,13 +5875,12 @@ async fn session_new_fails_when_zsh_fork_enabled_without_packaged_zsh() {
         base_instructions: config
             .base_instructions
             .clone()
-            .unwrap_or_else(|| model_info.get_model_instructions(config.personality)),
+            .unwrap_or_else(|| render_model_instructions(&model_info)),
         permission_profile_state: config.permissions.permission_profile_state().clone(),
         allow_login_shell: config.permissions.allow_login_shell,
         shell_environment_policy: config.permissions.shell_environment_policy.clone(),
         windows_sandbox_level: WindowsSandboxLevel::from_config(&config),
         windows_sandbox_type: config.permissions.windows_sandbox_type,
-        windows_sandbox_private_desktop: config.permissions.windows_sandbox_private_desktop,
         use_legacy_landlock: config.features.use_legacy_landlock(),
         legacy_fallback_cwd: config.cwd.clone(),
         runtime_workspace_roots: config.workspace_roots.clone(),
@@ -5854,7 +5938,7 @@ async fn session_new_fails_when_zsh_fork_enabled_without_packaged_zsh() {
         Arc::new(codex_extension_api::ExtensionRegistryBuilder::new().build()),
         codex_extension_api::ExtensionDataInit::default(),
         ClientMcpExtensions::default(),
-        AgentControl::default(),
+        LocalAgentControl::default(),
         /*reserved_thread_id*/ None,
         environment_manager,
         /*inherited_environments*/ None,
@@ -5937,7 +6021,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         auth_manager.clone(),
         config.model_provider.clone(),
     );
-    let agent_control = AgentControl::default();
+    let agent_control = LocalAgentControl::default();
     let exec_policy = Arc::new(ExecPolicyManager::default());
     let (agent_status_tx, _agent_status_rx) = watch::channel(AgentStatus::PendingInit);
     let model = get_model_offline_for_tests(config.model.as_deref());
@@ -5954,6 +6038,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
     };
     let default_environments = vec![local(config.cwd.clone())];
     let session_configuration = SessionConfiguration {
+        environments: default_environments.clone(),
         provider: create_model_provider(
             config.model_provider.clone(),
             Some(Arc::clone(&auth_manager)),
@@ -5971,13 +6056,12 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         base_instructions: config
             .base_instructions
             .clone()
-            .unwrap_or_else(|| model_info.get_model_instructions(config.personality)),
+            .unwrap_or_else(|| render_model_instructions(&model_info)),
         permission_profile_state: config.permissions.permission_profile_state().clone(),
         allow_login_shell: config.permissions.allow_login_shell,
         shell_environment_policy: config.permissions.shell_environment_policy.clone(),
         windows_sandbox_level: WindowsSandboxLevel::from_config(&config),
         windows_sandbox_type: config.permissions.windows_sandbox_type,
-        windows_sandbox_private_desktop: config.permissions.windows_sandbox_private_desktop,
         use_legacy_landlock: config.features.use_legacy_landlock(),
         legacy_fallback_cwd: config.cwd.clone(),
         runtime_workspace_roots: config.workspace_roots.clone(),
@@ -6114,6 +6198,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
             session_configuration.originator.clone(),
             config.model_verbosity,
             config.features.enabled(Feature::ContentItemKinds),
+            config.features.enabled(Feature::ReasoningEffortOverride),
             config.features.enabled(Feature::EnableRequestCompression),
             config.features.enabled(Feature::RuntimeMetrics),
             Session::build_model_client_beta_features_header(config.as_ref()),
@@ -6169,8 +6254,13 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         forked_from_ordinal_exclusive: None,
         next_internal_sub_id: AtomicU64::new(0),
     };
-    let per_turn_config =
-        session.build_per_turn_config(&session_configuration, session_configuration.cwd().clone());
+    let per_turn_config = session.build_per_turn_config(
+        &session_configuration,
+        session_configuration.cwd().clone(),
+        crate::environment_selection::ThreadEnvironments::primary_workspace_roots_for(
+            &session_configuration.environments,
+        ),
+    );
     let plugins_input = per_turn_config.plugins_config_input();
     let plugin_outcome = session
         .services
@@ -6263,6 +6353,7 @@ async fn make_session_with_config_and_rx(
     };
     let default_environments = vec![local(config.cwd.clone())];
     let session_configuration = SessionConfiguration {
+        environments: default_environments.clone(),
         provider: create_model_provider(
             config.model_provider.clone(),
             Some(Arc::clone(&auth_manager)),
@@ -6280,13 +6371,12 @@ async fn make_session_with_config_and_rx(
         base_instructions: config
             .base_instructions
             .clone()
-            .unwrap_or_else(|| model_info.get_model_instructions(config.personality)),
+            .unwrap_or_else(|| render_model_instructions(&model_info)),
         permission_profile_state: config.permissions.permission_profile_state().clone(),
         allow_login_shell: config.permissions.allow_login_shell,
         shell_environment_policy: config.permissions.shell_environment_policy.clone(),
         windows_sandbox_level: WindowsSandboxLevel::from_config(&config),
         windows_sandbox_type: config.permissions.windows_sandbox_type,
-        windows_sandbox_private_desktop: config.permissions.windows_sandbox_private_desktop,
         use_legacy_landlock: config.features.use_legacy_landlock(),
         legacy_fallback_cwd: config.cwd.clone(),
         runtime_workspace_roots: config.workspace_roots.clone(),
@@ -6345,7 +6435,7 @@ async fn make_session_with_config_and_rx(
         Arc::new(codex_extension_api::ExtensionRegistryBuilder::new().build()),
         codex_extension_api::ExtensionDataInit::default(),
         ClientMcpExtensions::default(),
-        AgentControl::default(),
+        LocalAgentControl::default(),
         /*reserved_thread_id*/ None,
         environment_manager,
         /*inherited_environments*/ None,
@@ -6370,7 +6460,7 @@ async fn make_session_with_config_and_rx(
 async fn make_session_with_history_source_and_agent_control_and_rx(
     initial_history: InitialHistory,
     session_source: SessionSource,
-    agent_control: AgentControl,
+    agent_control: LocalAgentControl,
 ) -> anyhow::Result<(Arc<Session>, async_channel::Receiver<Event>)> {
     let codex_home = tempfile::tempdir().expect("create temp dir");
     let mut config = build_test_config(codex_home.path()).await;
@@ -6395,6 +6485,7 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
     };
     let default_environments = vec![local(config.cwd.clone())];
     let session_configuration = SessionConfiguration {
+        environments: default_environments.clone(),
         provider: create_model_provider(
             config.model_provider.clone(),
             Some(Arc::clone(&auth_manager)),
@@ -6412,13 +6503,12 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
         base_instructions: config
             .base_instructions
             .clone()
-            .unwrap_or_else(|| model_info.get_model_instructions(config.personality)),
+            .unwrap_or_else(|| render_model_instructions(&model_info)),
         permission_profile_state: config.permissions.permission_profile_state().clone(),
         allow_login_shell: config.permissions.allow_login_shell,
         shell_environment_policy: config.permissions.shell_environment_policy.clone(),
         windows_sandbox_level: WindowsSandboxLevel::from_config(&config),
         windows_sandbox_type: config.permissions.windows_sandbox_type,
-        windows_sandbox_private_desktop: config.permissions.windows_sandbox_private_desktop,
         use_legacy_landlock: config.features.use_legacy_landlock(),
         legacy_fallback_cwd: config.cwd.clone(),
         runtime_workspace_roots: config.workspace_roots.clone(),
@@ -6516,7 +6606,7 @@ async fn resumed_root_session_uses_thread_id_as_session_id() {
             rollout_path: None,
         }),
         SessionSource::Exec,
-        AgentControl::default(),
+        LocalAgentControl::default(),
     )
     .await
     .expect("resume should succeed");
@@ -6559,7 +6649,7 @@ async fn resumed_subagent_session_restores_persisted_session_id() {
             rollout_path: None,
         }),
         session_source,
-        AgentControl::default(),
+        LocalAgentControl::default(),
     )
     .await
     .expect("resume should succeed");
@@ -6612,7 +6702,7 @@ async fn resumed_copied_fork_ignores_source_history_base() {
             rollout_path: None,
         }),
         SessionSource::Exec,
-        AgentControl::default(),
+        LocalAgentControl::default(),
     )
     .await
     .expect("resume should succeed");
@@ -6860,7 +6950,7 @@ async fn request_permissions_emits_event_when_granular_policy_allows_requests() 
         let call_id = call_id.clone();
         async move {
             let environment = turn_context
-                .environments
+                .initial_environments
                 .primary()
                 .expect("primary environment")
                 .selection();
@@ -6937,7 +7027,7 @@ async fn request_permissions_tool_resolves_legacy_paths_against_selected_environ
         }))
         .expect("test setup should allow updating approval policy");
     let current_environment = turn_context_mut
-        .environments
+        .initial_environments
         .primary()
         .expect("primary environment")
         .clone();
@@ -6956,7 +7046,8 @@ async fn request_permissions_tool_resolves_legacy_paths_against_selected_environ
             current_environment.shell,
         )
     };
-    turn_context_mut.environments.environments[0] = TurnEnvironmentState::Ready(environment);
+    turn_context_mut.initial_environments.environments[0] =
+        TurnEnvironmentState::Ready(environment);
 
     let call_id = "call-1".to_string();
     let handler = RequestPermissionsHandler;
@@ -7045,7 +7136,8 @@ async fn request_permissions_tool_rejects_invalid_requests(
     Arc::make_mut(&mut turn_context.config)
         .permissions
         .approval_policy = codex_config::Constrained::allow_any(AskForApproval::Never);
-    let TurnEnvironmentState::Ready(environment) = &mut turn_context.environments.environments[0]
+    let TurnEnvironmentState::Ready(environment) =
+        &mut turn_context.initial_environments.environments[0]
     else {
         panic!("turn environment should be ready");
     };
@@ -7123,7 +7215,7 @@ async fn request_permissions_response_materializes_session_cwd_grants_before_rec
         let requested_permissions = requested_permissions.clone();
         async move {
             let environment = turn_context
-                .environments
+                .initial_environments
                 .primary()
                 .expect("primary environment")
                 .selection();
@@ -7216,7 +7308,7 @@ async fn request_permissions_is_auto_denied_when_granular_policy_blocks_tool_req
     let turn_context = Arc::new(turn_context);
     let call_id = "call-1".to_string();
     let environment = turn_context
-        .environments
+        .initial_environments
         .primary()
         .expect("primary environment")
         .selection();
@@ -7420,10 +7512,10 @@ async fn turn_environments_set_primary_environment() {
         .await
         .expect("turn should start");
 
-    let turn_environments = &turn_context.environments;
+    let turn_environments = &turn_context.initial_environments;
     assert_eq!(turn_environments.turn_environments().count(), 1);
     let turn_environment = turn_context
-        .environments
+        .initial_environments
         .primary()
         .expect("primary environment should be set");
     assert!(std::sync::Arc::ptr_eq(
@@ -7435,7 +7527,7 @@ async fn turn_environments_set_primary_environment() {
     ));
     assert!(
         turn_context
-            .environments
+            .initial_environments
             .turn_environments()
             .next()
             .is_some()
@@ -7463,7 +7555,7 @@ async fn turn_environments_set_primary_environment() {
     assert!(Arc::ptr_eq(
         &stored_environment,
         &default_turn
-            .environments
+            .initial_environments
             .primary()
             .expect("default turn primary environment")
             .environment
@@ -7471,7 +7563,55 @@ async fn turn_environments_set_primary_environment() {
 }
 
 #[tokio::test]
-async fn default_turn_does_not_overlay_legacy_fallback_cwd_onto_stored_thread_environments() {
+async fn new_task_does_not_change_an_already_running_tasks_environments() {
+    let (session, running_turn, events) = make_session_and_context_with_rx().await;
+    let current_cwd = running_turn.config.cwd.clone();
+    let next_workspace = tempfile::tempdir().expect("next workspace");
+    let next_cwd = next_workspace.path().abs();
+    let finish = Arc::new(Notify::new());
+
+    session
+        .update_settings(SessionSettingsUpdate {
+            environments: Some(TurnEnvironmentSelections::new(
+                next_cwd.clone(),
+                vec![local(next_cwd.clone())],
+            )),
+            ..Default::default()
+        })
+        .await
+        .expect("save next task's settings");
+    session
+        .spawn_task(
+            running_turn,
+            Vec::new(),
+            HeldStepTask {
+                kind: TaskKind::Regular,
+                finish: Arc::clone(&finish),
+            },
+        )
+        .await;
+
+    let candidate = session
+        .new_turn_with_default_settings("candidate".into(), Default::default())
+        .await;
+    assert_eq!(candidate.config.cwd, current_cwd);
+    assert_eq!(candidate.config.workspace_roots, vec![current_cwd.clone()]);
+    assert_eq!(
+        session.services.turn_environments.selections(),
+        vec![local(current_cwd)]
+    );
+
+    finish.notify_one();
+    recv_terminal_event(&events, TerminalEventKind::TurnComplete).await;
+    let next = session
+        .new_turn_with_default_settings("next".into(), Default::default())
+        .await;
+    assert_eq!(next.config.cwd, next_cwd);
+    assert_eq!(next.config.workspace_roots, vec![next_cwd]);
+}
+
+#[tokio::test]
+async fn task_turn_does_not_overlay_legacy_fallback_cwd_onto_stored_thread_environments() {
     let (session, _initial_turn, _rx) = make_session_and_context_with_rx().await;
     let session_cwd = session.get_config().await.cwd.clone();
     let selected_cwd =
@@ -7486,12 +7626,14 @@ async fn default_turn_does_not_overlay_legacy_fallback_cwd_onto_stored_thread_en
         })
         .await
         .expect("environment selection update should succeed");
-    let turn_context = session.new_default_turn().await;
+    let turn_context = session
+        .new_turn_with_default_settings("task".into(), Default::default())
+        .await;
 
-    let turn_environments = &turn_context.environments;
+    let turn_environments = &turn_context.initial_environments;
     assert_eq!(turn_environments.turn_environments().count(), 1);
     let turn_environment = turn_context
-        .environments
+        .initial_environments
         .primary()
         .expect("primary environment should be set");
     assert!(std::sync::Arc::ptr_eq(
@@ -7508,7 +7650,7 @@ async fn default_turn_does_not_overlay_legacy_fallback_cwd_onto_stored_thread_en
 }
 
 #[tokio::test]
-async fn default_turn_honors_empty_stored_thread_environments() {
+async fn task_turn_honors_empty_stored_thread_environments() {
     let (session, _initial_turn, _rx) = make_session_and_context_with_rx().await;
     let session_cwd = session.get_config().await.cwd.clone();
 
@@ -7522,12 +7664,14 @@ async fn default_turn_honors_empty_stored_thread_environments() {
         })
         .await
         .expect("environment selection update should succeed");
-    let turn_context = session.new_default_turn().await;
+    let turn_context = session
+        .new_turn_with_default_settings("task".into(), Default::default())
+        .await;
 
-    assert!(turn_context.environments.primary().is_none());
+    assert!(turn_context.initial_environments.primary().is_none());
     assert!(
         turn_context
-            .environments
+            .initial_environments
             .turn_environments()
             .next()
             .is_none()
@@ -7536,14 +7680,20 @@ async fn default_turn_honors_empty_stored_thread_environments() {
     let turn_cwd = turn_context.cwd.clone();
     assert_eq!(turn_cwd, session_cwd);
     assert_eq!(turn_context.config.cwd, session_cwd);
-    assert_eq!(turn_context.environments.turn_environments().count(), 0);
+    assert_eq!(
+        turn_context
+            .initial_environments
+            .turn_environments()
+            .count(),
+        0
+    );
 }
 
 #[tokio::test]
 async fn primary_environment_uses_first_turn_environment() {
     let (_session, mut turn_context) = make_session_and_context().await;
     let first_environment = turn_context
-        .environments
+        .initial_environments
         .primary()
         .expect("primary environment")
         .clone();
@@ -7552,7 +7702,7 @@ async fn primary_environment_uses_first_turn_environment() {
     let second_cwd_uri = codex_utils_path_uri::PathUri::from_abs_path(&second_cwd);
     let first_environment_config = first_environment.config().clone();
     turn_context
-        .environments
+        .initial_environments
         .environments
         .push(TurnEnvironmentState::Ready(TurnEnvironment::new(
             TurnEnvironmentSelection {
@@ -7568,7 +7718,7 @@ async fn primary_environment_uses_first_turn_environment() {
 
     assert_eq!(
         turn_context
-            .environments
+            .initial_environments
             .primary()
             .expect("primary environment")
             .selection
@@ -7577,17 +7727,23 @@ async fn primary_environment_uses_first_turn_environment() {
     );
     assert_eq!(
         turn_context
-            .environments
+            .initial_environments
             .turn_environments()
             .find(|environment| environment.selection.environment_id == "second")
             .expect("second environment")
             .cwd(),
         &second_cwd_uri
     );
-    assert_eq!(turn_context.environments.turn_environments().count(), 2);
     assert_eq!(
         turn_context
-            .environments
+            .initial_environments
+            .turn_environments()
+            .count(),
+        2
+    );
+    assert_eq!(
+        turn_context
+            .initial_environments
             .turn_environments()
             .nth(1)
             .expect("second environment")
@@ -7615,10 +7771,10 @@ async fn empty_turn_environments_clear_primary_environment() {
         .await
         .expect("turn should start");
 
-    assert!(turn_context.environments.primary().is_none());
+    assert!(turn_context.initial_environments.primary().is_none());
     assert!(
         turn_context
-            .environments
+            .initial_environments
             .turn_environments()
             .next()
             .is_none()
@@ -8120,7 +8276,7 @@ where
         auth_manager.clone(),
         config.model_provider.clone(),
     );
-    let agent_control = AgentControl::default();
+    let agent_control = LocalAgentControl::default();
     let exec_policy = Arc::new(ExecPolicyManager::default());
     let (agent_status_tx, _agent_status_rx) = watch::channel(AgentStatus::PendingInit);
     let model = get_model_offline_for_tests(config.model.as_deref());
@@ -8137,6 +8293,7 @@ where
     };
     let default_environments = vec![local(config.cwd.clone())];
     let session_configuration = SessionConfiguration {
+        environments: default_environments.clone(),
         provider: create_model_provider(
             config.model_provider.clone(),
             Some(Arc::clone(&auth_manager)),
@@ -8154,13 +8311,12 @@ where
         base_instructions: config
             .base_instructions
             .clone()
-            .unwrap_or_else(|| model_info.get_model_instructions(config.personality)),
+            .unwrap_or_else(|| render_model_instructions(&model_info)),
         permission_profile_state: config.permissions.permission_profile_state().clone(),
         allow_login_shell: config.permissions.allow_login_shell,
         shell_environment_policy: config.permissions.shell_environment_policy.clone(),
         windows_sandbox_level: WindowsSandboxLevel::from_config(&config),
         windows_sandbox_type: config.permissions.windows_sandbox_type,
-        windows_sandbox_private_desktop: config.permissions.windows_sandbox_private_desktop,
         use_legacy_landlock: config.features.use_legacy_landlock(),
         legacy_fallback_cwd: config.cwd.clone(),
         runtime_workspace_roots: config.workspace_roots.clone(),
@@ -8300,6 +8456,7 @@ where
             session_configuration.originator.clone(),
             config.model_verbosity,
             config.features.enabled(Feature::ContentItemKinds),
+            config.features.enabled(Feature::ReasoningEffortOverride),
             config.features.enabled(Feature::EnableRequestCompression),
             config.features.enabled(Feature::RuntimeMetrics),
             Session::build_model_client_beta_features_header(config.as_ref()),
@@ -8355,8 +8512,13 @@ where
         forked_from_ordinal_exclusive: None,
         next_internal_sub_id: AtomicU64::new(0),
     });
-    let per_turn_config =
-        session.build_per_turn_config(&session_configuration, session_configuration.cwd().clone());
+    let per_turn_config = session.build_per_turn_config(
+        &session_configuration,
+        session_configuration.cwd().clone(),
+        crate::environment_selection::ThreadEnvironments::primary_workspace_roots_for(
+            &session_configuration.environments,
+        ),
+    );
     let plugins_input = per_turn_config.plugins_config_input();
     let plugin_outcome = session
         .services
@@ -8751,7 +8913,7 @@ async fn mcp_elicitation_reviewer_uses_active_reviewer_and_latest_runtime_policy
         .next()
         .expect("session should select its executor environment");
     let mut owner_config = old_turn
-        .environments
+        .initial_environments
         .primary()
         .expect("ready environment")
         .config()
@@ -8910,7 +9072,7 @@ async fn conflicting_ready_environment_root_ids_keep_first_location() {
         selected_root("executor-b", "file:///plugins/b"),
     ];
     let local_environment = turn_context
-        .environments
+        .initial_environments
         .primary()
         .expect("ready local environment");
     let mut turn_environments = Vec::new();
@@ -8977,14 +9139,13 @@ async fn capability_discovery_uses_environment_permission_profile() {
         .set_permission_profile(PermissionProfile::Disabled)
         .expect("unrestricted permission profile should be allowed");
     config.permissions.windows_sandbox_mode = Some(WindowsSandboxModeToml::Unelevated);
-    config.permissions.windows_sandbox_private_desktop = true;
     config
         .features
         .disable(Feature::UseLegacyLandlock)
         .expect("disable legacy Landlock");
     turn_context.windows_sandbox_level = WindowsSandboxLevel::RestrictedToken;
     let mut environment = turn_context
-        .environments
+        .initial_environments
         .primary()
         .expect("primary environment")
         .clone();
@@ -9003,11 +9164,10 @@ async fn capability_discovery_uses_environment_permission_profile() {
             NetworkSandboxPolicy::Restricted,
         ));
     environment_config.windows_sandbox_level = WindowsSandboxLevel::Elevated;
-    environment_config.windows_sandbox_private_desktop = false;
     environment_config.use_legacy_landlock = true;
     let expected_sandbox = FileSystemSandboxContext {
-        permissions: environment.permission_profile().clone().into(),
-        cwd: Some(environment.cwd().clone()),
+        permissions: environment.permission_profile().clone(),
+        cwd: environment.cwd().clone(),
         workspace_roots: environment.workspace_roots().to_vec(),
         user_home_dir: environment.user_home_dir.clone(),
         temporary_directories: environment.temporary_directories.clone(),
@@ -9016,18 +9176,17 @@ async fn capability_discovery_uses_environment_permission_profile() {
         } else {
             codex_file_system::WindowsSandboxSelection::Disabled
         },
-        windows_sandbox_private_desktop: false,
         windows_sandbox_proxy_settings_mode: None,
         use_legacy_landlock: true,
     };
     let environment_id = environment.selection.environment_id.clone();
-    turn_context.environments.environments[0] = TurnEnvironmentState::Ready(environment);
+    turn_context.initial_environments.environments[0] = TurnEnvironmentState::Ready(environment);
 
     let discovery = session
         .executor_capability_discovery_for_step(
             &turn_context.config,
             /*ready_selected_capability_roots*/ &[],
-            &turn_context.environments,
+            &turn_context.initial_environments,
         )
         .await
         .expect("restricted environment should trigger capability discovery");
@@ -9206,12 +9365,12 @@ async fn record_context_updates_emits_environment_item_for_cwd_changes() {
         .await;
     let cwd = test_path_buf("/new-repo").abs();
     let environment = current_context
-        .environments
+        .initial_environments
         .primary()
         .expect("primary environment")
         .clone();
     let environment_config = environment.config().clone();
-    current_context.environments.environments[0] =
+    current_context.initial_environments.environments[0] =
         TurnEnvironmentState::Ready(TurnEnvironment::new(
             TurnEnvironmentSelection {
                 environment_id: environment.selection.environment_id,
@@ -9246,13 +9405,13 @@ async fn record_context_updates_use_environment_permission_profile_and_workspace
         .set_permission_profile(PermissionProfile::Disabled)
         .expect("unrestricted permission profile should be allowed");
     let mut previous_environment = previous_context
-        .environments
+        .initial_environments
         .primary()
         .expect("primary environment")
         .clone();
     previous_environment.config_mut().permission_profile =
         PermissionProfileSnapshot::legacy(PermissionProfile::Disabled);
-    previous_context.environments.environments[0] =
+    previous_context.initial_environments.environments[0] =
         TurnEnvironmentState::Ready(previous_environment);
     let previous_context = Arc::new(previous_context);
     let mut current_context = previous_context
@@ -9262,7 +9421,7 @@ async fn record_context_updates_use_environment_permission_profile_and_workspace
         )
         .await;
     let environment = current_context
-        .environments
+        .initial_environments
         .primary()
         .expect("primary environment")
         .clone();
@@ -9272,7 +9431,7 @@ async fn record_context_updates_use_environment_permission_profile_and_workspace
     environment_config.workspace_roots = vec![PathUri::from_abs_path(&workspace_root)];
     environment_config.permission_profile =
         PermissionProfileSnapshot::legacy(PermissionProfile::workspace_write());
-    current_context.environments.environments[0] =
+    current_context.initial_environments.environments[0] =
         TurnEnvironmentState::Ready(TurnEnvironment::new(
             TurnEnvironmentSelection {
                 environment_id: environment.selection.environment_id,
@@ -9344,12 +9503,12 @@ async fn record_context_updates_omits_environment_item_when_disabled() {
     config.include_environment_context = false;
     current_context.config = Arc::new(config);
     let environment = current_context
-        .environments
+        .initial_environments
         .primary()
         .expect("primary environment")
         .clone();
     let environment_config = environment.config().clone();
-    current_context.environments.environments[0] =
+    current_context.initial_environments.environments[0] =
         TurnEnvironmentState::Ready(TurnEnvironment::new(
             TurnEnvironmentSelection {
                 environment_id: environment.selection.environment_id,
@@ -9904,23 +10063,24 @@ fn file_system_policy_with_unreadable_glob(turn_context: &TurnContext) -> FileSy
 async fn turn_context_item_stores_local_cwd() {
     let (_session, mut turn_context) = make_session_and_context().await;
     let environment = turn_context
-        .environments
+        .initial_environments
         .primary()
         .expect("primary environment")
         .clone();
     let cwd = PathUri::parse("file:///C:/windows").expect("Windows cwd URI");
     let environment_config = environment.config().clone();
-    turn_context.environments.environments[0] = TurnEnvironmentState::Ready(TurnEnvironment::new(
-        TurnEnvironmentSelection {
-            environment_id: "remote".to_string(),
-            cwd,
-            workspace_roots: Vec::new(),
-            config: EnvironmentConfigState::Ready(environment_config),
-        },
-        environment.config_origin,
-        environment.environment,
-        environment.shell,
-    ));
+    turn_context.initial_environments.environments[0] =
+        TurnEnvironmentState::Ready(TurnEnvironment::new(
+            TurnEnvironmentSelection {
+                environment_id: "remote".to_string(),
+                cwd,
+                workspace_roots: Vec::new(),
+                config: EnvironmentConfigState::Ready(environment_config),
+            },
+            environment.config_origin,
+            environment.environment,
+            environment.shell,
+        ));
 
     #[allow(deprecated)]
     let local_cwd = turn_context.cwd.clone();
@@ -9944,7 +10104,8 @@ async fn turn_context_item_omits_legacy_equivalent_file_system_sandbox_policy() 
 async fn turn_context_item_stores_active_permission_profile() {
     let (_session, mut turn_context) = make_session_and_context().await;
     let active_permission_profile = ActivePermissionProfile::read_only();
-    let TurnEnvironmentState::Ready(environment) = &mut turn_context.environments.environments[0]
+    let TurnEnvironmentState::Ready(environment) =
+        &mut turn_context.initial_environments.environments[0]
     else {
         panic!("turn environment should be ready");
     };
@@ -9971,7 +10132,8 @@ async fn turn_context_item_stores_split_file_system_sandbox_policy_when_differen
         &file_system_sandbox_policy,
         turn_context.network_sandbox_policy(),
     );
-    let TurnEnvironmentState::Ready(environment) = &mut turn_context.environments.environments[0]
+    let TurnEnvironmentState::Ready(environment) =
+        &mut turn_context.initial_environments.environments[0]
     else {
         panic!("turn environment should be ready");
     };
@@ -10150,7 +10312,8 @@ async fn record_context_updates_and_set_reference_context_item_persists_split_fi
         &file_system_sandbox_policy,
         turn_context.network_sandbox_policy(),
     );
-    let TurnEnvironmentState::Ready(environment) = &mut turn_context.environments.environments[0]
+    let TurnEnvironmentState::Ready(environment) =
+        &mut turn_context.initial_environments.environments[0]
     else {
         panic!("turn environment should be ready");
     };
@@ -10250,13 +10413,14 @@ async fn build_initial_context_uses_retained_step_after_model_change() {
         .as_mut()
         .unwrap()
         .instructions_template = Some("B instructions".to_string());
-    turn_context
-        .current_settings
-        .store(Arc::new(ResolvedStepSettings::new(
+    turn_context.next_step_input.store(Arc::new(StepInputs {
+        settings: Arc::new(ResolvedStepSettings::new(
             Arc::new(selected_b),
             Arc::new(model_b),
             /*fast_mode_enabled*/ false,
-        )));
+        )),
+        environments: step_a.environments.clone(),
+    }));
     let step_b = session
         .capture_step_context(Arc::clone(&turn_context), &CancellationToken::new())
         .await
@@ -11323,7 +11487,10 @@ async fn task_finish_emits_turn_item_lifecycle_for_leftover_pending_user_input()
 
     let mut current = tc.initial_settings.as_ref().clone();
     Arc::make_mut(&mut current.model_info).supports_image_detail_original = true;
-    tc.current_settings.store(Arc::new(current));
+    tc.next_step_input.store(Arc::new(StepInputs {
+        settings: Arc::new(current),
+        environments: tc.next_step_input.load().environments.clone(),
+    }));
 
     sess.on_task_finished(Arc::clone(&tc), /*task_result*/ Ok(None))
         .await;

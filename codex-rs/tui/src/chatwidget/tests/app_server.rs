@@ -69,6 +69,39 @@ fn configured_thread_session(thread_id: ThreadId) -> crate::session_state::Threa
 }
 
 #[tokio::test]
+async fn session_header_uses_catalog_display_name_without_changing_model() {
+    let slug = "us.openai.gpt-5.6-luna";
+    for (name, first_event, display_name) in [
+        ("startup", true, Some("GPT-5.6 Luna")),
+        ("resume", false, Some("GPT-5.6 Luna")),
+        ("unknown_model", false, None),
+    ] {
+        let (mut chat, mut events, _ops) = make_chatwidget_manual(Some(slug)).await;
+        let mut preset = get_available_model(&chat, "gpt-5.5");
+        preset.model = slug.to_string();
+        preset.display_name = display_name.unwrap_or_default().to_string();
+        chat.model_catalog = Arc::new(ModelCatalog::new(
+            display_name.map(|_| preset).into_iter().collect(),
+        ));
+        chat.show_welcome_banner = first_event;
+        chat.local_settings.tui.show_tooltips = false;
+        let mut session = configured_thread_session(ThreadId::new());
+        session.model = slug.to_string();
+        session.reasoning_effort = Some(ReasoningEffortConfig::High);
+        chat.handle_thread_session(session);
+
+        let rendered = drain_insert_history_with(&mut events, HistoryCell::raw_lines)
+            .iter()
+            .map(|lines| lines_to_single_string(lines))
+            .collect::<String>()
+            .replace(CODEX_CLI_VERSION, "<VERSION>")
+            .replace("C:\\tmp\\thread-settings", "/tmp/thread-settings");
+        assert_chatwidget_snapshot!(format!("catalog_model_session_header_{name}"), rendered);
+        assert_eq!(chat.current_model(), slug);
+    }
+}
+
+#[tokio::test]
 async fn session_and_settings_sync_server_provider_id() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.2")).await;
     chat.config.model_provider.base_url = Some("https://local-provider.example/v1".to_string());
@@ -826,11 +859,11 @@ async fn live_app_server_turn_completed_clears_working_status_after_answer_item(
         /*replay_kind*/ None,
     );
 
-    let completion_cells = drain_insert_history(&mut rx)
+    let completion_cells = drain_insert_history_normalized(&mut rx)
         .iter()
-        .map(|lines| normalize_completion_timestamps(lines_to_single_string(lines).trim()))
+        .map(|lines| lines_to_single_string(lines).trim().to_string())
         .collect::<Vec<_>>();
-    assert_eq!(completion_cells, vec!["done [completion time]"]);
+    assert_eq!(completion_cells, vec!["[completion time]"]);
     assert!(!chat.bottom_pane.is_task_running());
     assert!(chat.bottom_pane.status_widget().is_none());
     assert_eq!(

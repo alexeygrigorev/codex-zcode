@@ -102,6 +102,9 @@ impl ChatWidget {
     /// avoid triggering side effects. Event ids are passed as `None` to
     /// distinguish replayed events from live ones.
     pub(crate) fn replay_thread_turns(&mut self, turns: Vec<Turn>, replay_kind: ReplayKind) {
+        if !turns.is_empty() || matches!(replay_kind, ReplayKind::ThreadSnapshot) {
+            self.bottom_pane.dismiss_composer_sparkle();
+        }
         if matches!(replay_kind, ReplayKind::ThreadSnapshot) && !turns.is_empty() {
             self.warning_display_state.startup_complete = true;
         }
@@ -257,6 +260,15 @@ impl ChatWidget {
             ThreadItem::UserMessage {
                 content, client_id, ..
             } => {
+                if let Some(replies) = crate::async_question_reply::parse_input(&content) {
+                    let ids = replies
+                        .into_iter()
+                        .map(|reply| reply.question_item_id)
+                        .collect::<Vec<_>>();
+                    self.bottom_pane.question_editor().resolve_answers(&ids);
+                    self.refresh_pending_input_preview();
+                    self.request_redraw();
+                }
                 self.on_committed_user_message(
                     &content,
                     client_id.as_deref(),

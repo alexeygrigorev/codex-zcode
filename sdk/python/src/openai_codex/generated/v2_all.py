@@ -6179,6 +6179,12 @@ class Tool(BaseModel):
     title: str | None = None
 
 
+class ToolExposureSurface(Enum):
+    code_mode = "code_mode"
+    deferred = "deferred"
+    direct = "direct"
+
+
 class TurnDiffUpdatedNotification(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -6586,6 +6592,10 @@ class AppConfig(BaseModel):
     enabled: bool | None = True
     links: Annotated[
         AppLinksConfig | None, Field(description="Per-account approval settings keyed by link ID.")
+    ] = None
+    omit_tools_from: Annotated[
+        list[ToolExposureSurface] | None,
+        Field(description="Additional model-facing surfaces omitted for this connector's tools."),
     ] = None
     open_world_enabled: bool | None = None
     tools: AppToolsConfig | None = None
@@ -11442,9 +11452,6 @@ class ConfigRequirements(BaseModel):
     ] = None
     models: ModelsRequirements | None = None
     sqlite_home: Annotated[str | None, Field(alias="sqliteHome")] = None
-    windows_sandbox_private_desktop: Annotated[
-        bool | None, Field(alias="windowsSandboxPrivateDesktop")
-    ] = None
 
 
 class ConfigRequirementsReadResponse(BaseModel):
@@ -11564,6 +11571,13 @@ class PluginDetail(BaseModel):
     marketplace_name: Annotated[str, Field(alias="marketplaceName")]
     marketplace_path: Annotated[AbsolutePathBuf | None, Field(alias="marketplacePath")] = None
     mcp_servers: Annotated[list[str], Field(alias="mcpServers")]
+    onboarding_skill: Annotated[
+        SkillSummary | None,
+        Field(
+            alias="onboardingSkill",
+            description="The declared onboarding skill, when the plugin and visible skill are enabled.",
+        ),
+    ] = None
     scheduled_tasks: Annotated[list[ScheduledTaskSummary] | None, Field(alias="scheduledTasks")] = (
         None
     )

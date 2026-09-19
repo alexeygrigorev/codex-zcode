@@ -71,6 +71,11 @@ async fn connected_trust_cancellation_and_acceptance_control_task_creation() -> 
                         methods.lock().unwrap().push(request.method.clone());
                         let result = match request.method.as_str() {
                             "initialize" => json!({"userAgent": "trust-pty"}),
+                            "experimentalFeature/list" => json!({"data": (["code_mode_host", "auth_elicitation"].map(|name| json!({
+                                "name": name, "stage": "stable", "displayName": null,
+                                "description": null, "announcement": null,
+                                "enabled": true, "defaultEnabled": true,
+                            }))), "nextCursor": null}),
                             "account/read" => {
                                 json!({"account": {"type": "apiKey"}, "requiresOpenaiAuth": false})
                             }
@@ -157,7 +162,7 @@ async fn connected_trust_cancellation_and_acceptance_control_task_creation() -> 
             ("Launch-folder task", b"\x1b[Bn"),
             (prompt, b"\x1b"),
             ("n new", b"n"),
-            ("You are in", b"\x1b"),
+            ("Folder access", b"\x1b"),
             ("o resume", b"o"),
             ("Resume a previous session", b"\x1b[C"),
             ("Untrusted saved task", b"\r"),
@@ -169,16 +174,18 @@ async fn connected_trust_cancellation_and_acceptance_control_task_creation() -> 
             let is_consent = expected == prompt
                 || matches!(
                     expected,
-                    "Open existing task" | "moved-folder" | "You are in"
+                    "Open existing task" | "moved-folder" | "Folder access"
                 );
             terminal.wait_for_screen(expected)?;
-            if expected == "You are in" {
+            if expected == "Folder access" {
                 assert_eq!(
                     terminal
                         .screen_contents()
                         .lines()
-                        .find(|line| line.contains("You are in")),
-                    Some(format!("> You are in {}", repo_root.display()).as_str())
+                        .skip_while(|line| line.trim() != "Folder access")
+                        .nth(/*n*/ 1)
+                        .map(str::trim),
+                    Some(repo_root.display().to_string().as_str())
                 );
             }
             if is_consent {

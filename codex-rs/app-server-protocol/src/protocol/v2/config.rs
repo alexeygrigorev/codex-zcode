@@ -12,6 +12,7 @@ use codex_experimental_api_macros::ExperimentalApi;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::config_types::ForcedLoginMethod;
 use codex_protocol::config_types::ReasoningSummary;
+use codex_protocol::config_types::ToolExposureSurface;
 use codex_protocol::config_types::Verbosity;
 use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::config_types::WebSearchToolConfig;
@@ -234,6 +235,8 @@ pub struct AppLinksConfig {
 pub struct AppConfig {
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+    /// Additional model-facing surfaces omitted for this connector's tools.
+    pub omit_tools_from: Option<Vec<ToolExposureSurface>>,
     pub approvals_reviewer: Option<ApprovalsReviewer>,
     pub destructive_enabled: Option<bool>,
     pub open_world_enabled: Option<bool>,
@@ -453,7 +456,6 @@ pub struct ConfigRequirements {
     pub check_for_update_on_startup: Option<bool>,
     pub allow_login_shell: Option<bool>,
     pub feedback: Option<FeedbackRequirements>,
-    pub windows_sandbox_private_desktop: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]

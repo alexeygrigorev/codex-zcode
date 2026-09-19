@@ -189,7 +189,7 @@ impl App {
                 self.reconnect.seen_version_notice = None;
                 self.update_server_version_overview_notice(
                     CODEX_CLI_VERSION,
-                    /*older_server*/ None,
+                    /*server_version*/ None,
                 );
             }
             self.cancel_pending_key_chord();
@@ -217,8 +217,10 @@ impl App {
                 }
                 ReconnectPresentation::Overview
             } else {
-                self.chat_widget
-                    .handle_disconnected_key(KeyEvent::new(KeyCode::Null, KeyModifiers::NONE));
+                self.chat_widget.handle_restricted_key(
+                    KeyEvent::new(KeyCode::Null, KeyModifiers::NONE),
+                    RestrictedInputMode::Disconnected,
+                );
                 ReconnectPresentation::Conversation
             };
             self.chat_widget.pause_for_disconnect();
@@ -490,7 +492,10 @@ impl App {
             || self.reconnect.seen_version_notice != connected_notice_key
         {
             self.reconnect.seen_version_notice = None;
-            self.update_server_version_overview_notice(client_version, /*older_server*/ None);
+            self.update_server_version_overview_notice(
+                client_version,
+                /*server_version*/ None,
+            );
         }
         if let Some((notice, key)) = crate::status::remote_connection::pending_server_version_notice(
             &self.local_settings.tui,

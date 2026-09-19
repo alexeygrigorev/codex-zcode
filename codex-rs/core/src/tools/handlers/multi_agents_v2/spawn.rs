@@ -2,11 +2,11 @@ use super::*;
 use crate::agent::child_config::SpawnConfigOptions;
 use crate::agent::child_config::SpawnConfigVersion;
 use crate::agent::child_config::prepare_agent_spawn_config;
-use crate::agent::control::MessageDeliveryMode;
-use crate::agent::control::SpawnAgentForkMode;
-use crate::agent::control::SpawnAgentOptions;
 use crate::agent::next_thread_spawn_depth;
 use crate::agent::role::DEFAULT_ROLE_NAME;
+use crate::agent::types::MessageDeliveryMode;
+use crate::agent::types::SpawnAgentForkMode;
+use crate::agent::types::SpawnAgentOptions;
 use crate::agent_communication::AgentCommunicationContext;
 use crate::agent_communication::AgentCommunicationKind;
 use crate::codex_thread::ThreadConfigSnapshot;
@@ -16,6 +16,7 @@ use crate::tools::handlers::multi_agents_spec::SpawnAgentToolOptions;
 use crate::tools::handlers::multi_agents_spec::create_spawn_agent_tool_v2;
 use crate::tools::handlers::multi_agents_v2::message_tool::message_content;
 use crate::turn_timing::now_unix_timestamp_ms;
+use codex_prompts::ResolvedModelMessages;
 use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::MultiAgentVersion;
@@ -24,11 +25,18 @@ use codex_tools::ToolSpec;
 #[derive(Default)]
 pub(crate) struct Handler {
     options: SpawnAgentToolOptions,
+    description_override: Option<String>,
 }
 
 impl Handler {
-    pub(crate) fn new(options: SpawnAgentToolOptions) -> Self {
-        Self { options }
+    pub(crate) fn new(
+        options: SpawnAgentToolOptions,
+        description_override: Option<String>,
+    ) -> Self {
+        Self {
+            options,
+            description_override,
+        }
     }
 }
 
@@ -38,7 +46,7 @@ impl ToolExecutor<ToolInvocation> for Handler {
     }
 
     fn spec(&self) -> ToolSpec {
-        create_spawn_agent_tool_v2(self.options.clone())
+        create_spawn_agent_tool_v2(self.options.clone(), self.description_override.as_deref())
     }
 
     fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
@@ -128,7 +136,7 @@ async fn handle_spawn_agent(
     let child_depth = next_thread_spawn_depth(&session_source);
     let prepared = prepare_agent_spawn_config(
         &session,
-        turn.as_ref(),
+        step_context.as_ref(),
         SpawnConfigOptions {
             version: SpawnConfigVersion::V2,
             full_history_fork: matches!(fork_mode, Some(SpawnAgentForkMode::FullHistory)),
@@ -176,16 +184,13 @@ async fn handle_spawn_agent(
                 ),
                 _ => None,
             };
-            let child_catalog = child_model_info
-                .as_ref()
-                .unwrap_or(turn.model_info())
-                .model_messages
-                .as_ref()
-                .and_then(|messages| messages.multi_agent.as_ref())
-                .and_then(|messages| messages.role.as_ref());
+            let child_multi_agent_messages = ResolvedModelMessages::from_model(
+                child_model_info.as_ref().unwrap_or(turn.model_info()),
+            )
+            .multi_agent();
             Some(resolve_usage_hints(
                 &config.multi_agent_v2,
-                child_catalog,
+                child_multi_agent_messages,
                 !config.update_plan_enabled && config.model_catalog.is_none(),
             ))
         } else {

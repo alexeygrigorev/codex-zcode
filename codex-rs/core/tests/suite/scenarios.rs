@@ -68,6 +68,9 @@ use tokio::sync::oneshot;
 
 const ONE_PIXEL_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
 
+#[path = "scenarios_shared_instructions.rs"]
+mod shared_instructions;
+
 fn skills_extensions() -> Arc<ExtensionRegistry<Config>> {
     let mut extensions = ExtensionRegistryBuilder::<Config>::new();
     install(&mut extensions, |config: &Config| SkillsExtensionConfig {
@@ -277,7 +280,8 @@ async fn astra_asks_an_async_question_and_receives_the_answer_while_working() ->
     })
     .await;
 
-    let answer = format!("{}Customers", AnsweredQuestion::new(question).render());
+    let question_id = json!(["request_user_input_async", "audience-question", 0]).to_string();
+    let answer = AnsweredQuestion::new(&question_id, question, "Customers").render();
     test.codex
         .steer_turn(TurnInputRequest::user_input(vec![text(&answer)]), turn_id)
         .await?;
@@ -527,6 +531,69 @@ async fn astra_omits_disabled_executor_skills_from_model_context() -> Result<()>
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn multi_agent_catalog_parameters() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let test = test_codex()
+        .with_config(|config| {
+            configure_scenario_catalog(config);
+            config.workspace_roots = vec![config.cwd.clone()];
+        })
+        .with_model_info_override("gpt-6-astra", |model| {
+            model.model_messages.as_mut().expect("model messages").tools = Some(
+                serde_json::from_value(json!({"multi_agent": {"list_agents": {
+                    "parameters": json!({
+                        "type": "object",
+                        "properties": {"path_prefix": {
+                            "type": "string",
+                            "description": "Inspect agents within this task path.",
+                            "minLength": 1,
+                            "maxLength": 128,
+                        }},
+                        "required": ["path_prefix"],
+                        "additionalProperties": false,
+                    }).to_string(),
+                }}}))
+                .expect("catalog tool messages"),
+            );
+        })
+        .build_with_auto_env(&server)
+        .await?;
+    let mock = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("agents-response"),
+                ev_function_call_with_namespace(
+                    "agents-call",
+                    "collaboration",
+                    "list_agents",
+                    r#"{"path_prefix":"/root"}"#,
+                ),
+                ev_completed("agents-response"),
+            ]),
+            sse(vec![
+                ev_assistant_message("final", "Only the root agent is working on this task."),
+                ev_completed("final-response"),
+            ]),
+        ],
+    )
+    .await;
+    test.submit_turn("Check which agents are working under /root before delegating more work.")
+        .await?;
+    insta::assert_snapshot!(
+        "multi_agent_catalog_parameters",
+        context_snapshot::format_request_history_snapshot(
+            "Astra calls list_agents using the selected catalog parameter schema.",
+            &mock.requests(),
+            &ContextSnapshotOptions::default().include_request_settings(),
+        )
+    );
+    Ok(())
+}
+
 #[cfg_attr(windows, ignore = "the fixture uses a Unix shell command")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn astra_settings_release_check_with_direct_and_code_mode_tools() -> Result<()> {
@@ -636,6 +703,70 @@ text(`MCP: ${ping.structuredContent?.echo ?? "missing"}`);"#,
             "Astra checks a Settings release using direct collaboration and Code Mode tools.",
             &mock.requests(),
             &ContextSnapshotOptions::default().include_request_settings(),
+        )
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn astra_reads_code_mode_call_timing() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = start_mock_server().await;
+    let test = test_codex()
+        .with_model("gpt-6-astra")
+        .with_config(|config| {
+            configure_scenario_catalog(config);
+            // Use the selected cwd as the workspace root on local and remote executors.
+            config.workspace_roots = vec![config.cwd.clone()];
+            config.code_mode.experimental_show_cell_overhead = true;
+            config
+                .features
+                .enable(Feature::CodeMode)
+                .expect("enable code mode");
+            config
+                .features
+                .enable(Feature::CodeModeOnly)
+                .expect("enable code-mode-only tools");
+            config
+                .features
+                .enable(Feature::CodeModeHost)
+                .expect("enable the code-mode host");
+        })
+        .build_with_auto_env(&server)
+        .await?;
+    let mock = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("exec-response"),
+                ev_custom_tool_call("exec-call", "exec", "text('ready');"),
+                ev_completed("exec-response"),
+            ]),
+            sse(vec![
+                ev_response_created("wait-response"),
+                ev_function_call_with_namespace(
+                    "wait-call",
+                    "functions",
+                    "wait",
+                    r#"{"cell_id":"missing"}"#,
+                ),
+                ev_completed("wait-response"),
+            ]),
+            sse(vec![
+                ev_assistant_message("final", "The call completed; the missing-cell wait failed."),
+                ev_completed("final-response"),
+            ]),
+        ],
+    )
+    .await;
+    test.submit_turn("Run a code cell, then inspect its timing and a failed wait.")
+        .await?;
+    insta::assert_snapshot!(
+        "astra_code_mode_call_timing",
+        context_snapshot::format_request_history_snapshot(
+            "Astra receives host and handler timings on completed and failed code-mode calls.",
+            &mock.requests(),
+            &ContextSnapshotOptions::default(),
         )
     );
     Ok(())
@@ -757,6 +888,30 @@ async fn astra_refreshes_plugin_tools_and_skills_in_an_existing_thread() -> Resu
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn subagent_browser_auth_returns_handoff_without_prompting() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    skip_if_wine_exec!(Ok(()), "the MCP fixture requires a host Python interpreter");
+    use super::mcp_subagent_elicitation::Caller;
+    use super::mcp_subagent_elicitation::RequestKind;
+    use super::mcp_subagent_elicitation::mcp_server_elicitation_scenario;
+
+    let requests =
+        mcp_server_elicitation_scenario(Caller::Subagent, RequestKind::BrowserAuth).await?;
+    let snapshot = context_snapshot::format_request_history_snapshot(
+        "An MCP browser sign-in request fails in a subagent without prompting the user; the next model request contains guidance to ask the parent.",
+        &requests,
+        &ContextSnapshotOptions::default()
+            .rewrite_known_segments()
+            .include_request_settings(),
+    );
+    let snapshot = regex_lite::Regex::new(r"Wall time: [0-9]+(?:\.[0-9]+)? seconds")?
+        .replace_all(&snapshot, "Wall time: <DURATION> seconds")
+        .into_owned();
+    insta::assert_snapshot!("subagent_browser_auth_handoff", snapshot);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn guardian_checkpoint_migration_request_history() -> Result<()> {
     skip_if_no_network!(Ok(()));
     use super::guardian_checkpoint_migration::migration_scenario;
@@ -781,5 +936,26 @@ async fn guardian_checkpoint_migration_request_history() -> Result<()> {
             .into_owned();
     }
     insta::assert_snapshot!("guardian_checkpoint_migration", snapshot);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn app_tool_exposure_request_history() -> Result<()> {
+    let requests = super::app_tool_exposure::connector_exposure_requests(
+        super::app_tool_exposure::ExposureCase::non_deferred(
+            codex_protocol::openai_models::ToolMode::CodeModeOnly,
+        ),
+    )
+    .await?;
+    insta::assert_snapshot!(
+        "app_tool_exposure_CodeModeOnly",
+        context_snapshot::format_request_history_snapshot(
+            "A non-deferred connector is called through code mode while another connector stays deferred.",
+            &requests,
+            &ContextSnapshotOptions::default()
+                .rewrite_known_segments()
+                .include_request_settings(),
+        )
+    );
     Ok(())
 }

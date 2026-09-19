@@ -142,6 +142,8 @@ pub(crate) use footer::GoalStatusIndicator;
 pub(crate) use footer::goal_status_indicator_line;
 pub(crate) use list_selection_view::ColumnWidthMode;
 pub(crate) use list_selection_view::ListSelectionView;
+pub(crate) use list_selection_view::OnSelectionChangedCallback;
+pub(crate) use list_selection_view::PickerSurface;
 pub(crate) use list_selection_view::SelectionDescriptionLayout;
 pub(crate) use list_selection_view::SelectionRowDisplay;
 pub(crate) use list_selection_view::SelectionToggle;
@@ -150,6 +152,7 @@ pub(crate) use list_selection_view::SideContentWidth;
 pub(crate) use list_selection_view::popup_content_width;
 pub(crate) use list_selection_view::side_by_side_layout_widths;
 pub(crate) use memories_settings_view::MemoriesSettingsView;
+pub(crate) use picker_style::selection_style;
 use slash_commands::ServiceTierCommand;
 mod feedback_note_view;
 mod feedback_view;
@@ -173,9 +176,19 @@ pub(crate) use title_setup::preview_line_for_title_items;
 mod paste_burst;
 mod pending_input_preview;
 mod pending_thread_approvals;
+mod picker_option;
+mod picker_presets;
+mod picker_rows;
+pub(crate) use picker_option::picker_option_list;
+pub(crate) use picker_option::picker_option_row;
+mod picker_style;
+pub(crate) use picker_style::active_tab_style;
 pub(crate) mod popup_consts;
 mod scroll_state;
+mod selection_picker_layout;
 mod selection_popup_common;
+pub(crate) use selection_popup_common::menu_surface_padding_height;
+pub(crate) use selection_popup_common::render_menu_surface;
 mod selection_row_layout;
 mod selection_tabs;
 mod startup;
@@ -220,6 +233,7 @@ pub(crate) use chat_composer::ChatComposerConfig;
 pub(crate) use chat_composer::ComposerDraftSnapshot;
 pub(crate) use chat_composer::InputResult;
 pub(crate) use chat_composer::QueuedInputAction;
+pub(crate) use chat_composer::RestrictedInputMode;
 pub(crate) use chat_composer_history::HistoryEntry;
 pub(crate) use textarea::KillBufferSnapshot;
 
@@ -721,14 +735,19 @@ impl BottomPane {
         self.push_view(Box::new(modal));
     }
 
-    /// Edit the draft without invoking popups, submissions, or remote actions.
-    pub(crate) fn handle_disconnected_key(&mut self, key: KeyEvent) {
+    /// Preserve restricted drafts, allowing recovery commands only for connected unavailable threads.
+    pub(crate) fn handle_restricted_key(
+        &mut self,
+        key: KeyEvent,
+        mode: RestrictedInputMode,
+    ) -> InputResult {
         self.view_stack.clear();
         self.delayed_approval_requests.clear();
         self.composer
             .set_input_enabled(/*enabled*/ true, /*placeholder*/ None);
-        self.composer.handle_disconnected_key(key);
+        let result = self.composer.handle_restricted_key(key, mode);
         self.request_redraw();
+        result
     }
 
     /// Forward a key event to the active view or the composer.
@@ -1319,7 +1338,7 @@ impl BottomPane {
         if params.footer_hint.is_none()
             || params.footer_hint.as_ref() == Some(&popup_consts::standard_popup_hint_line())
         {
-            params.footer_hint = Some(self.standard_popup_hint_line());
+            params.footer_hint = Some(popup_consts::picker_hint_line_for_keymap(&self.keymap.list));
         }
     }
 
@@ -1377,10 +1396,6 @@ impl BottomPane {
         }
         self.request_redraw();
         true
-    }
-
-    pub(crate) fn standard_popup_hint_line(&self) -> Line<'static> {
-        popup_consts::standard_popup_hint_line_for_keymap(&self.keymap.list)
     }
 
     pub(crate) fn replace_view_if_present(
@@ -2188,6 +2203,8 @@ impl Renderable for BottomPane {
 mod tests {
     #[path = "actionable_banner_tests.rs"]
     mod actionable_banner_tests;
+    #[path = "picker_hint_tests.rs"]
+    mod picker_hint_tests;
 
     use super::*;
     use crate::app::app_server_requests::ResolvedAppServerRequest;
@@ -2626,7 +2643,10 @@ mod tests {
         assert_eq!(pane.composer_text(), "ya");
         assert!(pane.view_stack.is_empty());
         assert_eq!(pane.delayed_approval_requests.len(), 1);
-        pane.handle_disconnected_key(KeyEvent::new(KeyCode::Null, KeyModifiers::NONE));
+        pane.handle_restricted_key(
+            KeyEvent::new(KeyCode::Null, KeyModifiers::NONE),
+            RestrictedInputMode::Disconnected,
+        );
         pane.pre_draw_tick_at(Instant::now() + APPROVAL_PROMPT_TYPING_IDLE_DELAY);
         pane.handle_paste(" kept".into());
         assert_eq!(pane.composer_text(), "ya kept");

@@ -512,7 +512,7 @@ impl ChatWidget {
             subtitle: Some(format!("Switch to {switch_model} for lower credit usage?")),
             footer_hint: Some(standard_popup_hint_line()),
             items,
-            ..Default::default()
+            ..SelectionViewParams::picker()
         });
     }
 

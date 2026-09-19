@@ -2043,6 +2043,7 @@ dependencies = [
  "codex-network-proxy",
  "codex-otel",
  "codex-plugin",
+ "codex-prompts",
  "codex-protocol",
  "codex-queue-extension",
  "codex-rmcp-client",
@@ -2302,6 +2303,7 @@ name = "codex-async-utils"
 version = "0.0.0"
 dependencies = [
  "pretty_assertions",
+ "rand 0.9.3",
  "tokio",
  "tokio-util",
 ]
@@ -2313,6 +2315,7 @@ dependencies = [
  "pretty_assertions",
  "serde",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -2491,6 +2494,7 @@ dependencies = [
  "tracing-subscriber",
  "unicode-segmentation",
  "url",
+ "vt100",
  "which 8.0.0",
  "windows-sys 0.52.0",
  "wiremock",
@@ -2517,6 +2521,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "codex-agent-identity",
+ "codex-async-utils",
  "codex-backend-client",
  "codex-config",
  "codex-core",
@@ -2728,6 +2733,7 @@ dependencies = [
  "codex-protocol",
  "codex-utils-string",
  "pretty_assertions",
+ "serde_json",
 ]
 
 [[package]]
@@ -3005,6 +3011,7 @@ dependencies = [
  "codex-shell-command",
  "codex-test-binary-support",
  "codex-utils-absolute-path",
+ "codex-utils-cargo-bin",
  "codex-utils-home-dir",
  "codex-utils-path-uri",
  "codex-utils-pty",
@@ -3106,6 +3113,7 @@ dependencies = [
  "codex-config",
  "codex-context-fragments",
  "codex-exec-server-protocol",
+ "codex-file-system",
  "codex-history",
  "codex-mcp",
  "codex-protocol",
@@ -3190,6 +3198,7 @@ dependencies = [
  "mime_guess",
  "pretty_assertions",
  "sentry",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -3284,6 +3293,7 @@ dependencies = [
  "codex-core",
  "codex-extension-api",
  "codex-otel",
+ "codex-prompts",
  "codex-protocol",
  "codex-rollout",
  "codex-state",
@@ -3320,6 +3330,7 @@ dependencies = [
  "codex-guardian-context",
  "codex-mcp",
  "codex-otel",
+ "codex-prompts",
  "codex-protocol",
  "opentelemetry",
  "opentelemetry_sdk",
@@ -3341,6 +3352,7 @@ dependencies = [
  "codex-analytics",
  "codex-api",
  "codex-config",
+ "codex-context-fragments",
  "codex-core",
  "codex-extension-api",
  "codex-features",
@@ -3351,6 +3363,7 @@ dependencies = [
  "codex-login",
  "codex-model-provider",
  "codex-model-provider-info",
+ "codex-prompts",
  "codex-protocol",
  "core_test_support",
  "dirs",
@@ -3666,6 +3679,7 @@ dependencies = [
  "codex-protocol",
  "codex-utils-absolute-path",
  "codex-utils-path-uri",
+ "core_test_support",
  "futures",
  "pretty_assertions",
  "serde_json",
@@ -3674,6 +3688,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "wiremock",
 ]
 
 [[package]]
@@ -3779,12 +3794,14 @@ dependencies = [
  "codex-aws-auth",
  "codex-feedback",
  "codex-http-client",
+ "codex-keyring-store",
  "codex-login",
  "codex-model-provider-info",
  "codex-models-manager",
  "codex-otel",
  "codex-protocol",
  "codex-response-debug-context",
+ "codex-secrets",
  "codex-utils-redacted-string",
  "http 1.4.0",
  "pretty_assertions",
@@ -3813,6 +3830,7 @@ dependencies = [
  "serde",
  "tempfile",
  "toml 0.9.11+spec-1.1.0",
+ "url",
 ]
 
 [[package]]
@@ -3820,10 +3838,10 @@ name = "codex-models-manager"
 version = "0.0.0"
 dependencies = [
  "chrono",
- "codex-collaboration-mode-templates",
  "codex-http-client",
  "codex-login",
  "codex-otel",
+ "codex-prompts",
  "codex-protocol",
  "codex-utils-output-truncation",
  "pretty_assertions",
@@ -3866,6 +3884,7 @@ dependencies = [
  "clap",
  "codex-utils-absolute-path",
  "codex-utils-home-dir",
+ "codex-utils-path-uri",
  "codex-utils-rustls-provider",
  "codex-windows-sandbox",
  "globset",
@@ -3890,6 +3909,7 @@ dependencies = [
  "schemars 0.8.22",
  "security-framework 3.5.1",
  "serde",
+ "serde_ignored",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
@@ -3897,6 +3917,7 @@ dependencies = [
  "time",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "url",
  "windows-sys 0.52.0",
 ]
@@ -3992,13 +4013,16 @@ name = "codex-prompts"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "codex-collaboration-mode-templates",
  "codex-context-fragments",
  "codex-execpolicy",
  "codex-git-utils",
+ "codex-guardian-context",
  "codex-protocol",
  "codex-utils-absolute-path",
  "codex-utils-template",
  "pretty_assertions",
+ "tracing",
 ]
 
 [[package]]
@@ -4490,6 +4514,7 @@ dependencies = [
  "clap",
  "codex-ansi-escape",
  "codex-app-server-client",
+ "codex-app-server-daemon",
  "codex-app-server-protocol",
  "codex-arg0",
  "codex-backend-client",
@@ -4509,6 +4534,7 @@ dependencies = [
  "codex-install-context",
  "codex-login",
  "codex-mcp",
+ "codex-mermaid",
  "codex-message-history",
  "codex-model-provider",
  "codex-model-provider-info",
@@ -4562,6 +4588,7 @@ dependencies = [
  "ratatui-macros",
  "regex-lite",
  "rmcp",
+ "semver",
  "serde",
  "serde_json",
  "serial_test",
@@ -4579,6 +4606,7 @@ dependencies = [
  "tokio-tungstenite",
  "tokio-util",
  "toml 0.9.11+spec-1.1.0",
+ "toml_edit 0.24.0+spec-1.1.0",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
@@ -4821,6 +4849,7 @@ dependencies = [
  "portable-pty",
  "pretty_assertions",
  "shared_library",
+ "tempfile",
  "tokio",
  "winapi",
 ]

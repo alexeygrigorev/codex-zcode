@@ -42,13 +42,14 @@ impl ChatWidget {
     pub(super) fn model_menu_header(&self, title: &str, subtitle: &str) -> Box<dyn Renderable> {
         let title = title.to_string();
         let subtitle = subtitle.to_string();
-        let mut header = ColumnRenderable::new();
-        header.push(Line::from(title.bold()));
-        header.push(Line::from(subtitle.dim()));
+        let mut header = vec![Line::from(title.bold())];
+        if !subtitle.is_empty() {
+            header.push(Line::from(subtitle.dim()));
+        }
         if let Some(warning) = self.model_menu_warning_line() {
             header.push(warning);
         }
-        Box::new(header)
+        Box::new(Paragraph::new(header).wrap(Wrap { trim: false }))
     }
 
     fn model_menu_warning_line(&self) -> Option<Line<'static>> {
@@ -92,7 +93,7 @@ impl ChatWidget {
         let current_label = presets
             .iter()
             .find(|preset| preset.model.as_str() == current_model)
-            .map(|preset| preset.model.to_string())
+            .map(|preset| preset.display_name.clone())
             .unwrap_or_else(|| self.model_display_name().to_string());
 
         let (mut auto_presets, other_presets): (Vec<ModelPreset>, Vec<ModelPreset>) = presets
@@ -105,6 +106,10 @@ impl ChatWidget {
         }
 
         auto_presets.sort_by_key(|preset| Self::auto_model_order(&preset.model));
+        let mut model_ids: Vec<String> = auto_presets
+            .iter()
+            .map(|preset| preset.model.clone())
+            .collect();
         let mut items: Vec<SelectionItem> = auto_presets
             .into_iter()
             .map(|preset| {
@@ -137,7 +142,7 @@ impl ChatWidget {
                     )
                 };
                 SelectionItem {
-                    name: model.clone(),
+                    name: preset.display_name.clone(),
                     description,
                     is_current: model.as_str() == current_model,
                     is_default: preset.is_default,
@@ -158,6 +163,7 @@ impl ChatWidget {
             .collect();
 
         if !other_presets.is_empty() {
+            model_ids.push("All models".to_string());
             let actions: Vec<SelectionAction> = vec![Box::new(|tx| {
                 tx.send(AppEvent::OpenAllModelsPopup);
             })];
@@ -181,13 +187,15 @@ impl ChatWidget {
             "Select Model",
             "Pick a quick auto mode or browse all models.",
         );
-        self.show_model_selection_view(SelectionViewParams {
-            view_id: Some(MODEL_SELECTION_VIEW_ID),
-            footer_hint: Some(standard_popup_hint_line()),
-            items,
-            header,
-            ..Default::default()
-        });
+        self.show_model_selection_view(
+            model_ids,
+            SelectionViewParams {
+                view_id: Some(MODEL_SELECTION_VIEW_ID),
+                items,
+                header,
+                ..SelectionViewParams::picker()
+            },
+        );
     }
 
     pub(super) fn is_auto_model(model: &str) -> bool {
@@ -236,6 +244,7 @@ impl ChatWidget {
         }
 
         let mut items: Vec<SelectionItem> = Vec::new();
+        let model_ids = presets.iter().map(|preset| preset.model.clone()).collect();
         for preset in presets.into_iter() {
             let description =
                 (!preset.description.is_empty()).then_some(preset.description.to_string());
@@ -255,7 +264,7 @@ impl ChatWidget {
                 });
             })];
             items.push(SelectionItem {
-                name: preset.model.clone(),
+                name: preset.display_name.clone(),
                 description,
                 is_current,
                 is_default: preset.is_default,
@@ -269,17 +278,16 @@ impl ChatWidget {
             });
         }
 
-        let header = self.model_menu_header(
-            "Select Model and Effort",
-            "Access legacy models by running codex -m <model_name> or in your config.toml",
+        let header = self.model_menu_header("Select Model and Effort", "");
+        self.show_model_selection_view(
+            model_ids,
+            SelectionViewParams {
+                view_id: Some(view_id),
+                items,
+                header,
+                ..SelectionViewParams::picker()
+            },
         );
-        self.show_model_selection_view(SelectionViewParams {
-            view_id: Some(view_id),
-            footer_hint: Some(self.bottom_pane.standard_popup_hint_line()),
-            items,
-            header,
-            ..Default::default()
-        });
     }
 
     fn model_selection_actions(
@@ -292,6 +300,7 @@ impl ChatWidget {
             .as_ref()
             .and_then(|effort| self.ultra_reasoning_concurrency_warning(effort));
         let thread_id = self.thread_id();
+        let sparkle_thread = self.sparkle_thread_for_picker_action(&model_for_action);
         vec![Box::new(move |tx| {
             if model_for_action == LUNA_RESERVE_MODEL {
                 // Reserve is temporary: update the active task without persisting a model default.
@@ -302,17 +311,22 @@ impl ChatWidget {
                     });
                 }
             } else if effort_for_action == Some(ReasoningEffortConfig::Ultra) {
-                tx.send(AppEvent::ApplyAdvancedReasoning {
-                    model: model_for_action.clone(),
-                    effort: ReasoningEffortConfig::Ultra,
-                });
+                tx.send(
+                    AstraModelPickerAction::ApplyAdvancedReasoning {
+                        effort: ReasoningEffortConfig::Ultra,
+                    }
+                    .into_picker_event(sparkle_thread, model_for_action.clone()),
+                );
             } else if should_prompt_plan_mode_scope {
                 tx.send(AppEvent::OpenPlanReasoningScopePrompt {
                     model: model_for_action.clone(),
                     effort: effort_for_action.clone(),
                 });
             } else {
-                tx.send(AppEvent::UpdateModel(model_for_action.clone()));
+                tx.send(
+                    AstraModelPickerAction::UpdateModel
+                        .into_picker_event(sparkle_thread, model_for_action.clone()),
+                );
                 tx.send(AppEvent::UpdateReasoningEffort(effort_for_action.clone()));
                 tx.send(AppEvent::PersistModelSelection {
                     model: model_for_action.clone(),
@@ -394,13 +408,17 @@ impl ChatWidget {
         let warning = effort
             .as_ref()
             .and_then(|effort| self.ultra_reasoning_concurrency_warning(effort));
+        let sparkle_thread = self.sparkle_thread_for_picker_action(&model);
 
         let plan_only_actions: Vec<SelectionAction> = vec![Box::new({
             let model = model.clone();
             let effort = effort.clone();
             let warning = warning.clone();
             move |tx| {
-                tx.send(AppEvent::UpdateModel(model.clone()));
+                tx.send(
+                    AstraModelPickerAction::UpdateModel
+                        .into_picker_event(sparkle_thread, model.clone()),
+                );
                 tx.send(AppEvent::UpdatePlanModeReasoningEffort(effort.clone()));
                 tx.send(AppEvent::PersistPlanModeReasoningEffort(effort.clone()));
                 if let Some(warning) = warning.clone() {
@@ -411,7 +429,10 @@ impl ChatWidget {
             }
         })];
         let all_modes_actions: Vec<SelectionAction> = vec![Box::new(move |tx| {
-            tx.send(AppEvent::UpdateModel(model.clone()));
+            tx.send(
+                AstraModelPickerAction::UpdateModel
+                    .into_picker_event(sparkle_thread, model.clone()),
+            );
             tx.send(AppEvent::UpdateReasoningEffort(effort.clone()));
             tx.send(AppEvent::UpdatePlanModeReasoningEffort(effort.clone()));
             tx.send(AppEvent::PersistPlanModeReasoningEffort(effort.clone()));
@@ -429,7 +450,6 @@ impl ChatWidget {
         self.bottom_pane.show_selection_view(SelectionViewParams {
             title: Some(PLAN_MODE_REASONING_SCOPE_TITLE.to_string()),
             subtitle: Some(subtitle),
-            footer_hint: Some(standard_popup_hint_line()),
             items: vec![
                 SelectionItem {
                     name: PLAN_MODE_REASONING_SCOPE_PLAN_ONLY.to_string(),
@@ -446,7 +466,7 @@ impl ChatWidget {
                     ..Default::default()
                 },
             ],
-            ..Default::default()
+            ..SelectionViewParams::picker()
         });
         self.notify(Notification::PlanModePrompt {
             title: PLAN_MODE_REASONING_SCOPE_TITLE.to_string(),
@@ -517,11 +537,7 @@ impl ChatWidget {
             .then(|| default_effort.clone());
 
         let model_slug = preset.model.to_string();
-        let model_label = if model_slug == LUNA_RESERVE_MODEL {
-            preset.display_name.clone()
-        } else {
-            model_slug.clone()
-        };
+        let model_label = preset.display_name.clone();
         let is_current_model = self.current_model() == preset.model.as_str();
         let highlight_choice = if is_current_model {
             if in_plan_mode {
@@ -619,17 +635,16 @@ impl ChatWidget {
             });
         }
 
-        let mut header = ColumnRenderable::new();
-        header.push(Line::from(
+        let header = Paragraph::new(Line::from(
             format!("Select Reasoning Level for {model_label}").bold(),
-        ));
+        ))
+        .wrap(Wrap { trim: false });
 
         self.bottom_pane.show_selection_view(SelectionViewParams {
             header: Box::new(header),
-            footer_hint: Some(standard_popup_hint_line()),
             items,
             initial_selected_idx,
-            ..Default::default()
+            ..SelectionViewParams::picker()
         });
     }
 
@@ -687,14 +702,15 @@ impl ChatWidget {
             });
         }
 
-        let mut header = ColumnRenderable::new();
-        header.push(Line::from("Advanced Reasoning".bold()));
-        header.push(Line::from("⚠ Consumes usage limits faster".cyan()));
+        let header = Paragraph::new(vec![
+            Line::from("Advanced Reasoning".bold()),
+            Line::from("⚠ Consumes usage limits faster".cyan()),
+        ])
+        .wrap(Wrap { trim: false });
         self.bottom_pane.show_selection_view(SelectionViewParams {
             header: Box::new(header),
-            footer_hint: Some(standard_popup_hint_line()),
             items,
-            ..Default::default()
+            ..SelectionViewParams::picker()
         });
     }
 

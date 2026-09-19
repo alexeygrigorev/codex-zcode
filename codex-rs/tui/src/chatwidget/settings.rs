@@ -415,6 +415,8 @@ impl ChatWidget {
 
     pub(super) fn refresh_model_display(&mut self) {
         let effective = self.effective_collaboration_mode();
+        self.bottom_pane
+            .stop_ineligible_sparkle(effective.model(), &self.local_settings.tui);
         self.session_header.set_model(effective.model());
         // Keep composer paste affordances aligned with the currently effective model.
         self.sync_image_paste_enabled();
@@ -541,12 +543,12 @@ impl ChatWidget {
         self.refresh_model_dependent_surfaces();
     }
 
-    pub(super) fn model_display_name(&self) -> &str {
+    pub(crate) fn model_display_name(&self) -> &str {
         let model = self.current_model();
         if model.is_empty() {
             DEFAULT_MODEL_DISPLAY_NAME
         } else {
-            crate::model_catalog::model_display_name(model)
+            self.model_catalog.display_name(model)
         }
     }
 

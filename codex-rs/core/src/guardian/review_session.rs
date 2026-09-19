@@ -12,6 +12,7 @@ pub(crate) use setup::run_guardian_review_session;
 mod context_policy;
 use context_policy::ReviewContextPolicy;
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -68,8 +69,7 @@ use crate::context::GuardianNodeReplPolicy;
 use crate::context_manager::ContextManager;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::image_preparation::ImagePreparationMode;
-use crate::image_preparation::ImageResizeNoticeMode;
-use crate::image_preparation::prepare_response_items;
+use crate::image_preparation::resize_image;
 use crate::image_preparation::unified_image_budget_enabled;
 use crate::session::SessionIo;
 use crate::session::session::Session;
@@ -80,7 +80,6 @@ use codex_model_provider_info::ModelProviderInfo;
 use codex_protocol::turn_input::TurnInputMode;
 use codex_protocol::turn_input::TurnInputRequest;
 use codex_protocol::turn_input::TurnInputSubmission;
-use codex_protocol::user_input::UserInput;
 use codex_thread_store::PersistContext;
 use codex_tools::normalize_output_image_detail;
 use codex_utils_path_uri::PathUri;
@@ -90,8 +89,6 @@ use super::GUARDIAN_REVIEWER_NAME;
 use super::GuardianApprovalRequest;
 use super::GuardianReviewContext;
 use super::feedback::record_failed_review;
-#[cfg(test)]
-use super::prompt::BUNDLED_GUARDIAN_POLICY;
 use super::prompt::GUARDIAN_TRANSCRIPT_START;
 use super::prompt::GuardianPromptMode;
 #[cfg(test)]
@@ -488,7 +485,8 @@ async fn run_review_on_session(
 
             let parent_history = params.parent_history.conversation_history_snapshot();
             let history = if GuardianContextMode::from_history(parent_history.as_ref())
-                == GuardianContextMode::ThreadOwned {
+                == GuardianContextMode::ThreadOwned
+            {
                 parent_history
             } else {
                 params.parent_session.conversation_history_snapshot().await
@@ -510,17 +508,26 @@ async fn run_review_on_session(
                 .any(|(_, cost)| cost.image_count > 0)
             {
                 let reviewer_history = review_session.session.clone_history().await;
-                let reviewer_image_urls = reviewer_history
-                    .raw_items()
-                    .flat_map(|item| match item {
-                        ResponseItem::Message { content, .. } => content.as_slice(),
-                        _ => &[],
-                    })
-                    .filter_map(|item| match item {
-                        ContentItem::InputImage { image: ImageReference::Inline { image_url }, .. } => Some(image_url.as_str()),
-                        _ => None,
-                    })
-                    .collect::<HashSet<_>>();
+                let mut reviewer_image_urls = HashSet::new();
+                let mut reviewer_file_ids = HashSet::new();
+                for item in reviewer_history.raw_items() {
+                    let ResponseItem::Message { content, .. } = item else {
+                        continue;
+                    };
+                    for item in content {
+                        let ContentItem::InputImage { image, .. } = item else {
+                            continue;
+                        };
+                        match image {
+                            ImageReference::Inline { image_url } => {
+                                reviewer_image_urls.insert(image_url.as_str());
+                            }
+                            ImageReference::File { file_id } => {
+                                reviewer_file_ids.insert(file_id.as_str());
+                            }
+                        }
+                    }
+                }
                 let context_window = model_info.resolved_context_window().map(|supported| {
                     params
                         .spawn_config
@@ -541,7 +548,7 @@ async fn run_review_on_session(
                     } else {
                         ImagePreparationMode::DetailBased
                     };
-                    prompt_items.context.retain_images(|image_url, detail| {
+                    prompt_items.context.retain_images(|image, detail| {
                         *detail = match normalize_output_image_detail(&model_info, *detail) {
                             _ if mode == ImagePreparationMode::UnifiedBudget => {
                                 Some(ImageDetail::Original)
@@ -549,27 +556,23 @@ async fn run_review_on_session(
                             Some(ImageDetail::Low) => Some(ImageDetail::High),
                             detail => detail,
                         };
-                        let mut prepared = vec![
-                            ResponseInputItem::from(vec![UserInput::Image {
-                                image: ImageReference::Inline {
-                                    image_url: image_url.to_owned(),
-                                },
-                                detail: *detail,
-                            }])
-                            .into(),
-                        ];
-                        prepare_response_items(
-                            &mut prepared,
-                            mode,
-                            ImageResizeNoticeMode::Disabled,
-                        );
-                        let Some(ResponseItem::Message { content, .. }) = prepared.first() else {
-                            return false;
-                        };
-                        content.iter().any(|item| {
-                            matches!(item, ContentItem::InputImage { image: ImageReference::Inline { image_url }, .. }
-                                if !reviewer_image_urls.contains(image_url.as_str()))
-                        })
+                        match image {
+                            ImageReference::Inline { image_url } => {
+                                let prepared_image_url = match resize_image(image_url, detail, mode)
+                                {
+                                    Ok(Some(prepared)) => Cow::Owned(prepared.into_data_url()),
+                                    Ok(None) => Cow::Borrowed(image_url),
+                                    Err(error) => {
+                                        warn!(%error, "failed to prepare guardian review image");
+                                        return false;
+                                    }
+                                };
+                                !reviewer_image_urls.contains(prepared_image_url.as_str())
+                            }
+                            ImageReference::File { file_id } => {
+                                !reviewer_file_ids.contains(file_id.as_str())
+                            }
+                        }
                     });
                     let prompt: ResponseItem =
                         ResponseInputItem::from(prompt_items.context.clone().into_user_inputs()?)
@@ -852,18 +855,6 @@ async fn ensure_guardian_node_repl_policy(
     Ok(())
 }
 
-async fn load_rollout_items_for_fork(
-    session: &Session,
-) -> anyhow::Result<Option<Vec<RolloutItem>>> {
-    session
-        .try_ensure_rollout_materialized(PersistContext::Standard)
-        .await?;
-    session.flush_rollout().await?;
-    let live_thread = session.live_thread_for_persistence("guardian review fork")?;
-    let history = live_thread.load_history(/*include_archived*/ true).await?;
-    Ok(Some(history.items))
-}
-
 impl codex_guardian_reviewer::ReviewerRuntime for GuardianReviewSession {
     async fn submit_turn(&self, request: TurnInputRequest) -> anyhow::Result<TurnInputSubmission> {
         Ok(self
@@ -912,22 +903,16 @@ impl codex_guardian_reviewer::ReviewerSession for GuardianReviewSession {
     }
 
     async fn commit_snapshot(&self) {
-        match load_rollout_items_for_fork(&self.session).await {
-            Ok(Some(items)) if !items.is_empty() => {
-                let mut state = self.state.lock().await;
-                let last_admitted_node_repl_response_sequence =
-                    state.last_admitted_node_repl_response_sequence;
-                state.conversation.commit_snapshot(GuardianReviewHistory {
-                    initial_history: InitialHistory::Forked(items),
-                    last_admitted_node_repl_response_sequence,
-                });
-            }
-            Ok(Some(_)) => {}
-            Ok(None) => {}
-            Err(err) => {
-                warn!("failed to refresh guardian trunk rollout snapshot: {err}");
-            }
-        }
+        // The pool holds the review lock until this checkpoint is published. Capture the
+        // completed model context directly; saving and reloading the transcript adds no state.
+        let items = self.session.guardian_fork_history().await;
+        let mut state = self.state.lock().await;
+        let last_admitted_node_repl_response_sequence =
+            state.last_admitted_node_repl_response_sequence;
+        state.conversation.commit_snapshot(GuardianReviewHistory {
+            initial_history: InitialHistory::Forked(items),
+            last_admitted_node_repl_response_sequence,
+        });
     }
 }
 

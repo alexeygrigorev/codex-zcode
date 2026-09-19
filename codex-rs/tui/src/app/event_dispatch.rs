@@ -454,6 +454,11 @@ impl App {
                     self.refresh_in_memory_config_from_disk_best_effort("forking the thread")
                         .await;
                     let mut fork_config = self.config.clone();
+                    if app_server.uses_remote_workspace() {
+                        fork_config.workspace_roots.clone_from(
+                            &self.chat_widget.config_ref().workspace_roots,
+                        );
+                    }
                     fork_config.model = Some(self.chat_widget.current_model().to_string());
                     fork_config.model_reasoning_effort =
                         self.chat_widget.current_reasoning_effort();
@@ -1781,6 +1786,22 @@ impl App {
                         .await;
                 }
             }
+            AppEvent::AstraSelectedFromModelPicker { thread_id, model, action } => {
+                // Check and apply in the same event so a queued backend update cannot turn a
+                // no-op picker confirmation into a sparkle.
+                let should_offer = self.chat_widget.current_model() != model
+                    && self.chat_widget.sparkle_thread_for_picker_action(&model) == Some(thread_id);
+                let control = Box::pin(self.handle_event(
+                    tui,
+                    app_server,
+                    action.into_app_event(model.clone()),
+                ))
+                .await?;
+                if should_offer {
+                    self.chat_widget.on_sparkle_model_selected_from_picker(&model);
+                }
+                return Ok(control);
+            }
             AppEvent::RealtimeWebrtcOfferCreated {
                 thread_id,
                 attempt_id,
@@ -2311,8 +2332,10 @@ impl App {
                         error = %err,
                         "failed to persist approvals reviewer update"
                     );
-                    self.chat_widget
-                        .add_error_message(format!("Failed to save approvals reviewer: {err}"));
+                    self.chat_widget.add_error_message(format!(
+                        "Failed to save approvals reviewer: {}",
+                        format_config_error(&err)
+                    ));
                 }
             }
             AppEvent::FetchExperimentalFeatures { thread_id, response_tx } => {
@@ -2446,7 +2469,7 @@ impl App {
                         };
                         let manager = pending.manager.clone();
                         let cwd = AbsolutePathBuf::try_from(checkout.cwd.clone())?;
-                        return Box::pin(self.start_agents_overview_session(tui, app_server, Some(cwd), Some((manager, checkout)))).await;
+                        return Box::pin(self.start_agents_overview_session(tui, app_server, Some(cwd), Some((manager, checkout)), /*startup_draft*/ None)).await;
                     }
                     Err(error) => self.add_agents_overview_error(error),
                 }
@@ -3049,7 +3072,12 @@ impl App {
             Ok(runtime_keymap) => runtime_keymap,
             Err(err) => {
                 let params = crate::keymap_setup::build_keymap_conflict_params(
-                    context, action, key, intent, err,
+                    context,
+                    action,
+                    key,
+                    intent,
+                    err,
+                    &self.keymap,
                 );
                 self.chat_widget.show_selection_view(params);
                 return;
