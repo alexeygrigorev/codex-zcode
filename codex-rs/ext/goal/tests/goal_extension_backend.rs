@@ -1463,6 +1463,97 @@ async fn update_goal_rejects_resume_and_system_limit_statuses() -> anyhow::Resul
 }
 
 #[tokio::test]
+async fn external_goal_changes_defer_reminders_to_the_turn_boundary() -> anyhow::Result<()> {
+    let runtime = test_runtime().await?;
+    let thread_id = test_thread_id()?;
+    seed_thread_metadata(runtime.as_ref(), thread_id).await?;
+    let harness = GoalExtensionHarness::new(runtime.clone(), thread_id).await?;
+    harness.start_turn("turn-1", &TokenUsage::default()).await;
+    let tools = harness.tools();
+    let create_tool = tool_by_name(&tools, "create_goal");
+    create_tool
+        .handle(tool_call(
+            "create_goal",
+            "call-create-goal",
+            json!({ "objective": "old objective" }),
+        ))
+        .await?;
+    let handle = harness.runtime_handle();
+
+    fn set_goal<'a>(
+        thread_id: ThreadId,
+        objective: GoalObjectiveUpdate<'a>,
+        status: Option<ThreadGoalStatus>,
+    ) -> GoalSetRequest<'a> {
+        GoalSetRequest {
+            thread_id,
+            objective,
+            status,
+            token_budget: GoalTokenBudgetUpdate::Keep,
+            max_goal_token_budget: None,
+        }
+    }
+
+    // Mid-turn changes queue instead of touching the running turn: an
+    // objective rewrite, a pause, and a resume.
+    let outcome = harness
+        .goal_service
+        .set_thread_goal(
+            runtime.as_ref(),
+            set_goal(thread_id, GoalObjectiveUpdate::Set("new objective"), None),
+        )
+        .await?;
+    outcome.apply_runtime_effects(&harness.goal_service).await;
+    let outcome = harness
+        .goal_service
+        .set_thread_goal(
+            runtime.as_ref(),
+            set_goal(
+                thread_id,
+                GoalObjectiveUpdate::Keep,
+                Some(ThreadGoalStatus::Paused),
+            ),
+        )
+        .await?;
+    outcome.apply_runtime_effects(&harness.goal_service).await;
+    let outcome = harness
+        .goal_service
+        .set_thread_goal(
+            runtime.as_ref(),
+            set_goal(
+                thread_id,
+                GoalObjectiveUpdate::Keep,
+                Some(ThreadGoalStatus::Active),
+            ),
+        )
+        .await?;
+    outcome.apply_runtime_effects(&harness.goal_service).await;
+
+    // The turn boundary drains exactly the three queued reminders.
+    assert_eq!(3, handle.flush_deferred_reminders().await);
+    assert_eq!(0, handle.flush_deferred_reminders().await);
+
+    // Past the cap the oldest reminders are dropped, keeping the queue
+    // bounded no matter how often the goal changes mid-turn.
+    for index in 0..6 {
+        let outcome = harness
+            .goal_service
+            .set_thread_goal(
+                runtime.as_ref(),
+                set_goal(
+                    thread_id,
+                    GoalObjectiveUpdate::Set(&format!("objective {index}")),
+                    None,
+                ),
+            )
+            .await?;
+        outcome.apply_runtime_effects(&harness.goal_service).await;
+    }
+    assert_eq!(4, handle.flush_deferred_reminders().await);
+    Ok(())
+}
+
+#[tokio::test]
 async fn external_goal_mutation_start_accounts_active_goal_progress() -> anyhow::Result<()> {
     let runtime = test_runtime().await?;
     let thread_id = test_thread_id()?;

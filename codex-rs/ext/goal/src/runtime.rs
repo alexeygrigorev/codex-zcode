@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::Weak;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -18,8 +19,11 @@ use crate::analytics::GoalAnalytics;
 use crate::analytics::GoalEventAttribution;
 use crate::events::GoalEventEmitter;
 use crate::metrics::GoalMetrics;
+use crate::steering::cleared_reminder_item;
 use crate::steering::continuation_steering_item;
 use crate::steering::objective_updated_steering_item;
+use crate::steering::resumed_reminder_item;
+use crate::steering::stopped_reminder_item;
 use crate::tool::protocol_goal_from_state;
 use tokio::sync::Semaphore;
 use tokio::sync::SemaphorePermit;
@@ -65,7 +69,13 @@ struct GoalRuntimeInner {
     tools_available_for_thread: bool,
     tools_visible_for_thread: bool,
     goal_state_lock: Semaphore,
+    /// Turn-safe reminders for goal status/objective changes that arrived
+    /// while a turn was running; flushed at the next turn boundary.
+    deferred_reminders: StdMutex<Vec<ResponseItem>>,
 }
+
+/// Bound on queued turn-safe goal reminders.
+const MAX_DEFERRED_GOAL_REMINDERS: usize = 4;
 
 pub(crate) struct AccountedGoalProgress {
     pub(crate) goal: ThreadGoal,
@@ -119,6 +129,7 @@ impl GoalRuntimeHandle {
                 tools_available_for_thread: config.tools_available_for_thread,
                 tools_visible_for_thread: config.tools_visible_for_thread,
                 goal_state_lock: Semaphore::new(/*permits*/ 1),
+                deferred_reminders: StdMutex::new(Vec::new()),
             }),
         }
     }
@@ -242,9 +253,20 @@ impl GoalRuntimeHandle {
                         .accounting_state
                         .mark_idle_goal_active(goal.goal_id.clone());
                 }
+                // Deferred reminders wait for the next turn boundary instead
+                // of rewriting a running turn's context mid-stream.
+                let resumed_from = matches!(
+                    previous_status,
+                    Some(codex_state::ThreadGoalStatus::Paused)
+                        | Some(codex_state::ThreadGoalStatus::Blocked)
+                );
+                if resumed_from {
+                    self.defer_reminder(resumed_reminder_item());
+                }
                 if objective_changed {
-                    let item = objective_updated_steering_item(&protocol_goal_from_state(goal));
-                    self.inject_active_turn_steering(item).await;
+                    self.defer_reminder(objective_updated_steering_item(
+                        &protocol_goal_from_state(goal),
+                    ));
                 }
                 self.continue_if_idle().await?;
             }
@@ -253,9 +275,11 @@ impl GoalRuntimeHandle {
                     self.inner.accounting_state.clear_active_goal();
                 }
             }
-            codex_state::ThreadGoalStatus::Paused
-            | codex_state::ThreadGoalStatus::Blocked
-            | codex_state::ThreadGoalStatus::UsageLimited
+            codex_state::ThreadGoalStatus::Paused | codex_state::ThreadGoalStatus::Blocked => {
+                self.inner.accounting_state.clear_active_goal();
+                self.defer_reminder(stopped_reminder_item(goal.status.as_str()));
+            }
+            codex_state::ThreadGoalStatus::UsageLimited
             | codex_state::ThreadGoalStatus::Complete => {
                 self.inner.accounting_state.clear_active_goal();
             }
@@ -273,6 +297,7 @@ impl GoalRuntimeHandle {
 
         self.inner.analytics.cleared(&goal);
         self.inner.accounting_state.clear_active_goal();
+        self.defer_reminder(cleared_reminder_item());
         Ok(())
     }
 
@@ -547,6 +572,41 @@ impl GoalRuntimeHandle {
                 .reset_idle_progress_baseline_and_clear_active_goal();
         }
         Ok(())
+    }
+
+    /// Queues a turn-safe reminder for the next turn boundary.
+    ///
+    /// Status and objective changes that arrive mid-turn must not rewrite
+    /// the in-flight context; the bounded queue defers them to turn start.
+    /// Past the cap the oldest reminder is dropped, matching the assumption
+    /// that newer state supersedes it.
+    pub(crate) fn defer_reminder(&self, item: ResponseItem) {
+        let mut queue = self
+            .inner
+            .deferred_reminders
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if queue.len() >= MAX_DEFERRED_GOAL_REMINDERS {
+            queue.remove(0);
+        }
+        queue.push(item);
+    }
+
+    /// Injects every queued reminder at a turn boundary, returning how many
+    /// were drained.
+    pub async fn flush_deferred_reminders(&self) -> usize {
+        let reminders = self
+            .inner
+            .deferred_reminders
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain(..)
+            .collect::<Vec<_>>();
+        let drained = reminders.len();
+        for reminder in reminders {
+            self.inject_active_turn_steering(reminder).await;
+        }
+        drained
     }
 
     pub(crate) async fn inject_active_turn_steering(&self, item: ResponseItem) {

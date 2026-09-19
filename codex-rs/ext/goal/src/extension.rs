@@ -250,6 +250,9 @@ where
                 input.collaboration_mode.mode,
                 input.token_usage_at_turn_start,
             );
+            // Goal status/objective changes that arrived mid-turn were
+            // queued; the turn boundary is the safe point to surface them.
+            runtime.flush_deferred_reminders().await;
             if matches!(
                 input.collaboration_mode.mode,
                 codex_protocol::config_types::ModeKind::Plan

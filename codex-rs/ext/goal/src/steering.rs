@@ -57,6 +57,29 @@ pub(crate) fn continuation_steering_item(
     goal_context_input_item(continuation_prompt(goal, update_plan_enabled))
 }
 
+/// Turn-safe reminders for goal status changes. They carry only the status
+/// transition (the objective already sits in the continuation context), so
+/// they stay small and bounded by construction.
+pub(crate) fn resumed_reminder_item() -> ResponseItem {
+    goal_context_input_item(
+        "Goal status update: the goal was resumed; continue working toward it.".to_string(),
+    )
+}
+
+pub(crate) fn stopped_reminder_item(status: &str) -> ResponseItem {
+    goal_context_input_item(format!(
+        "Goal status update: the goal is now {status}; stop working toward it until it is resumed."
+    ))
+}
+
+pub(crate) fn cleared_reminder_item() -> ResponseItem {
+    goal_context_input_item(
+        "Goal status update: the goal was cleared and no longer applies; \
+         do not keep working toward it."
+            .to_string(),
+    )
+}
+
 fn goal_context_input_item(prompt: String) -> ResponseItem {
     ContextualUserFragment::into(InternalModelContextFragment::new(
         InternalContextSource::from_static("goal"),
