@@ -31,6 +31,7 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering;
 
 use crate::CodexResponsesHeaders;
@@ -133,6 +134,7 @@ use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::subagent_header_value;
 use crate::util::emit_feedback_auth_recovery_tags;
 use crate::zcode_process;
+use crate::zcode_warm;
 use codex_feedback::FeedbackRequestTags;
 use codex_feedback::emit_feedback_request_tags_with_auth_env;
 use codex_login::auth::AgentIdentityAuthPolicy;
@@ -253,7 +255,7 @@ const ZCODE_TOOL_ARGS_PERSIST_CAP: usize = 128 * 1024;
 ///
 /// The CLI writes its crash reason (stack traces, provider errors) to stderr;
 /// keeping the last few KiB turns "exit status: 1" into an actionable error.
-const ZCODE_STDERR_TAIL_CAP: usize = 8 * 1024;
+pub(crate) const ZCODE_STDERR_TAIL_CAP: usize = 8 * 1024;
 
 /// Wire note bounding the model's final replies.
 ///
@@ -339,7 +341,7 @@ fn zcode_stderr_is_db_lock(stderr: &str) -> bool {
 }
 
 /// Trimmed UTF-8 snapshot of the bounded ZCode stderr tail.
-fn zcode_stderr_tail(stderr_tail: &std::sync::Mutex<Vec<u8>>) -> String {
+pub(crate) fn zcode_stderr_tail(stderr_tail: &std::sync::Mutex<Vec<u8>>) -> String {
     String::from_utf8_lossy(
         &stderr_tail
             .lock()
@@ -369,9 +371,9 @@ impl Drop for ZcodePromptFileGuard {
 ///
 /// Resolved from the environment in production; tests construct it directly
 /// to point the stream loop at a scripted fake runtime.
-struct ZcodeRuntime {
-    node: String,
-    cjs: String,
+pub(crate) struct ZcodeRuntime {
+    pub(crate) node: String,
+    pub(crate) cjs: String,
 }
 
 impl ZcodeRuntime {
@@ -578,6 +580,109 @@ fn zcode_current_turn_tail(input: &[ResponseItem]) -> &[ResponseItem] {
     }
 }
 
+/// Flattens response items into the transcript string the ZCode wire
+/// receives as its prompt. Prior tool calls and outputs are part of the
+/// transcript; sending only user text makes ZCode repeat the same tool call.
+fn zcode_flatten_transcript(input: &[ResponseItem]) -> String {
+    let mut user_text = String::new();
+    for item in input {
+        match item {
+            ResponseItem::Message { role, content, .. } => {
+                let text = content
+                    .iter()
+                    .filter_map(|c| match c {
+                        codex_protocol::models::ContentItem::InputText { text }
+                        | codex_protocol::models::ContentItem::OutputText { text } => {
+                            Some(text.as_str())
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !text.is_empty() {
+                    user_text.push_str(&format!("{role}: {text}\n"));
+                }
+            }
+            ResponseItem::FunctionCall {
+                name, arguments, ..
+            } => {
+                user_text.push_str(&format!("[tool call {name}] {arguments}\n"));
+            }
+            ResponseItem::FunctionCallOutput {
+                call_id, output, ..
+            } => {
+                let result_text = output
+                    .text_content()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| {
+                        output
+                            .content_items()
+                            .map(|items| {
+                                items
+                                    .iter()
+                                    .filter_map(|item| match item {
+                                        codex_protocol::models::FunctionCallOutputContentItem::InputText { text } => Some(text.clone()),
+                                        _ => None,
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                            })
+                            .unwrap_or_default()
+                    });
+                user_text.push_str(&format!(
+                    "[tool result for {}] {}\n",
+                    call_id.as_deref().unwrap_or("call"),
+                    result_text
+                ));
+            }
+            ResponseItem::AgentMessage {
+                author, content, ..
+            } => {
+                let text = content
+                    .iter()
+                    .filter_map(|part| match part {
+                        codex_protocol::models::AgentMessageInputContent::InputText { text } => {
+                            Some(text.as_str())
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !text.is_empty() {
+                    user_text.push_str(&format!("[inter-agent message from {author}] {text}\n"));
+                }
+            }
+            _ => {}
+        }
+    }
+    user_text
+}
+
+/// The warm bridge re-sends only the newest user turn; everything before it
+/// lives in the app-server session's server-side history.
+fn zcode_warm_turn_content(input: &[ResponseItem]) -> String {
+    let start = input.iter().rposition(
+        |item| matches!(item, ResponseItem::Message { role, .. } if role.as_str() == "user"),
+    );
+    zcode_flatten_transcript(&input[start.unwrap_or(0)..])
+}
+
+/// Whether the current turn consists only of goal bookkeeping (a translated
+/// `update_goal` call and its output), which ends the turn without
+/// re-prompting ZCode.
+fn zcode_only_goal_bookkeeping(input: &[ResponseItem]) -> bool {
+    let turn_tail = zcode_current_turn_tail(input);
+    !turn_tail.is_empty()
+        && turn_tail.iter().all(|item| match item {
+            ResponseItem::FunctionCallOutput { call_id, .. } => call_id
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("zcode_goal_"),
+            ResponseItem::FunctionCall { name, .. } => name == "update_goal",
+            _ => false,
+        })
+}
+
 /// Whether the current turn already translated a goal-status marker into an
 /// `update_goal` call.
 ///
@@ -596,7 +701,7 @@ fn zcode_goal_already_reported_in_current_turn(input: &[ResponseItem]) -> bool {
 /// `{"error":{"code":"model_output_limit_exceeded","message":"..."}}`; some
 /// serializers use `lastError` instead. Returns `None` when no message is
 /// present so callers can fall back to a stringified payload.
-fn zcode_failure_message(payload: &serde_json::Value) -> Option<String> {
+pub(crate) fn zcode_failure_message(payload: &serde_json::Value) -> Option<String> {
     let error = payload.get("error").or_else(|| payload.get("lastError"))?;
     let message = error.get("message")?.as_str()?.trim();
     if message.is_empty() {
@@ -863,6 +968,10 @@ struct ModelClientState {
     disable_websockets: AtomicBool,
     agent_identity_session_fallback: AgentIdentitySessionFallback,
     cached_websocket_session: StdMutex<WebsocketSession>,
+    /// Warm app-server child for the ZCode wire, one per Codex thread
+    /// (populated only when the `ZCODE_WARM` experiment is enabled).
+    zcode_warm: StdMutex<Option<Arc<crate::zcode_warm::ZcodeWarmBridge>>>,
+    zcode_warm_spawn_failures: AtomicU32,
 }
 
 enum ClientRouting {
@@ -1141,6 +1250,8 @@ impl ModelClient {
                 disable_websockets: AtomicBool::new(false),
                 agent_identity_session_fallback: AgentIdentitySessionFallback::default(),
                 cached_websocket_session: StdMutex::new(WebsocketSession::default()),
+                zcode_warm: StdMutex::new(None),
+                zcode_warm_spawn_failures: AtomicU32::new(0),
             }),
             agent_identity_policy,
             prompt_cache_key_override: None,
@@ -2781,7 +2892,31 @@ impl ModelClientSession {
             WireApi::Zcode => {
                 let inference_trace_attempt = inference_trace.start_attempt();
                 let runtime = ZcodeRuntime::from_env(&model_info.slug);
-                let api_stream = Self::stream_zcode(runtime, prompt).await?;
+                // Goal bookkeeping turns exist purely to record a status
+                // change; the legacy path already ends them without
+                // re-prompting, and the warm bridge must not see them.
+                let api_stream = if zcode_warm::warm_bridge_enabled()
+                    && !zcode_only_goal_bookkeeping(&prompt.input)
+                    && self
+                        .client
+                        .state
+                        .zcode_warm_spawn_failures
+                        .load(Ordering::Relaxed)
+                        < zcode_warm::ZCODE_WARM_MAX_CONSECUTIVE_FAILURES
+                {
+                    match Self::stream_zcode_warm(&self.client.state, &runtime, prompt).await {
+                        Ok(stream) => stream,
+                        Err(warm_error) => {
+                            warn!(
+                                "ZCode warm bridge unavailable ({warm_error}); using \
+                                 spawn-per-turn"
+                            );
+                            Self::stream_zcode(runtime, prompt).await?
+                        }
+                    }
+                } else {
+                    Self::stream_zcode(runtime, prompt).await?
+                };
                 let (stream, _) = map_response_stream(
                     api_stream,
                     session_telemetry.clone(),
@@ -2789,6 +2924,64 @@ impl ModelClientSession {
                     Arc::clone(&self.client.state.provider),
                 );
                 Ok(stream)
+            }
+        }
+    }
+
+    /// Streams the turn through the warm app-server child, falling back to
+    /// the spawn-per-turn bridge on any startup or protocol failure.
+    async fn stream_zcode_warm(
+        state: &ModelClientState,
+        runtime: &ZcodeRuntime,
+        prompt: &Prompt,
+    ) -> std::result::Result<codex_api::ResponseStream, String> {
+        let workspace_path = std::env::current_dir()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let bridge = {
+            let mut slot = state
+                .zcode_warm
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(bridge) = slot.as_ref()
+                && !bridge.is_dead()
+                && bridge.consecutive_failures() < zcode_warm::ZCODE_WARM_MAX_CONSECUTIVE_FAILURES
+            {
+                Arc::clone(bridge)
+            } else {
+                let bridge =
+                    zcode_warm::ZcodeWarmBridge::spawn(runtime, &workspace_path).map_err(|e| {
+                        state
+                            .zcode_warm_spawn_failures
+                            .fetch_add(1, Ordering::Relaxed);
+                        format!("could not launch warm app-server: {e}")
+                    })?;
+                *slot = Some(Arc::clone(&bridge));
+                bridge
+            }
+        };
+        let turned = async {
+            let session_id = bridge.ensure_session(&workspace_path).await?;
+            let content = zcode_warm_turn_content(&prompt.input);
+            bridge.turn(&session_id, &content)
+        }
+        .await;
+        match turned {
+            Ok(stream) => {
+                // Spawn/protocol failures are environmental; a healthy
+                // session/send resets the consecutive-failure latch.
+                bridge.register_success();
+                Ok(stream)
+            }
+            Err(e) => {
+                bridge.register_failure();
+                let stderr = bridge.stderr_text();
+                Err(if stderr.is_empty() {
+                    e
+                } else {
+                    format!("{e}; ZCode app-server stderr: {stderr}")
+                })
             }
         }
     }
@@ -2820,78 +3013,7 @@ impl ModelClientSession {
         // Flatten the full conversation into a transcript. ZCode needs prior
         // tool calls and outputs on follow-up turns; sending only user text
         // makes it repeat the same tool call forever.
-        let mut user_text = String::new();
-        for item in &prompt.input {
-            match item {
-                ResponseItem::Message { role, content, .. } => {
-                    let text = content
-                        .iter()
-                        .filter_map(|c| match c {
-                            codex_protocol::models::ContentItem::InputText { text }
-                            | codex_protocol::models::ContentItem::OutputText { text } => {
-                                Some(text.as_str())
-                            }
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    if !text.is_empty() {
-                        user_text.push_str(&format!("{role}: {text}\n"));
-                    }
-                }
-                ResponseItem::FunctionCall {
-                    name, arguments, ..
-                } => {
-                    user_text.push_str(&format!("[tool call {name}] {arguments}\n"));
-                }
-                ResponseItem::FunctionCallOutput {
-                    call_id, output, ..
-                } => {
-                    let result_text = output
-                        .text_content()
-                        .map(str::to_string)
-                        .unwrap_or_else(|| {
-                            output
-                                .content_items()
-                                .map(|items| {
-                                    items
-                                        .iter()
-                                        .filter_map(|item| match item {
-                                            codex_protocol::models::FunctionCallOutputContentItem::InputText { text } => Some(text.clone()),
-                                            _ => None,
-                                        })
-                                        .collect::<Vec<_>>()
-                                        .join("\n")
-                                })
-                                .unwrap_or_default()
-                        });
-                    user_text.push_str(&format!(
-                        "[tool result for {}] {}\n",
-                        call_id.as_deref().unwrap_or("call"),
-                        result_text
-                    ));
-                }
-                ResponseItem::AgentMessage {
-                    author, content, ..
-                } => {
-                    let text = content
-                        .iter()
-                        .filter_map(|part| match part {
-                            codex_protocol::models::AgentMessageInputContent::InputText {
-                                text,
-                            } => Some(text.as_str()),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    if !text.is_empty() {
-                        user_text
-                            .push_str(&format!("[inter-agent message from {author}] {text}\n"));
-                    }
-                }
-                _ => {}
-            }
-        }
+        let mut user_text = zcode_flatten_transcript(&prompt.input);
 
         // The ZCode harness exposes a fixed toolset and refuses Codex-side
         // tool names, so when a goal is active the model needs the
@@ -2941,16 +3063,7 @@ impl ModelClientSession {
         // bookkeeping. Re-prompting ZCode makes the model answer the same
         // question a second time (observed as near-duplicate replies), so
         // end the turn here: the answer is already finalized in history.
-        let turn_tail = zcode_current_turn_tail(&prompt.input);
-        let only_goal_bookkeeping = !turn_tail.is_empty()
-            && turn_tail.iter().all(|item| match item {
-                ResponseItem::FunctionCallOutput { call_id, .. } => call_id
-                    .as_deref()
-                    .unwrap_or_default()
-                    .starts_with("zcode_goal_"),
-                ResponseItem::FunctionCall { name, .. } => name == "update_goal",
-                _ => false,
-            });
+        let only_goal_bookkeeping = zcode_only_goal_bookkeeping(&prompt.input);
         if only_goal_bookkeeping {
             let _ = tx
                 .send(Ok(ResponseEvent::Completed {

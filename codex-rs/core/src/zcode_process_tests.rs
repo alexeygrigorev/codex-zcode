@@ -52,13 +52,24 @@ fn idle_timeout_parses_seconds_and_falls_back_on_junk() {
 
 #[tokio::test]
 async fn dispose_reaps_a_child_that_exits_on_its_own() {
-    // Ignore TERM so the graceful stage cannot kill the child; it must exit
-    // by itself (0.2s) well inside the grace period.
+    // Ignore TERM so the graceful stage cannot kill the child, and prove the
+    // trap is installed via a readiness line before signaling; the child
+    // must then exit by itself (0.2s) well inside the grace period.
     let mut child = test_command()
         .arg("-c")
-        .arg("trap '' TERM; sleep 0.2")
+        .arg("trap '' TERM; echo ready; sleep 0.2")
+        .stdout(Stdio::piped())
         .spawn()
         .expect("spawn test child");
+    let stdout = child.stdout.take().expect("stdout is piped");
+    let mut lines = BufReader::new(stdout).lines();
+    lines
+        .next_line()
+        .await
+        .expect("readiness line")
+        .expect("line is present");
+    drop(lines);
+
     let started = Instant::now();
     let status = dispose_and_wait_once(&mut child)
         .await
