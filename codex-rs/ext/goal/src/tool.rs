@@ -16,6 +16,8 @@ use serde::Serialize;
 
 use crate::accounting::BudgetLimitedGoalDisposition;
 use crate::accounting::GoalAccountingState;
+use crate::accounting::GoalIterationSummary;
+use crate::accounting::GoalIterationVerdict;
 use crate::analytics::GoalAnalytics;
 use crate::analytics::GoalEventAttribution;
 use crate::events::GoalEventEmitter;
@@ -68,6 +70,8 @@ struct GoalToolResponse {
     goal: Option<ThreadGoal>,
     remaining_tokens: Option<i64>,
     completion_budget_report: Option<String>,
+    iteration_count: u32,
+    iterations: Vec<GoalIterationSummary>,
 }
 
 #[derive(Clone, Copy)]
@@ -196,7 +200,7 @@ impl GoalToolExecutor {
             .map_err(|err| {
                 FunctionCallError::RespondToModel(format!("failed to read goal: {err}"))
             })?;
-        goal_response(goal, CompletionBudgetReport::Omit)
+        goal_response(goal, CompletionBudgetReport::Omit, &self.accounting_state)
     }
 
     async fn handle_create(
@@ -239,7 +243,11 @@ impl GoalToolExecutor {
         );
         let goal = protocol_goal_from_state(goal);
         self.emit_goal_updated_from_tool_call(&invocation, turn_id, goal.clone());
-        goal_response(Some(goal), CompletionBudgetReport::Omit)
+        goal_response(
+            Some(goal),
+            CompletionBudgetReport::Omit,
+            &self.accounting_state,
+        )
     }
 
     async fn handle_update(
@@ -269,6 +277,8 @@ impl GoalToolExecutor {
             if let Some(existing_goal) = existing_goal
                 && existing_goal.status != codex_state::ThreadGoalStatus::Complete
             {
+                // Every verification attempt is one goal iteration, passes
+                // included, so get_goal can show the per-attempt history.
                 match verify_goal_completion(
                     &invocation.model_completion,
                     existing_goal.objective.as_str(),
@@ -276,13 +286,20 @@ impl GoalToolExecutor {
                 )
                 .await
                 {
-                    Ok(CompletionVerdict::Passed) => {}
+                    Ok(CompletionVerdict::Passed) => {
+                        self.accounting_state
+                            .record_goal_iteration(GoalIterationVerdict::Passed);
+                    }
                     Ok(CompletionVerdict::NotPassed(reason)) => {
+                        self.accounting_state
+                            .record_goal_iteration(GoalIterationVerdict::NotPassed);
                         return Err(FunctionCallError::RespondToModel(format!(
                             "the goal stays active because the completion review did not pass: {reason}"
                         )));
                     }
                     Err(err) => {
+                        self.accounting_state
+                            .record_goal_iteration(GoalIterationVerdict::Error);
                         return Err(FunctionCallError::RespondToModel(format!(
                             "the goal stays active because completion could not be verified: {err}"
                         )));
@@ -346,6 +363,7 @@ impl GoalToolExecutor {
             } else {
                 CompletionBudgetReport::Omit
             },
+            &self.accounting_state,
         )
     }
 
@@ -479,14 +497,26 @@ pub(crate) fn validate_goal_budget(
 fn goal_response(
     goal: Option<ThreadGoal>,
     completion_budget_report: CompletionBudgetReport,
+    accounting_state: &GoalAccountingState,
 ) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
-    let value = serde_json::to_value(GoalToolResponse::new(goal, completion_budget_report))
-        .map_err(|err| FunctionCallError::Fatal(err.to_string()))?;
+    let (iteration_count, iterations) = accounting_state.goal_iterations();
+    let value = serde_json::to_value(GoalToolResponse::new(
+        goal,
+        completion_budget_report,
+        iteration_count,
+        iterations,
+    ))
+    .map_err(|err| FunctionCallError::Fatal(err.to_string()))?;
     Ok(Box::new(JsonToolOutput::new(value)))
 }
 
 impl GoalToolResponse {
-    fn new(goal: Option<ThreadGoal>, report_mode: CompletionBudgetReport) -> Self {
+    fn new(
+        goal: Option<ThreadGoal>,
+        report_mode: CompletionBudgetReport,
+        iteration_count: u32,
+        iterations: Vec<GoalIterationSummary>,
+    ) -> Self {
         let remaining_tokens = goal.as_ref().and_then(|goal| {
             goal.token_budget
                 .map(|budget| (budget - goal.tokens_used).max(0))
@@ -502,6 +532,8 @@ impl GoalToolResponse {
             goal,
             remaining_tokens,
             completion_budget_report,
+            iteration_count,
+            iterations,
         }
     }
 }

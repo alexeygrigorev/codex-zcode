@@ -5,6 +5,7 @@ mod accounting;
 
 use accounting::BudgetLimitedGoalDisposition;
 use accounting::GoalAccountingState;
+use accounting::GoalIterationVerdict;
 use codex_extension_api::ToolCallOutcome;
 use codex_extension_api::ToolName;
 use codex_protocol::config_types::ModeKind;
@@ -341,4 +342,122 @@ fn no_progress_continuations_block_after_three_turns_without_successful_tools() 
             state.finish_turn(&turn_id);
         }
     }
+}
+
+#[test]
+fn goal_iterations_record_verdicts_with_per_cycle_cost() {
+    let state = GoalAccountingState::default();
+    state.start_turn(
+        "turn-1",
+        ModeKind::Default,
+        &token_usage(
+            /*input_tokens*/ 100, /*cached_input_tokens*/ 0, /*output_tokens*/ 0,
+            /*reasoning_output_tokens*/ 0, /*total_tokens*/ 100,
+        ),
+    );
+    state.mark_current_turn_goal_active("goal-1");
+
+    // First iteration: two attributed tool calls and a token delta.
+    state.record_tool_outcome(
+        "turn-1",
+        &ToolName::plain("exec"),
+        ToolCallOutcome::Completed { success: true },
+    );
+    state.record_tool_outcome(
+        "turn-1",
+        &ToolName::plain("shell"),
+        ToolCallOutcome::Completed { success: true },
+    );
+    state
+        .record_token_usage(
+            "turn-1",
+            &token_usage(
+                /*input_tokens*/ 160, /*cached_input_tokens*/ 10,
+                /*output_tokens*/ 40, /*reasoning_output_tokens*/ 0,
+                /*total_tokens*/ 190,
+            ),
+        )
+        .expect("delta recorded");
+    let first = state.record_goal_iteration(GoalIterationVerdict::NotPassed);
+    assert_eq!(first.index, 1);
+    assert_eq!(first.verdict, GoalIterationVerdict::NotPassed);
+    assert_eq!(first.tool_calls, 2);
+    // Usage delta (60 input, 10 cached, 40 output) counts
+    // (60 - 10) non-cached input plus 40 output = 90 goal tokens.
+    assert_eq!(first.token_delta, 90);
+
+    // Second iteration accrues only what came after the first verification.
+    state
+        .record_token_usage(
+            "turn-1",
+            &token_usage(
+                /*input_tokens*/ 170, /*cached_input_tokens*/ 20,
+                /*output_tokens*/ 45, /*reasoning_output_tokens*/ 0,
+                /*total_tokens*/ 195,
+            ),
+        )
+        .expect("delta recorded");
+    let second = state.record_goal_iteration(GoalIterationVerdict::Passed);
+    assert_eq!(second.index, 2);
+    assert_eq!(second.verdict, GoalIterationVerdict::Passed);
+    // Usage delta (10 input, 10 cached, 5 output) counts
+    // (10 - 10) + 5 = 5 goal tokens.
+    assert_eq!(second.token_delta, 5);
+    assert_eq!(second.tool_calls, 0);
+
+    let (count, iterations) = state.goal_iterations();
+    assert_eq!(count, 2);
+    assert_eq!(iterations, vec![first, second]);
+}
+
+#[test]
+fn goal_iterations_reset_when_the_goal_clears() {
+    let state = GoalAccountingState::default();
+    state.start_turn(
+        "turn-1",
+        ModeKind::Default,
+        &token_usage(
+            /*input_tokens*/ 100, /*cached_input_tokens*/ 0, /*output_tokens*/ 0,
+            /*reasoning_output_tokens*/ 0, /*total_tokens*/ 100,
+        ),
+    );
+    state.mark_current_turn_goal_active("goal-1");
+    state
+        .record_token_usage(
+            "turn-1",
+            &token_usage(
+                /*input_tokens*/ 150, /*cached_input_tokens*/ 0,
+                /*output_tokens*/ 20, /*reasoning_output_tokens*/ 0,
+                /*total_tokens*/ 170,
+            ),
+        )
+        .expect("delta recorded");
+    state.record_goal_iteration(GoalIterationVerdict::Error);
+
+    state.clear_current_turn_goal();
+
+    assert_eq!((0, Vec::new()), state.goal_iterations());
+}
+
+#[test]
+fn goal_iterations_history_stays_bounded() {
+    let state = GoalAccountingState::default();
+    state.start_turn(
+        "turn-1",
+        ModeKind::Default,
+        &token_usage(
+            /*input_tokens*/ 0, /*cached_input_tokens*/ 0, /*output_tokens*/ 0,
+            /*reasoning_output_tokens*/ 0, /*total_tokens*/ 0,
+        ),
+    );
+    state.mark_current_turn_goal_active("goal-1");
+    for _ in 0..12 {
+        state.record_goal_iteration(GoalIterationVerdict::NotPassed);
+    }
+
+    let (count, iterations) = state.goal_iterations();
+    assert_eq!(count, 12);
+    assert_eq!(iterations.len(), accounting::MAX_RECORDED_GOAL_ITERATIONS);
+    assert_eq!(iterations.first().expect("non-empty").index, 3);
+    assert_eq!(iterations.last().expect("non-empty").index, 12);
 }

@@ -87,6 +87,8 @@ async fn installed_goal_tools_create_goal_and_fill_empty_preview() -> anyhow::Re
             },
             "remainingTokens": 123,
             "completionBudgetReport": serde_json::Value::Null,
+            "iterationCount": 0,
+            "iterations": serde_json::Value::Array(vec![]),
         })
     );
 
@@ -1375,6 +1377,8 @@ async fn update_goal_can_stop_and_accounts_final_progress() -> anyhow::Result<()
                 },
                 "remainingTokens": (token_budget - 23).max(0),
                 "completionBudgetReport": serde_json::Value::Null,
+                "iterationCount": 0,
+                "iterations": serde_json::Value::Array(vec![]),
             })
         );
 

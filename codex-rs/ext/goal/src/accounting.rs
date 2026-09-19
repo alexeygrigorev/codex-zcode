@@ -6,6 +6,7 @@ use codex_protocol::items::TurnItem;
 use codex_protocol::models::MessagePhase;
 use codex_protocol::protocol::TokenUsage;
 use codex_state::ThreadGoalStatus;
+use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::PoisonError;
@@ -15,6 +16,30 @@ use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::Semaphore;
 use tokio::sync::SemaphorePermit;
+
+/// Bounded number of per-iteration summaries retained for `get_goal`.
+pub(crate) const MAX_RECORDED_GOAL_ITERATIONS: usize = 10;
+
+/// What the completion verifier decided for one goal iteration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum GoalIterationVerdict {
+    Passed,
+    NotPassed,
+    Error,
+}
+
+/// One verification/continuation cycle of the active goal: what the
+/// verification decided and what the goal cost since the previous cycle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct GoalIterationSummary {
+    pub(crate) index: u32,
+    pub(crate) verdict: GoalIterationVerdict,
+    pub(crate) token_delta: i64,
+    pub(crate) tool_calls: u32,
+    pub(crate) elapsed_seconds: i64,
+}
 
 #[derive(Debug)]
 pub(crate) struct GoalAccountingState {
@@ -35,12 +60,21 @@ struct GoalAccountingInner {
     consecutive_empty_turns: u8,
     consecutive_no_progress_turns: u8,
     last_accounted_descendant_token_usage: i64,
+    goal_iterations: Vec<GoalIterationSummary>,
+    goal_iteration_count: u32,
+    goal_iteration_token_delta: i64,
+    goal_iteration_tool_calls: u32,
+    goal_iteration_started_at: Instant,
 }
 
 #[derive(Debug)]
 struct GoalTurnAccounting {
     current_token_usage: TokenUsage,
     last_accounted_token_usage: TokenUsage,
+    /// Usage as of the last time this turn fed the goal-iteration
+    /// accumulator, so repeated `record_token_usage` calls between progress
+    /// accountings never double count.
+    iteration_seen_usage: TokenUsage,
     active_goal_id: Option<String>,
     account_tokens: bool,
     failed_execution: bool,
@@ -115,13 +149,20 @@ impl GoalAccountingState {
     ) {
         let mut inner = self.inner();
         inner.consecutive_empty_turns = 0;
+        let has_active_goal = match inner.turns.get_mut(turn_id) {
+            Some(turn) => {
+                turn.has_activity = true;
+                turn.active_goal_id.is_some()
+            }
+            None => return,
+        };
+        if !has_active_goal {
+            return;
+        }
+        inner.goal_iteration_tool_calls = inner.goal_iteration_tool_calls.saturating_add(1);
         let Some(turn) = inner.turns.get_mut(turn_id) else {
             return;
         };
-        turn.has_activity = true;
-        if turn.active_goal_id.is_none() {
-            return;
-        }
 
         match outcome {
             ToolCallOutcome::Completed { success: true } => {
@@ -209,11 +250,54 @@ impl GoalAccountingState {
         self.inner().automatic_goal_turn_id = Some(turn_id);
     }
 
+    /// Records one verification/continuation cycle of the active goal and
+    /// restarts the per-iteration accruals (tokens, tool calls, wall clock).
+    pub(crate) fn record_goal_iteration(
+        &self,
+        verdict: GoalIterationVerdict,
+    ) -> GoalIterationSummary {
+        let mut inner = self.inner();
+        inner.goal_iteration_count = inner.goal_iteration_count.saturating_add(1);
+        let summary = GoalIterationSummary {
+            index: inner.goal_iteration_count,
+            verdict,
+            token_delta: inner.goal_iteration_token_delta,
+            tool_calls: inner.goal_iteration_tool_calls,
+            elapsed_seconds: i64::try_from(inner.goal_iteration_started_at.elapsed().as_secs())
+                .unwrap_or(i64::MAX),
+        };
+        inner.goal_iterations.push(summary.clone());
+        if inner.goal_iterations.len() > MAX_RECORDED_GOAL_ITERATIONS {
+            let excess = inner.goal_iterations.len() - MAX_RECORDED_GOAL_ITERATIONS;
+            inner.goal_iterations.drain(..excess);
+        }
+        inner.goal_iteration_token_delta = 0;
+        inner.goal_iteration_tool_calls = 0;
+        inner.goal_iteration_started_at = Instant::now();
+        summary
+    }
+
+    /// Rollup exposed through `get_goal`: total iterations plus the bounded
+    /// per-attempt history (most recent last).
+    pub(crate) fn goal_iterations(&self) -> (u32, Vec<GoalIterationSummary>) {
+        let inner = self.inner();
+        (inner.goal_iteration_count, inner.goal_iterations.clone())
+    }
+
+    fn reset_goal_iterations(inner: &mut GoalAccountingInner) {
+        inner.goal_iterations.clear();
+        inner.goal_iteration_count = 0;
+        inner.goal_iteration_token_delta = 0;
+        inner.goal_iteration_tool_calls = 0;
+        inner.goal_iteration_started_at = Instant::now();
+    }
+
     pub(crate) fn reset_empty_responses(&self) {
         let mut inner = self.inner();
         inner.automatic_goal_turn_id = None;
         inner.consecutive_empty_turns = 0;
         inner.consecutive_no_progress_turns = 0;
+        Self::reset_goal_iterations(&mut inner);
     }
 
     /// Evaluated under the goal-state permit after automatic admission records its turn ID.
@@ -282,13 +366,28 @@ impl GoalAccountingState {
     ) -> Option<RecordedTokenDelta> {
         let turn_id = turn_id.into();
         let mut inner = self.inner();
-        let turn = inner.turns.get_mut(&turn_id)?;
-        turn.current_token_usage = total_usage.clone();
-        if !turn.account_tokens {
-            return None;
+        let (iteration_attributable, iteration_delta) = {
+            let turn = inner.turns.get_mut(&turn_id)?;
+            let iteration_delta =
+                token_delta_since_last_accounting(&turn.iteration_seen_usage, total_usage);
+            turn.iteration_seen_usage = total_usage.clone();
+            turn.current_token_usage = total_usage.clone();
+            let attributable = turn.account_tokens && turn.active_goal_id.is_some();
+            if !turn.account_tokens {
+                return None;
+            }
+            (attributable, iteration_delta)
+        };
+        if iteration_delta > 0 && iteration_attributable {
+            inner.goal_iteration_token_delta = inner
+                .goal_iteration_token_delta
+                .saturating_add(iteration_delta);
         }
 
-        let delta = turn.token_delta_since_last_accounting();
+        let delta = inner
+            .turns
+            .get(&turn_id)?
+            .token_delta_since_last_accounting();
         if delta <= 0 {
             return None;
         }
@@ -383,6 +482,7 @@ impl GoalAccountingState {
         inner.automatic_goal_turn_id = None;
         inner.consecutive_empty_turns = 0;
         inner.consecutive_no_progress_turns = 0;
+        Self::reset_goal_iterations(&mut inner);
         Some(turn_id)
     }
 
@@ -400,6 +500,7 @@ impl GoalAccountingState {
         inner.automatic_goal_turn_id = None;
         inner.consecutive_empty_turns = 0;
         inner.consecutive_no_progress_turns = 0;
+        Self::reset_goal_iterations(&mut inner);
     }
 
     pub(crate) fn progress_snapshot(&self, turn_id: &str) -> Option<GoalProgressSnapshot> {
@@ -507,6 +608,7 @@ impl GoalAccountingState {
         inner.wall_clock.reset_baseline();
         inner.wall_clock.clear_active_goal();
         inner.budget_limit_reported_goal_id = None;
+        Self::reset_goal_iterations(&mut inner);
     }
 
     pub(crate) fn mark_budget_limit_reported_if_new(&self, goal_id: &str) -> bool {
@@ -572,6 +674,11 @@ impl Default for GoalAccountingInner {
             consecutive_empty_turns: 0,
             consecutive_no_progress_turns: 0,
             last_accounted_descendant_token_usage: 0,
+            goal_iterations: Vec::new(),
+            goal_iteration_count: 0,
+            goal_iteration_token_delta: 0,
+            goal_iteration_tool_calls: 0,
+            goal_iteration_started_at: Instant::now(),
         }
     }
 }
@@ -591,6 +698,7 @@ impl GoalTurnAccounting {
     fn new(current_token_usage: TokenUsage, account_tokens: bool) -> Self {
         Self {
             last_accounted_token_usage: current_token_usage.clone(),
+            iteration_seen_usage: current_token_usage.clone(),
             current_token_usage,
             active_goal_id: None,
             account_tokens,
