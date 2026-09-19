@@ -143,6 +143,40 @@ base_url = ""
 wire_api = "zcode"
 ```
 
+## Troubleshooting
+
+### `无法定位 CLI ZCode Built-in Provider Config` (ZCode 3.14+)
+
+Symptom when starting a new session:
+
+```text
+stream disconnected before completion: ZCode exited unsuccessfully (exit status: 1);
+stderr: 无法定位 CLI ZCode Built-in Provider Config：
+/opt/ZCode/resources/glm/provider/zcode-builtin.json, /config/provider/zcode-builtin.json
+```
+
+Cause: ZCode Desktop 3.14+ ships the file at
+`/opt/ZCode/resources/config/provider/zcode-builtin.json`, but the headless
+runtime looks under `/opt/ZCode/resources/glm/provider/` (plus a bad
+`/config/provider/` fallback). The install was tested against 3.11.2.
+
+Fix: copy the shipped file to both expected locations, then verify headless:
+
+```bash
+ls -l /opt/ZCode/resources/config/provider/zcode-builtin.json
+sudo mkdir -p /opt/ZCode/resources/glm/provider /config/provider
+sudo cp /opt/ZCode/resources/config/provider/zcode-builtin.json \
+  /opt/ZCode/resources/glm/provider/zcode-builtin.json
+sudo cp /opt/ZCode/resources/config/provider/zcode-builtin.json \
+  /config/provider/zcode-builtin.json
+node /opt/ZCode/resources/glm/zcode.cjs --prompt hi --json --mode yolo --cwd /tmp
+```
+
+For a self-contained bundle (`scripts/build-zcode-bundle.sh`), the same drift
+applies under `zcode/`: copy `zcode/config/provider/zcode-builtin.json` to
+`zcode/glm/provider/zcode-builtin.json` inside the unpacked bundle.
+Re-apply after every ZCode Desktop update until upstream fixes the lookup.
+
 ## Upstream Synchronization
 
 Upstream's `README.md` is intentionally unchanged. This project documents itself
