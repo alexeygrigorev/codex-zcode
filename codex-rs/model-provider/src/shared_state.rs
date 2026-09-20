@@ -8,15 +8,20 @@ use codex_login::AuthRuntimeConfig;
 use codex_login::GatewayAuthConfig;
 use codex_login::GatewayAuthManager;
 use codex_model_provider_info::GatewayOAuthConfig;
+#[cfg(feature = "bedrock")]
 use codex_model_provider_info::ModelProviderAwsAuthInfo;
 
+#[cfg(feature = "bedrock")]
 use crate::amazon_bedrock::AwsAuthRecovery;
+#[cfg(feature = "bedrock")]
 use crate::amazon_bedrock::AwsCredentialExport;
 
 /// Provider-owned runtime state shared across independently configured sessions.
 #[derive(Debug, Default)]
 pub(crate) struct ModelProviderSharedState {
+    #[cfg(feature = "bedrock")]
     aws_credential_exports: Mutex<Vec<(ModelProviderAwsAuthInfo, Weak<AwsCredentialExport>)>>,
+    #[cfg(feature = "bedrock")]
     aws_auth_recoveries: Mutex<Vec<(ModelProviderAwsAuthInfo, Weak<AwsAuthRecovery>)>>,
     gateway_managers: Mutex<
         Vec<(
@@ -70,6 +75,7 @@ impl ModelProviderSharedState {
         Ok(manager)
     }
 
+    #[cfg(feature = "bedrock")]
     pub(crate) fn aws_credential_export(
         &self,
         aws: &ModelProviderAwsAuthInfo,
@@ -94,6 +100,7 @@ impl ModelProviderSharedState {
         Some(export)
     }
 
+    #[cfg(feature = "bedrock")]
     pub(crate) fn aws_auth_recovery(
         &self,
         aws: &ModelProviderAwsAuthInfo,

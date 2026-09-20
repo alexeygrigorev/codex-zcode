@@ -587,6 +587,7 @@ fn zcode_models_catalog(
                 supports_search_tool: true,
                 supports_experimental_context: false,
                 use_responses_lite: false,
+                supports_reasoning_effort_updates: false,
                 node_repl_auto_review_required: false,
                 node_repl_disabled: false,
                 auto_review_model_override: None,

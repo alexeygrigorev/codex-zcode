@@ -1,10 +1,11 @@
 ---
 source: tui/src/chatwidget/tests/composer_submission.rs
+assertion_line: 2746
 expression: "normalize_snapshot_paths(render_bottom_popup(&chat, 80))"
 ---
 • Queued follow-up inputs
   ↳ Preparing images: describe
-    ⌥+↑ edit last queued message
+    shift+← edit last queued message
 
 › x
 

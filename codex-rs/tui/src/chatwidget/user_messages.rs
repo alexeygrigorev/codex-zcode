@@ -698,7 +698,6 @@ impl ChatWidget {
             .collect();
         let reply_text = crate::async_question_reply::display_text(&message);
         let (message, prompt_request_offset) =
-        let (message, prompt_request_offset) =
             crate::prompt_request::extract_prompt_request_with_offset(&message);
         if let Some(message) =
             reply_text.or_else(|| crate::async_question_reply::display_text(message))

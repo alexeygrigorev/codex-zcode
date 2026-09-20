@@ -80,7 +80,14 @@ pub(super) async fn handle_message_string_tool(
                 .map(|agents| {
                     agents
                         .iter()
-                        .map(|agent| agent.agent_name.clone())
+                        .map(|agent| {
+                            agent
+                                .metadata
+                                .agent_path
+                                .as_ref()
+                                .map(ToString::to_string)
+                                .unwrap_or_else(|| agent.thread_id.to_string())
+                        })
                         .collect::<Vec<_>>()
                         .join(", ")
                 })

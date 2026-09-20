@@ -7,7 +7,6 @@ mod combined_auth;
 mod models_endpoint;
 mod models_identity;
 mod provider;
-#[cfg(feature = "bedrock")]
 mod shared_state;
 pub mod test_support;
 mod workspace_routing;
