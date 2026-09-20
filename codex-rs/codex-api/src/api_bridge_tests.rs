@@ -81,6 +81,32 @@ fn map_api_error_distinguishes_capacity_from_slow_down() {
 }
 
 #[test]
+fn map_api_error_promotes_rate_limit_stream_to_rate_limit() {
+    let message =
+        "[1302][Rate limit reached for requests] [20260920065300c5262d40cfa74eab]".to_string();
+    let err = map_api_error(ApiError::Stream(message.clone()));
+    assert_eq!(
+        err.to_codex_protocol_error(),
+        CodexErrorInfo::RateLimitExceeded
+    );
+    assert_eq!(
+        err.retry_delay(/*retry_count*/ 1),
+        Some(codex_protocol::error::RATE_LIMIT_STREAM_RETRY_DELAY)
+    );
+    assert_eq!(
+        err.server_retry_delay(),
+        Some(codex_protocol::error::RATE_LIMIT_STREAM_RETRY_DELAY)
+    );
+
+    let err = map_api_error(ApiError::Stream(
+        "websocket closed by server before response.completed".to_string(),
+    ));
+    assert_eq!(err.to_codex_protocol_error(), CodexErrorInfo::Other);
+    let delay = err.retry_delay(/*retry_count*/ 1).expect("retryable");
+    assert!(delay < codex_protocol::error::RATE_LIMIT_STREAM_RETRY_DELAY);
+}
+
+#[test]
 fn map_api_error_maps_cloudflare_blocked_response_to_user_message() {
     let mut headers = HeaderMap::new();
     headers.insert(CF_RAY_HEADER, http::HeaderValue::from_static("ray-id"));

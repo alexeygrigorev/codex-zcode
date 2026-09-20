@@ -735,6 +735,11 @@ const ZCODE_PROJECTION_FAILURE_MESSAGE: &str = "ZCode turn failed (projection st
 /// full so the next turn compacts the transcript before sampling instead of
 /// repeating the same doomed attempt.
 ///
+/// A failure carrying a rate-limit signal (for example
+/// `[1302][Rate limit reached for requests]`) is transient: the session
+/// retry loop waits about a minute and resumes automatically, matching the
+/// manual "wait and type `continue`" recovery.
+///
 /// `stderr_tail` is consulted only when `message` is
 /// [`ZCODE_PROJECTION_FAILURE_MESSAGE`]: the result line's projection has no
 /// error detail, and the CLI writes the provider reason to stderr even when
@@ -745,6 +750,14 @@ fn zcode_turn_failure_error(message: &str, stderr_tail: &str) -> ApiError {
             && stderr_tail.contains(ZCODE_OUTPUT_LIMIT_CODE));
     if hit_output_limit {
         ApiError::ContextWindowExceeded
+    } else if codex_protocol::error::stream_message_looks_like_rate_limit(message)
+        || (message == ZCODE_PROJECTION_FAILURE_MESSAGE
+            && codex_protocol::error::stream_message_looks_like_rate_limit(stderr_tail))
+    {
+        ApiError::RateLimitExceeded {
+            message: message.to_string(),
+            delay: Some(codex_protocol::error::RATE_LIMIT_STREAM_RETRY_DELAY),
+        }
     } else {
         ApiError::Stream(message.to_string())
     }

@@ -34,6 +34,24 @@ pub type Result<T> = std::result::Result<T, CodexErr>;
 /// Limit UI error messages to a reasonable size while keeping useful context.
 const ERROR_MESSAGE_UI_MAX_BYTES: usize = 2 * 1024;
 
+/// Delay applied when a retryable error carries a rate-limit signal (for
+/// example `[1302][Rate limit reached for requests]`) but no server
+/// `retry-after` advice. This matches the manual recovery of waiting about
+/// a minute and typing `continue`.
+pub const RATE_LIMIT_STREAM_RETRY_DELAY: Duration = Duration::from_secs(60);
+
+/// Returns true when a stream disconnect message looks like a rate limit
+/// rather than a generic transport failure.
+pub fn stream_message_looks_like_rate_limit(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("rate limit")
+        || message.contains("rate_limit")
+        || message.contains("rate-limit")
+        || message.contains("too many requests")
+        || message.contains("slow_down")
+        || message.contains("[1302]")
+}
+
 #[derive(Error, Debug)]
 pub enum SandboxErr {
     /// Error from sandbox execution
@@ -374,8 +392,10 @@ impl CodexErr {
 
     /// Returns the delay before the given retry attempt, or `None` for a terminal error.
     ///
-    /// The first retry is attempt one. Retryable errors use server advice when available and
-    /// otherwise use exponential backoff with jitter. Callers enforce their own retry budgets.
+    /// The first retry is attempt one. Retryable errors use server advice when available,
+    /// rate-limit signals without advice wait [`RATE_LIMIT_STREAM_RETRY_DELAY`], and
+    /// everything else uses exponential backoff with jitter. Callers enforce their own
+    /// retry budgets.
     pub fn retry_delay(&self, retry_count: u64) -> Option<Duration> {
         match self.details() {
             CodexErrorDetails::TurnAborted
@@ -414,10 +434,22 @@ impl CodexErr {
             | CodexErrorDetails::InternalAgentDied
             | CodexErrorDetails::Io(_)
             | CodexErrorDetails::Json(_)
-            | CodexErrorDetails::TokioJoin(_) => Some(
-                self.server_retry_delay
-                    .unwrap_or_else(|| backoff(retry_count)),
-            ),
+            | CodexErrorDetails::TokioJoin(_) => {
+                Some(self.server_retry_delay.unwrap_or_else(|| {
+                    let is_rate_limit = match self.details() {
+                        CodexErrorDetails::RateLimitExceeded(_) => true,
+                        CodexErrorDetails::Stream(message) => {
+                            stream_message_looks_like_rate_limit(message)
+                        }
+                        _ => false,
+                    };
+                    if is_rate_limit {
+                        RATE_LIMIT_STREAM_RETRY_DELAY
+                    } else {
+                        backoff(retry_count)
+                    }
+                }))
+            }
             #[cfg(target_os = "linux")]
             CodexErrorDetails::LandlockRuleset(_) | CodexErrorDetails::LandlockPathFd(_) => None,
         }

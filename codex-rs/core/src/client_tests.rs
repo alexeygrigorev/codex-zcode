@@ -2106,12 +2106,14 @@ fn zcode_turn_failure_error_maps_projection_stderr_output_limit() {
     assert!(matches!(error, ApiError::ContextWindowExceeded));
 
     // A detailed failure message is authoritative: stderr is not consulted.
+    // Use a non-rate-limit message here so the assertion targets the
+    // precedence rule rather than the rate-limit mapping below.
     let error = super::zcode_turn_failure_error(
-        "provider unavailable (rate_limited)",
+        "provider unavailable (boom)",
         "Error: model_output_limit_exceeded",
     );
     match error {
-        ApiError::Stream(message) => assert_eq!(message, "provider unavailable (rate_limited)"),
+        ApiError::Stream(message) => assert_eq!(message, "provider unavailable (boom)"),
         other => panic!("expected stream error, got {other:?}"),
     }
 }
@@ -2123,6 +2125,31 @@ fn zcode_turn_failure_error_keeps_other_failures_retryable() {
         ApiError::Stream(message) => assert_eq!(message, "provider unavailable (boom)"),
         other => panic!("expected stream error, got {other:?}"),
     }
+}
+
+#[test]
+fn zcode_turn_failure_error_maps_rate_limit_to_retryable_rate_limit() {
+    let message = "[1302][Rate limit reached for requests] [20260920065300c5262d40cfa74eab]";
+    let error = super::zcode_turn_failure_error(message, "");
+    match error {
+        ApiError::RateLimitExceeded {
+            message: actual,
+            delay,
+        } => {
+            assert_eq!(actual, message);
+            assert_eq!(
+                delay,
+                Some(codex_protocol::error::RATE_LIMIT_STREAM_RETRY_DELAY)
+            );
+        }
+        other => panic!("expected rate limit error, got {other:?}"),
+    }
+
+    let error = super::zcode_turn_failure_error(
+        super::ZCODE_PROJECTION_FAILURE_MESSAGE,
+        "stderr: [1302][Rate limit reached for requests]",
+    );
+    assert!(matches!(error, ApiError::RateLimitExceeded { .. }));
 }
 
 #[test]

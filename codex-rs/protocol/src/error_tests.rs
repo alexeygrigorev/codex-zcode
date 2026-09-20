@@ -732,3 +732,48 @@ fn usage_limit_reached_with_promo_message() {
         assert_eq!(err.to_string(), expected);
     });
 }
+
+#[test]
+fn stream_message_rate_limit_detection() {
+    assert!(stream_message_looks_like_rate_limit(
+        "[1302][Rate limit reached for requests] [20260920065300c5262d40cfa74eab]"
+    ));
+    assert!(stream_message_looks_like_rate_limit(
+        "stream disconnected before completion: [1302][Rate limit reached for requests]"
+    ));
+    assert!(stream_message_looks_like_rate_limit("Rate_limit exceeded"));
+    assert!(stream_message_looks_like_rate_limit("too many requests"));
+    assert!(!stream_message_looks_like_rate_limit(
+        "websocket closed by server before response.completed"
+    ));
+    assert!(!stream_message_looks_like_rate_limit(
+        "stream closed before response.completed"
+    ));
+}
+
+#[test]
+fn retry_delay_waits_a_minute_for_rate_limit_stream() {
+    let error = CodexErr::Stream(
+        "[1302][Rate limit reached for requests] [20260920065300c5262d40cfa74eab]".to_string(),
+    );
+    assert_eq!(
+        error.retry_delay(/*retry_count*/ 1),
+        Some(RATE_LIMIT_STREAM_RETRY_DELAY)
+    );
+    assert_eq!(RATE_LIMIT_STREAM_RETRY_DELAY, Duration::from_secs(60),);
+
+    let error = CodexErr::new(CodexErrorDetails::RateLimitExceeded("slow down".into()));
+    assert_eq!(
+        error.retry_delay(/*retry_count*/ 1),
+        Some(Duration::from_secs(60)),
+    );
+
+    let error = CodexErr::Stream("websocket closed by server".to_string());
+    let delay = error.retry_delay(/*retry_count*/ 1).expect("retryable");
+    assert!(delay < Duration::from_secs(60));
+
+    let advice = Duration::from_secs(17);
+    let error = CodexErr::Stream("[1302][Rate limit reached for requests]".to_string())
+        .with_retry_delay(advice);
+    assert_eq!(error.retry_delay(/*retry_count*/ 1), Some(advice));
+}
