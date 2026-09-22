@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::path::PathBuf;
 
 use codex_utils_absolute_path::AbsolutePathBuf;
 use pretty_assertions::assert_eq;
@@ -115,11 +116,22 @@ fn effective_workspace_intersection_preserves_network_metadata_and_temp() {
     let result = intersection(&authority, &requested, &project);
     let policy = result.file_system_sandbox_policy();
 
+    // `Special::Tmpdir` entries resolve lexically against $TMPDIR and vanish when it
+    // is unset, so the temp-directory root itself is only writable while the test's
+    // TempDir lives under a valid $TMPDIR.
+    let tmpdir = std::env::var_os("TMPDIR")
+        .filter(|value| !value.is_empty())
+        .and_then(|value| AbsolutePathBuf::from_absolute_path(PathBuf::from(value)).ok());
+    let root_access = if tmpdir.is_some_and(|tmpdir| root.as_path().starts_with(tmpdir.as_path())) {
+        Write
+    } else {
+        Read
+    };
     assert_eq!(
         [&root, &project]
             .map(|path| policy
                 .resolve_access_for_local_path_with_cwd(path.as_path(), root.as_path())),
-        [Read, Write]
+        [root_access, Write]
     );
     assert_eq!(result.network_sandbox_policy(), Restricted);
     assert!(policy.entries.contains(&special(Tmpdir, Write)));
