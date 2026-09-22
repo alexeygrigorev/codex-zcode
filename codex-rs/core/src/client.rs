@@ -137,6 +137,7 @@ use crate::responses_metadata::subagent_header_value;
 use crate::util::emit_feedback_auth_recovery_tags;
 use crate::zcode_process;
 use crate::zcode_warm;
+use crate::zcode_warm_permissions;
 use crate::zcode_warm_store;
 use codex_feedback::FeedbackRequestTags;
 use codex_feedback::emit_feedback_request_tags_with_auth_env;
@@ -3050,6 +3051,7 @@ impl ModelClientSession {
                     runtime,
                     &workspace_path,
                     zcode_warm::warm_mode_from_env(),
+                    zcode_warm_permissions::WarmPermissionPolicy::from_env(),
                     resume_seed,
                 )
                 .map_err(|e| {

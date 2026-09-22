@@ -248,6 +248,7 @@ mod zcode_process;
 mod zcode_warm;
 mod zcode_warm_events;
 mod zcode_warm_goal;
+mod zcode_warm_permissions;
 mod zcode_warm_resume;
 mod zcode_warm_store;
 mod zcode_warm_v4_send;

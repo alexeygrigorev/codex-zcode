@@ -11,6 +11,9 @@ use super::ZcodeWarmBridge;
 use super::warm_bridge_enabled_from_value;
 use super::warm_mode_from_value;
 use crate::client::ZcodeRuntime;
+use crate::zcode_warm_permissions::PermissionRequest;
+use crate::zcode_warm_permissions::RiskTier;
+use crate::zcode_warm_permissions::WarmPermissionPolicy;
 use crate::zcode_warm_store::ZcodeWarmRecord;
 use crate::zcode_warm_v4_send::TurnInputChannel;
 use codex_api::ResponseEvent;
@@ -48,6 +51,12 @@ pub(crate) struct FakeServerOptions {
     /// `interaction/requestUserInput` callbacks during the create handshake,
     /// recording each answer in the stats file.
     pub(crate) probes_interactions: bool,
+    /// `riskLevel` carried by the permission probe.
+    pub(crate) permission_risk_level: &'static str,
+    /// Re-send the permission probe once (same business `requestId`, fresh
+    /// protocol id) after the host's first answer, the way the core
+    /// re-announces pending interactions.
+    pub(crate) reannounces_probe: bool,
     /// Probe the host with the provider-runtime-headers and official-MCP
     /// auth-headers callbacks during the create handshake, recording each
     /// answer in the stats file.
@@ -94,6 +103,8 @@ impl Default for FakeServerOptions {
         Self {
             rejects_unknown_create_keys: false,
             probes_interactions: false,
+            permission_risk_level: "medium",
+            reannounces_probe: false,
             probes_runtime_callbacks: false,
             emits_tool_events: false,
             turn_result_type: "success",
@@ -134,7 +145,7 @@ function sendProbe(kind, original) {
   const probeId = kind + "-" + original.id;
   const params = {
     sessionId: "sess_fake", turnId: "turn_1", requestId: "req_1", toolCallId: "tc_1",
-    toolName: "Bash", riskLevel: "medium", reason: "probe", input: { command: "ls /tmp" },
+    toolName: "Bash", riskLevel: PERM_RISK, reason: "probe", input: { command: "ls /tmp" },
   };
   if (kind === "input") params.prompt = "Which directory?";
   write({
@@ -142,6 +153,18 @@ function sendProbe(kind, original) {
     method: kind === "input" ? "interaction/requestUserInput" : "interaction/requestPermission",
     params,
   });
+  return probeId;
+}
+// The core re-announces a pending interaction every second with a fresh
+// protocol id and the same business requestId; this resends the permission
+// probe verbatim so tests can pin the host's reannouncement behavior.
+function resendPermissionProbe(original) {
+  const probeId = "perm-re-" + original.id;
+  const params = {
+    sessionId: "sess_fake", turnId: "turn_1", requestId: "req_1", toolCallId: "tc_1",
+    toolName: "Bash", riskLevel: PERM_RISK, reason: "probe", input: { command: "ls /tmp" },
+  };
+  write({ id: probeId, method: "interaction/requestPermission", params });
   return probeId;
 }
 function sendRuntimeProbe(kind, original) {
@@ -298,6 +321,8 @@ const DRIFT_KEY = "titleGenerationEnabled";
 const REJECT_DRIFT = %REJECT_DRIFT%;
 const PROBE_INTERACTIONS = %PROBE_INTERACTIONS%;
 const PROBE_RUNTIME = %PROBE_RUNTIME%;
+const PERM_RISK = "%PERM_RISK%";
+const REANNOUNCE_PROBE = %REANNOUNCE_PROBE%;
 const TOOL_EVENTS = %TOOL_EVENTS%;
 const FAIL_RESUME = %FAIL_RESUME%;
 const EXIT_MID_TURN = %EXIT_MID_TURN%;
@@ -353,6 +378,14 @@ process.stdin.on("data", (chunk) => {
       const original = pendingPerm.original;
       pendingPerm = null;
       stats("permission:" + (msg.error ? "rejected:" + msg.error.code : JSON.stringify(msg.result)));
+      if (REANNOUNCE_PROBE && !original.reannounced) {
+        // Re-announce once, like the core does every second while an
+        // interaction pends; the second answer resumes the normal chain.
+        original.reannounced = true;
+        const probeId = resendPermissionProbe(original);
+        pendingPerm = { probeId, original };
+        continue;
+      }
       const probeId = sendProbe("input", original);
       pendingInput = { probeId, original };
       continue;
@@ -402,6 +435,15 @@ process.stdin.on("data", (chunk) => {
         .replace(
             "%PROBE_RUNTIME%",
             if options.probes_runtime_callbacks {
+                "true"
+            } else {
+                "false"
+            },
+        )
+        .replace("%PERM_RISK%", options.permission_risk_level)
+        .replace(
+            "%REANNOUNCE_PROBE%",
+            if options.reannounces_probe {
                 "true"
             } else {
                 "false"
@@ -502,6 +544,7 @@ async fn warm_turn_streams_deltas_and_completes_with_usage() {
         &test_runtime(&fixture),
         "/tmp",
         WarmMode::Yolo,
+        WarmPermissionPolicy::DenyAll,
         SessionSeed::Fresh,
     )
     .expect("spawn fake app-server");
@@ -572,6 +615,7 @@ async fn warm_turn_maps_tool_call_events_to_bridge_activity() {
         &test_runtime(&fixture),
         "/tmp",
         WarmMode::Yolo,
+        WarmPermissionPolicy::DenyAll,
         SessionSeed::Fresh,
     )
     .expect("spawn fake app-server");
@@ -645,6 +689,7 @@ async fn warm_bridge_reuses_one_session_across_turns() {
         &test_runtime(&fixture),
         "/tmp",
         WarmMode::Yolo,
+        WarmPermissionPolicy::DenyAll,
         SessionSeed::Fresh,
     )
     .expect("spawn fake app-server");
@@ -683,6 +728,7 @@ async fn warm_turn_without_deltas_uses_final_response() {
         &test_runtime(&fixture),
         "/tmp",
         WarmMode::Yolo,
+        WarmPermissionPolicy::DenyAll,
         SessionSeed::Fresh,
     )
     .expect("spawn fake app-server");
@@ -751,6 +797,7 @@ async fn warm_turn_reports_budget_exhaustion_instead_of_success() {
         &test_runtime(&fixture),
         "/tmp",
         WarmMode::Yolo,
+        WarmPermissionPolicy::DenyAll,
         SessionSeed::Fresh,
     )
     .expect("spawn fake app-server");
@@ -796,6 +843,7 @@ async fn compat_retry_strips_unrecognized_keys_and_retries_once() {
         &test_runtime(&fixture),
         "/tmp",
         WarmMode::Yolo,
+        WarmPermissionPolicy::DenyAll,
         SessionSeed::Fresh,
     )
     .expect("spawn fake app-server");
@@ -827,6 +875,7 @@ async fn compat_retry_does_not_retry_unrelated_rejections() {
         &test_runtime(&fixture),
         "/tmp",
         WarmMode::Yolo,
+        WarmPermissionPolicy::DenyAll,
         SessionSeed::Fresh,
     )
     .expect("spawn fake app-server");
@@ -865,6 +914,7 @@ async fn gated_bridge_creates_build_session_and_denies_interaction_callbacks() {
         &test_runtime(&fixture),
         "/tmp",
         WarmMode::Build,
+        WarmPermissionPolicy::DenyAll,
         SessionSeed::Fresh,
     )
     .expect("spawn fake app-server");
@@ -887,6 +937,118 @@ async fn gated_bridge_creates_build_session_and_denies_interaction_callbacks() {
     bridge.kill("test end");
 }
 
+/// The stats line the fake server records for the permission probe, computed
+/// through the policy itself so the assertion cannot drift from it.
+fn permission_stats_line(policy: WarmPermissionPolicy, risk: RiskTier) -> String {
+    let answer = policy.resolve(&PermissionRequest {
+        tool_name: "Bash",
+        risk,
+        session_id: "sess_fake",
+        request_id: "req_1",
+    });
+    format!(
+        "permission:{}",
+        serde_json::json!({ "decision": answer.decision, "reason": answer.reason })
+    )
+}
+
+#[tokio::test]
+async fn allow_safe_policy_auto_approves_medium_risk_requests() {
+    let fixture = write_fake_server_with(FakeServerOptions {
+        probes_interactions: true,
+        ..FakeServerOptions::default()
+    });
+    let bridge = ZcodeWarmBridge::spawn(
+        &test_runtime(&fixture),
+        "/tmp",
+        WarmMode::Build,
+        WarmPermissionPolicy::AllowSafe,
+        SessionSeed::Fresh,
+    )
+    .expect("spawn fake app-server");
+    bridge
+        .ensure_session("/tmp")
+        .await
+        .expect("session created");
+
+    let stats_text = std::fs::read_to_string(stats_path(&fixture)).expect("stats written");
+    let expected = permission_stats_line(WarmPermissionPolicy::AllowSafe, RiskTier::Medium);
+    assert!(
+        stats_text.lines().any(|line| line == expected),
+        "stats: {stats_text}"
+    );
+    bridge.kill("test end");
+}
+
+#[tokio::test]
+async fn allow_safe_policy_denies_high_risk_requests() {
+    let fixture = write_fake_server_with(FakeServerOptions {
+        probes_interactions: true,
+        permission_risk_level: "high",
+        ..FakeServerOptions::default()
+    });
+    let bridge = ZcodeWarmBridge::spawn(
+        &test_runtime(&fixture),
+        "/tmp",
+        WarmMode::Build,
+        WarmPermissionPolicy::AllowSafe,
+        SessionSeed::Fresh,
+    )
+    .expect("spawn fake app-server");
+    bridge
+        .ensure_session("/tmp")
+        .await
+        .expect("session created");
+
+    let stats_text = std::fs::read_to_string(stats_path(&fixture)).expect("stats written");
+    let expected = permission_stats_line(WarmPermissionPolicy::AllowSafe, RiskTier::High);
+    assert!(
+        stats_text.lines().any(|line| line == expected),
+        "stats: {stats_text}"
+    );
+    bridge.kill("test end");
+}
+
+#[tokio::test]
+async fn reannounced_permission_request_is_answered_each_time() {
+    let fixture = write_fake_server_with(FakeServerOptions {
+        probes_interactions: true,
+        reannounces_probe: true,
+        ..FakeServerOptions::default()
+    });
+    let bridge = ZcodeWarmBridge::spawn(
+        &test_runtime(&fixture),
+        "/tmp",
+        WarmMode::Build,
+        WarmPermissionPolicy::DenyAll,
+        SessionSeed::Fresh,
+    )
+    .expect("spawn fake app-server");
+    bridge
+        .ensure_session("/tmp")
+        .await
+        .expect("session created");
+
+    // Every reannouncement carries a protocol id the core expects answered;
+    // a bridge that deduped answers would wedge the handshake here.
+    let stats_text = std::fs::read_to_string(stats_path(&fixture)).expect("stats written");
+    let deny_line = permission_stats_line(WarmPermissionPolicy::DenyAll, RiskTier::Medium);
+    assert_eq!(
+        stats_text.lines().filter(|line| *line == deny_line).count(),
+        2,
+        "both reannouncements are answered; stats: {stats_text}"
+    );
+    // The user-input probe only runs after the reannouncement resolves, so
+    // reaching it proves the whole handshake survived.
+    assert!(
+        stats_text
+            .lines()
+            .any(|line| line.starts_with("userinput:")),
+        "stats: {stats_text}"
+    );
+    bridge.kill("test end");
+}
+
 #[tokio::test]
 async fn yolo_bridge_rejects_interaction_callbacks() {
     let fixture = write_fake_server_with(FakeServerOptions {
@@ -897,6 +1059,7 @@ async fn yolo_bridge_rejects_interaction_callbacks() {
         &test_runtime(&fixture),
         "/tmp",
         WarmMode::Yolo,
+        WarmPermissionPolicy::DenyAll,
         SessionSeed::Fresh,
     )
     .expect("spawn fake app-server");
@@ -929,6 +1092,7 @@ async fn bridge_fast_fails_runtime_header_callbacks_with_host_fallback_shapes() 
         &test_runtime(&fixture),
         "/tmp",
         WarmMode::Yolo,
+        WarmPermissionPolicy::DenyAll,
         SessionSeed::Fresh,
     )
     .expect("spawn fake app-server");
@@ -959,6 +1123,7 @@ async fn respawned_bridge_resumes_the_previous_session_instead_of_creating() {
         &test_runtime(&fixture),
         "/tmp",
         WarmMode::Yolo,
+        WarmPermissionPolicy::DenyAll,
         SessionSeed::Fresh,
     )
     .expect("spawn fake app-server");
@@ -975,6 +1140,7 @@ async fn respawned_bridge_resumes_the_previous_session_instead_of_creating() {
         &test_runtime(&fixture),
         "/tmp",
         WarmMode::Yolo,
+        WarmPermissionPolicy::DenyAll,
         SessionSeed::Predecessor(previous.clone()),
     )
     .expect("spawn replacement app-server");
@@ -1004,6 +1170,7 @@ async fn resume_failure_falls_back_to_creating_a_fresh_session() {
         &test_runtime(&fixture),
         "/tmp",
         WarmMode::Yolo,
+        WarmPermissionPolicy::DenyAll,
         SessionSeed::Predecessor("sess_prev".to_string()),
     )
     .expect("spawn fake app-server");
@@ -1027,6 +1194,7 @@ async fn recorded_session_is_adopted_via_list_and_resume() {
         &test_runtime(&fixture),
         "/tmp",
         WarmMode::Yolo,
+        WarmPermissionPolicy::DenyAll,
         SessionSeed::Recorded(ZcodeWarmRecord {
             zcode_session_id: "sess_fake".to_string(),
             workspace_path: "/tmp".to_string(),
@@ -1071,6 +1239,7 @@ async fn recorded_session_missing_on_the_server_creates_a_fresh_one() {
         &test_runtime(&fixture),
         "/tmp",
         WarmMode::Yolo,
+        WarmPermissionPolicy::DenyAll,
         SessionSeed::Recorded(ZcodeWarmRecord {
             zcode_session_id: "sess_gone".to_string(),
             workspace_path: "/tmp".to_string(),
@@ -1106,6 +1275,7 @@ async fn recorded_session_in_another_workspace_creates_a_fresh_one() {
         &test_runtime(&fixture),
         "/tmp",
         WarmMode::Yolo,
+        WarmPermissionPolicy::DenyAll,
         SessionSeed::Recorded(ZcodeWarmRecord {
             zcode_session_id: "sess_elsewhere".to_string(),
             workspace_path: "/elsewhere".to_string(),
@@ -1141,6 +1311,7 @@ async fn collector_fails_fast_when_the_app_server_exits_mid_turn() {
         &test_runtime(&fixture),
         "/tmp",
         WarmMode::Yolo,
+        WarmPermissionPolicy::DenyAll,
         SessionSeed::Fresh,
     )
     .expect("spawn fake app-server");
@@ -1174,6 +1345,7 @@ async fn v4_send_channel_sends_text_through_v4_command() {
         &test_runtime(&fixture),
         "/tmp",
         WarmMode::Yolo,
+        WarmPermissionPolicy::DenyAll,
         SessionSeed::Fresh,
     )
     .expect("spawn fake app-server");
@@ -1240,6 +1412,7 @@ async fn v4_send_failure_falls_back_to_legacy_send() {
         &test_runtime(&fixture),
         "/tmp",
         WarmMode::Yolo,
+        WarmPermissionPolicy::DenyAll,
         SessionSeed::Fresh,
     )
     .expect("spawn fake app-server");

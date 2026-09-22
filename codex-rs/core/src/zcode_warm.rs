@@ -18,8 +18,10 @@
 //! `ZCODE_WARM_MODE=build` opts into the gated variant of the experiment:
 //! the session is created in `build` mode so the core asks before risky
 //! actions via `interaction/*` callbacks. The bridge has no human on the
-//! other end, so it denies every request and logs it — measuring how far a
-//! gated core gets and what a real approval bridge would need (issue #25).
+//! other end, so the `ZCODE_WARM_PERMISSIONS` policy decides: `deny`
+//! (default) refuses every request with a reason, `allow-safe` auto-approves
+//! low/medium risk and gates the rest — measuring how far a gated core gets
+//! and what a real approval bridge would need (issue #25).
 //!
 //! Envelope (JSON-RPC minus the `jsonrpc` member):
 //! `{"id", "method", "params"}` requests, bare `{"method", "params"}`
@@ -55,6 +57,9 @@ use crate::client::zcode_failure_message;
 use crate::client::zcode_stderr_tail;
 use crate::zcode_process;
 use crate::zcode_warm_events::bridge_tool_activity_from_notification;
+use crate::zcode_warm_permissions::PermissionRequest;
+use crate::zcode_warm_permissions::PermissionRequestLog;
+use crate::zcode_warm_permissions::WarmPermissionPolicy;
 use crate::zcode_warm_resume;
 
 /// Env var enabling the warm bridge (`ZCODE_WARM=1`).
@@ -251,6 +256,8 @@ pub(crate) struct ZcodeWarmBridge {
     consecutive_failures: AtomicU32,
     request_timeout: Duration,
     mode: WarmMode,
+    permission_policy: WarmPermissionPolicy,
+    permission_log: StdMutex<PermissionRequestLog>,
 }
 
 impl std::fmt::Debug for ZcodeWarmBridge {
@@ -271,6 +278,7 @@ impl ZcodeWarmBridge {
         runtime: &ZcodeRuntime,
         workspace_path: &str,
         mode: WarmMode,
+        permission_policy: WarmPermissionPolicy,
         resume_seed: SessionSeed,
     ) -> io::Result<Arc<Self>> {
         let mut command = Command::new(&runtime.node);
@@ -356,6 +364,8 @@ impl ZcodeWarmBridge {
             consecutive_failures: AtomicU32::new(0),
             request_timeout: REQUEST_TIMEOUT,
             mode,
+            permission_policy,
+            permission_log: StdMutex::new(PermissionRequestLog::default()),
         });
 
         // The reader holds the bridge only weakly: when the thread's last
@@ -536,11 +546,12 @@ impl ZcodeWarmBridge {
     /// unknown callbacks get a protocol error so the core fails fast instead
     /// of waiting out its request timeout.
     ///
-    /// In gated mode the `interaction/*` requests are answered with denials
-    /// (the wire result schemas are strict: permission answers carry
-    /// `decision`, user-input answers carry `action`), and each request is
-    /// logged with a bounded input preview so the experiment shows exactly
-    /// what the gated core wanted to do.
+    /// In gated mode the `interaction/*` requests are answered by the
+    /// [`WarmPermissionPolicy`] (the wire result schemas are strict:
+    /// permission answers carry `decision`, user-input answers carry
+    /// `action`), and each first-seen request is logged with a bounded input
+    /// preview so the experiment shows exactly what the gated core wanted to
+    /// do.
     async fn answer_callback(
         &self,
         id: serde_json::Value,
@@ -591,34 +602,39 @@ impl ZcodeWarmBridge {
                 })
             }
             "interaction/requestPermission" if self.mode == WarmMode::Build => {
-                let input_preview = params
-                    .get("input")
-                    .map(serde_json::to_string)
-                    .and_then(Result::ok)
-                    .map(|input| input.chars().take(200).collect::<String>())
-                    .unwrap_or_default();
-                warn!(
-                    "ZCode warm permission request denied: tool={} risk={} reason={} input={}",
-                    params
-                        .get("toolName")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("unknown"),
-                    params
-                        .get("riskLevel")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("unknown"),
-                    params
-                        .get("reason")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or(""),
-                    input_preview,
-                );
+                let request = PermissionRequest::from_params(params);
+                let answer = self.permission_policy.resolve(&request);
+                // The core re-sends a pending interaction every second with a
+                // fresh protocol id; log only the first sighting.
+                let is_new = self
+                    .permission_log
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .first_sighting(request.session_id, request.request_id);
+                if is_new {
+                    let input_preview = params
+                        .get("input")
+                        .map(serde_json::to_string)
+                        .and_then(Result::ok)
+                        .map(|input| input.chars().take(200).collect::<String>())
+                        .unwrap_or_default();
+                    warn!(
+                        "ZCode warm permission request {}: tool={} risk={:?} reason={} input={}",
+                        answer.decision,
+                        request.tool_name,
+                        request.risk,
+                        params
+                            .get("reason")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or(""),
+                        input_preview,
+                    );
+                }
                 serde_json::json!({
                     "id": id,
                     "result": {
-                        "decision": "deny",
-                        "reason": "Denied by the Codex host: the warm ZCode bridge has no \
-                                   interactive approver",
+                        "decision": answer.decision,
+                        "reason": answer.reason,
                     },
                 })
             }

@@ -17,6 +17,7 @@ use crate::zcode_warm::tests::next_event;
 use crate::zcode_warm::tests::stats_path;
 use crate::zcode_warm::tests::test_runtime;
 use crate::zcode_warm::tests::write_fake_server_with;
+use crate::zcode_warm_permissions::WarmPermissionPolicy;
 use codex_api::ResponseEvent;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
@@ -112,6 +113,7 @@ async fn mirrored_turn(
         &test_runtime(fixture),
         "/tmp",
         WarmMode::Yolo,
+        WarmPermissionPolicy::DenyAll,
         SessionSeed::Fresh,
     )
     .expect("spawn fake app-server");
@@ -279,6 +281,7 @@ async fn mirrored_goal_turn_fails_when_the_set_is_refused() {
         &test_runtime(&fixture),
         "/tmp",
         WarmMode::Yolo,
+        WarmPermissionPolicy::DenyAll,
         SessionSeed::Fresh,
     )
     .expect("spawn fake app-server");
@@ -307,6 +310,7 @@ async fn mirrored_goal_turn_fails_when_the_core_skips_the_goal_loop() {
         &test_runtime(&fixture),
         "/tmp",
         WarmMode::Yolo,
+        WarmPermissionPolicy::DenyAll,
         SessionSeed::Fresh,
     )
     .expect("spawn fake app-server");
