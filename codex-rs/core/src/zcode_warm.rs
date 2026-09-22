@@ -242,6 +242,11 @@ pub(crate) struct ZcodeWarmBridge {
     /// with the session id so a later process knows where catch-up would
     /// start from.
     last_event_seq: AtomicU64,
+    /// `protocol.version` the core reported on create/resume; 0 before the
+    /// handshake. Persisted so a zcode.cjs auto-update that shifts the
+    /// protocol version between processes is caught by the record's drift
+    /// warning (issue #44).
+    protocol_version: AtomicU64,
     dead: Arc<AtomicBool>,
     consecutive_failures: AtomicU32,
     request_timeout: Duration,
@@ -346,6 +351,7 @@ impl ZcodeWarmBridge {
             session_id: tokio::sync::OnceCell::new(),
             resume_seed,
             last_event_seq: AtomicU64::new(0),
+            protocol_version: AtomicU64::new(0),
             dead: Arc::clone(&dead),
             consecutive_failures: AtomicU32::new(0),
             request_timeout: REQUEST_TIMEOUT,
@@ -406,6 +412,17 @@ impl ZcodeWarmBridge {
     /// Highest `seq` seen on the session's event stream, or 0 before any.
     pub(crate) fn last_event_seq(&self) -> u64 {
         self.last_event_seq.load(Ordering::Relaxed)
+    }
+
+    /// `protocol.version` the core reported during the handshake, or 0
+    /// before it completed.
+    pub(crate) fn protocol_version(&self) -> u32 {
+        u32::try_from(self.protocol_version.load(Ordering::Relaxed)).unwrap_or(0)
+    }
+
+    /// Records the handshake's `protocol.version` if the core reported one.
+    pub(crate) fn observe_protocol_version(&self, version: u64) {
+        self.protocol_version.store(version, Ordering::Relaxed);
     }
 
     /// Folds an observed sequence number into [`Self::last_event_seq`].
@@ -752,14 +769,16 @@ impl ZcodeWarmBridge {
 
     /// Sends one user turn and returns the mapped Codex event stream.
     ///
-    /// Events arrive as `session/event` notifications on the shared
-    /// subscription; the collector filters by session, maps text deltas and
-    /// the terminal event, and stops the server-side turn if the consumer
-    /// goes away.
+    /// The input goes out on `channel` (legacy `session/send` or the
+    /// `v4/command sendText` prototype, issue #44); events arrive as
+    /// `session/event` notifications on the shared subscription either way.
+    /// The collector filters by session, maps text deltas and the terminal
+    /// event, and stops the server-side turn if the consumer goes away.
     pub(crate) fn turn(
         self: &Arc<Self>,
         session_id: &str,
         content: &str,
+        channel: crate::zcode_warm_v4_send::TurnInputChannel,
     ) -> Result<codex_api::ResponseStream, String> {
         let mut events = self.events.subscribe();
         let send_bridge = Arc::clone(self);
@@ -773,26 +792,15 @@ impl ZcodeWarmBridge {
         let collector_session = session_id.to_string();
         let collector_timeout = event_timeout();
         tokio::spawn(async move {
-            let send = send_bridge
-                .request_with_compat_retry(
-                    "session/send",
-                    serde_json::json!({ "sessionId": send_session, "content": send_content }),
-                )
-                .await;
-            let send = match send {
-                Ok(result) => result,
-                Err(message) => {
-                    let _ = tx.send(Err(ApiError::Stream(message))).await;
-                    return;
-                }
-            };
-            if send.get("accepted") != Some(&serde_json::Value::Bool(true)) {
-                let _ = tx
-                    .send(Err(ApiError::Stream(format!(
-                        "session/send was not accepted: {}",
-                        serde_json::to_string(&send).unwrap_or_default()
-                    ))))
-                    .await;
+            let sent = crate::zcode_warm_v4_send::send_turn_input(
+                &send_bridge,
+                &send_session,
+                &send_content,
+                channel,
+            )
+            .await;
+            if let Err(message) = sent {
+                let _ = tx.send(Err(ApiError::Stream(message))).await;
                 return;
             }
 

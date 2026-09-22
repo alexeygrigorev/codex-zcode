@@ -3059,7 +3059,11 @@ impl ModelClientSession {
         let turned = async {
             let session_id = bridge.ensure_session(&workspace_path).await?;
             let content = zcode_warm_turn_content(&prompt.input);
-            let stream = bridge.turn(&session_id, &content)?;
+            let stream = bridge.turn(
+                &session_id,
+                &content,
+                crate::zcode_warm_v4_send::channel_from_env(),
+            )?;
             Ok((stream, session_id))
         }
         .await;
@@ -3076,6 +3080,10 @@ impl ModelClientSession {
                         zcode_session_id: session_id,
                         workspace_path: workspace_path.clone(),
                         last_event_seq: bridge.last_event_seq(),
+                        protocol_version: {
+                            let version = bridge.protocol_version();
+                            (version != 0).then_some(version)
+                        },
                     },
                 );
                 Ok(stream)

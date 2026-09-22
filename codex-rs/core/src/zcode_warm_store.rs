@@ -32,6 +32,12 @@ pub(crate) struct ZcodeWarmRecord {
     /// `session/events` catch-up.
     #[serde(default)]
     pub(crate) last_event_seq: u64,
+    /// `protocol.version` the core reported at the last handshake. The
+    /// desktop app auto-updates zcode.cjs under us, so a change between
+    /// processes is the visible edge of a protocol drift and gets a loud
+    /// warning (issue #44).
+    #[serde(default)]
+    pub(crate) protocol_version: Option<u32>,
 }
 
 /// Reads the thread's record, or `None` when absent or unreadable.
@@ -45,10 +51,31 @@ pub(crate) fn load_record(thread_id: &ThreadId) -> Option<ZcodeWarmRecord> {
     }
 }
 
-/// Persists the thread's record, replacing any previous one.
+/// Persists the thread's record, replacing any previous one; a changed
+/// `protocol_version` warns loudly, since the vendored binary drifted under
+/// us and the warm bridge's wire assumptions are worth re-checking.
 pub(crate) fn store_record(thread_id: &ThreadId, record: &ZcodeWarmRecord) {
     if let Ok(codex_home) = find_codex_home() {
-        store_record_to(&record_dir(&codex_home), thread_id, record);
+        let dir = record_dir(&codex_home);
+        if let Some(previous) = load_record_from(&dir, thread_id)
+            && let Some(message) = protocol_drift_message(&previous, record)
+        {
+            warn!("{message}");
+        }
+        store_record_to(&dir, thread_id, record);
+    }
+}
+
+/// The drift warning for `previous` → `next`, or `None` when the recorded
+/// protocol version did not change.
+fn protocol_drift_message(previous: &ZcodeWarmRecord, next: &ZcodeWarmRecord) -> Option<String> {
+    match (previous.protocol_version, next.protocol_version) {
+        (Some(old), Some(new)) if old != new => Some(format!(
+            "ZCode Protocol version drift: zcode.cjs moved from v{old} to v{new} for session \
+             {}; re-verify the warm bridge",
+            next.zcode_session_id
+        )),
+        _ => None,
     }
 }
 

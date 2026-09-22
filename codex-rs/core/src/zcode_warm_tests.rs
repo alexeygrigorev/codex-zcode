@@ -12,6 +12,7 @@ use super::warm_bridge_enabled_from_value;
 use super::warm_mode_from_value;
 use crate::client::ZcodeRuntime;
 use crate::zcode_warm_store::ZcodeWarmRecord;
+use crate::zcode_warm_v4_send::TurnInputChannel;
 use codex_api::ResponseEvent;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::BridgeToolActivityEvent;
@@ -63,6 +64,9 @@ struct FakeServerOptions {
     /// Answer `session/list` with no sessions, so a recorded session that
     /// the server forgot cannot be adopted.
     empty_session_list: bool,
+    /// Reject `v4/command` with method-not-found, exercising the prototype
+    /// channel's legacy fallback.
+    fails_v4_command: bool,
 }
 
 impl Default for FakeServerOptions {
@@ -76,6 +80,7 @@ impl Default for FakeServerOptions {
             fails_resume: false,
             exits_mid_turn: false,
             empty_session_list: false,
+            fails_v4_command: false,
         }
     }
 }
@@ -187,26 +192,23 @@ function handle(msg) {
         emit({ sessionId: msg.params.sessionId, type: "model.streaming", payload: { kind: "text_delta", delta: "pa" } });
         process.exit(0);
       }
-      if (TOOL_EVENTS) {
-        emit({ sessionId: msg.params.sessionId, type: "tool_call_scheduled", payload: { toolCallId: "tc_1", toolName: "Bash", input: { command: "ls /tmp" } } });
-        emit({ sessionId: msg.params.sessionId, type: "tool_call_scheduled", payload: { toolCallId: "tc_2", toolName: "Read", input: { file: "/x" } } });
-        emit({ sessionId: msg.params.sessionId, type: "tool_call_result", payload: { toolCallId: "tc_1", result: { success: true, content: "out" }, duration: 3 } });
-        emit({ sessionId: msg.params.sessionId, type: "tool_call_error", payload: { toolCallId: "tc_2", error: { type: "ToolError", message: "boom" } } });
-      }
-      if (!content.includes("nodelta")) {
-        emit({ sessionId: msg.params.sessionId, type: "model.streaming", payload: { kind: "text_delta", delta: content.slice(0, 2) } });
-        emit({ sessionId: msg.params.sessionId, type: "model.streaming", payload: { kind: "text_delta", delta: content.slice(2) } });
-      }
-      emit({
-        sessionId: msg.params.sessionId,
-        type: "turn.completed",
-        payload: {
-          response: content + "!",
-          usage: { inputTokens: 10, outputTokens: 2, totalTokens: 12, cacheReadTokens: 5, reasoningTokens: 1 },
-          resultType: "%RESULT_TYPE%",
-        },
-      });
+      runTurn(msg.params.sessionId, content);
       respond({ accepted: true, sessionId: msg.params.sessionId, stateRevision: 1 });
+      break;
+    }
+    case "v4/command": {
+      if (FAIL_V4) {
+        write({ id: msg.id, error: { code: -32601, message: "method not found: v4/command" } });
+        break;
+      }
+      stats("v4command:" + JSON.stringify(msg.params));
+      runTurn(msg.params.sessionId, msg.params.payload.text);
+      respond({
+        commandId: msg.params.commandId,
+        status: "accepted",
+        revisionAtDecision: 1,
+        result: { type: "inputAccepted", delivery: "startNow", inputId: msg.params.commandId },
+      });
       break;
     }
     case "session/stop":
@@ -216,6 +218,29 @@ function handle(msg) {
       write({ id: msg.id, error: { code: -32601, message: "unhandled " + msg.method } });
   }
 }
+// Both input surfaces feed the same turn: tool activity, deltas, terminal
+// event — only the request/ACK envelope differs.
+function runTurn(sessionId, content) {
+  if (TOOL_EVENTS) {
+    emit({ sessionId: sessionId, type: "tool_call_scheduled", payload: { toolCallId: "tc_1", toolName: "Bash", input: { command: "ls /tmp" } } });
+    emit({ sessionId: sessionId, type: "tool_call_scheduled", payload: { toolCallId: "tc_2", toolName: "Read", input: { file: "/x" } } });
+    emit({ sessionId: sessionId, type: "tool_call_result", payload: { toolCallId: "tc_1", result: { success: true, content: "out" }, duration: 3 } });
+    emit({ sessionId: sessionId, type: "tool_call_error", payload: { toolCallId: "tc_2", error: { type: "ToolError", message: "boom" } } });
+  }
+  if (!content.includes("nodelta")) {
+    emit({ sessionId: sessionId, type: "model.streaming", payload: { kind: "text_delta", delta: content.slice(0, 2) } });
+    emit({ sessionId: sessionId, type: "model.streaming", payload: { kind: "text_delta", delta: content.slice(2) } });
+  }
+  emit({
+    sessionId: sessionId,
+    type: "turn.completed",
+    payload: {
+      response: content + "!",
+      usage: { inputTokens: 10, outputTokens: 2, totalTokens: 12, cacheReadTokens: 5, reasoningTokens: 1 },
+      resultType: "%RESULT_TYPE%",
+    },
+  });
+}
 const DRIFT_KEY = "titleGenerationEnabled";
 const REJECT_DRIFT = %REJECT_DRIFT%;
 const PROBE_INTERACTIONS = %PROBE_INTERACTIONS%;
@@ -224,6 +249,7 @@ const TOOL_EVENTS = %TOOL_EVENTS%;
 const FAIL_RESUME = %FAIL_RESUME%;
 const EXIT_MID_TURN = %EXIT_MID_TURN%;
 const EMPTY_LIST = %EMPTY_LIST%;
+const FAIL_V4 = %FAIL_V4%;
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => {
   buffer += chunk;
@@ -359,6 +385,14 @@ process.stdin.on("data", (chunk) => {
                 "false"
             },
         )
+        .replace(
+            "%FAIL_V4%",
+            if options.fails_v4_command {
+                "true"
+            } else {
+                "false"
+            },
+        )
         .replace("%RESULT_TYPE%", options.turn_result_type);
     std::fs::write(&fixture, script).expect("write fake app-server fixture");
     fixture
@@ -410,7 +444,9 @@ async fn warm_turn_streams_deltas_and_completes_with_usage() {
         .ensure_session("/tmp")
         .await
         .expect("session created");
-    let stream = bridge.turn(&session_id, "first").expect("turn starts");
+    let stream = bridge
+        .turn(&session_id, "first", TurnInputChannel::LegacySend)
+        .expect("turn starts");
     let mut rx = stream.rx_event;
 
     match next_event(&mut rx).await {
@@ -455,6 +491,9 @@ async fn warm_turn_streams_deltas_and_completes_with_usage() {
     // The fake numbers event envelopes from 8 (subscribe pins head 7): two
     // deltas then turn.completed. The bridge must have tracked the stream.
     assert_eq!(bridge.last_event_seq(), 10);
+    // The create handshake reported the fake's protocol version; the drift
+    // guard pins it.
+    assert_eq!(bridge.protocol_version(), 1);
     bridge.kill("test end");
 }
 
@@ -475,7 +514,9 @@ async fn warm_turn_maps_tool_call_events_to_bridge_activity() {
         .ensure_session("/tmp")
         .await
         .expect("session created");
-    let stream = bridge.turn(&session_id, "toolturn").expect("turn starts");
+    let stream = bridge
+        .turn(&session_id, "toolturn", TurnInputChannel::LegacySend)
+        .expect("turn starts");
     let mut rx = stream.rx_event;
 
     let expected = [
@@ -548,7 +589,9 @@ async fn warm_bridge_reuses_one_session_across_turns() {
         .expect("session created");
 
     for prompt in ["first", "second"] {
-        let stream = bridge.turn(&session_id, prompt).expect("turn starts");
+        let stream = bridge
+            .turn(&session_id, prompt, TurnInputChannel::LegacySend)
+            .expect("turn starts");
         let mut rx = stream.rx_event;
         loop {
             if matches!(next_event(&mut rx).await, ResponseEvent::Completed { .. }) {
@@ -583,7 +626,7 @@ async fn warm_turn_without_deltas_uses_final_response() {
         .await
         .expect("session created");
     let stream = bridge
-        .turn(&session_id, "nodelta please")
+        .turn(&session_id, "nodelta please", TurnInputChannel::LegacySend)
         .expect("turn starts");
     let mut rx = stream.rx_event;
 
@@ -650,7 +693,9 @@ async fn warm_turn_reports_budget_exhaustion_instead_of_success() {
         .ensure_session("/tmp")
         .await
         .expect("session created");
-    let stream = bridge.turn(&session_id, "nodelta").expect("turn starts");
+    let stream = bridge
+        .turn(&session_id, "nodelta", TurnInputChannel::LegacySend)
+        .expect("turn starts");
     let mut rx = stream.rx_event;
 
     // The final response is flushed before the error so the partial
@@ -921,6 +966,7 @@ async fn recorded_session_is_adopted_via_list_and_resume() {
             zcode_session_id: "sess_fake".to_string(),
             workspace_path: "/tmp".to_string(),
             last_event_seq: 41,
+            protocol_version: Some(1),
         }),
     )
     .expect("spawn fake app-server");
@@ -963,6 +1009,7 @@ async fn recorded_session_missing_on_the_server_creates_a_fresh_one() {
         SessionSeed::Recorded(ZcodeWarmRecord {
             zcode_session_id: "sess_gone".to_string(),
             workspace_path: "/tmp".to_string(),
+            protocol_version: None,
             last_event_seq: 0,
         }),
     )
@@ -997,6 +1044,7 @@ async fn recorded_session_in_another_workspace_creates_a_fresh_one() {
         SessionSeed::Recorded(ZcodeWarmRecord {
             zcode_session_id: "sess_elsewhere".to_string(),
             workspace_path: "/elsewhere".to_string(),
+            protocol_version: None,
             last_event_seq: 3,
         }),
     )
@@ -1035,7 +1083,9 @@ async fn collector_fails_fast_when_the_app_server_exits_mid_turn() {
         .ensure_session("/tmp")
         .await
         .expect("session created");
-    let stream = bridge.turn(&session_id, "dying turn").expect("turn starts");
+    let stream = bridge
+        .turn(&session_id, "dying turn", TurnInputChannel::LegacySend)
+        .expect("turn starts");
     let mut rx = stream.rx_event;
 
     let err = loop {
@@ -1050,4 +1100,115 @@ async fn collector_fails_fast_when_the_app_server_exits_mid_turn() {
         matches!(err, codex_api::ApiError::Stream(ref message) if message.contains("exited mid-turn")),
         "got {err:?}"
     );
+}
+
+#[tokio::test]
+async fn v4_send_channel_sends_text_through_v4_command() {
+    let fixture = write_fake_server();
+    let bridge = ZcodeWarmBridge::spawn(
+        &test_runtime(&fixture),
+        "/tmp",
+        WarmMode::Yolo,
+        SessionSeed::Fresh,
+    )
+    .expect("spawn fake app-server");
+    let session_id = bridge
+        .ensure_session("/tmp")
+        .await
+        .expect("session created");
+    let stream = bridge
+        .turn(&session_id, "v4 hello", TurnInputChannel::V4Command)
+        .expect("turn starts");
+    let mut rx = stream.rx_event;
+
+    loop {
+        match next_event(&mut rx).await {
+            ResponseEvent::OutputItemAdded(_) => continue,
+            ResponseEvent::OutputTextDelta(delta) => {
+                assert_eq!(delta, "v4");
+                break;
+            }
+            other => panic!("expected OutputTextDelta, got {other:?}"),
+        }
+    }
+    loop {
+        match next_event(&mut rx).await {
+            ResponseEvent::Completed { end_turn, .. } => {
+                assert_eq!(end_turn, Some(true));
+                break;
+            }
+            ResponseEvent::OutputItemAdded(_)
+            | ResponseEvent::OutputTextDelta(_)
+            | ResponseEvent::OutputItemDone(_) => continue,
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    let stats_text = std::fs::read_to_string(stats_path(&fixture)).expect("stats written");
+    let lines: Vec<&str> = stats_text.lines().collect();
+    let command = lines
+        .iter()
+        .find(|line| line.starts_with("v4command:"))
+        .expect("the input must go out on v4/command");
+    assert!(
+        command.contains("\"type\":\"sendText\"")
+            && command.contains("\"text\":\"v4 hello\"")
+            && command.contains("\"sessionId\":\"sess_fake\"")
+            && command.contains("\"commandId\"")
+            && command.contains("\"issuedAt\""),
+        "the envelope must carry the v4 sendText shape: {command}"
+    );
+    assert!(
+        !lines.iter().any(|line| line.starts_with("send:")),
+        "the v4 channel must not touch legacy session/send: {stats_text}"
+    );
+    bridge.kill("test end");
+}
+
+#[tokio::test]
+async fn v4_send_failure_falls_back_to_legacy_send() {
+    let fixture = write_fake_server_with(FakeServerOptions {
+        fails_v4_command: true,
+        ..FakeServerOptions::default()
+    });
+    let bridge = ZcodeWarmBridge::spawn(
+        &test_runtime(&fixture),
+        "/tmp",
+        WarmMode::Yolo,
+        SessionSeed::Fresh,
+    )
+    .expect("spawn fake app-server");
+    let session_id = bridge
+        .ensure_session("/tmp")
+        .await
+        .expect("session created");
+    let stream = bridge
+        .turn(&session_id, "fallback", TurnInputChannel::V4Command)
+        .expect("turn starts");
+    let mut rx = stream.rx_event;
+
+    loop {
+        match next_event(&mut rx).await {
+            ResponseEvent::Completed { end_turn, .. } => {
+                assert_eq!(end_turn, Some(true));
+                break;
+            }
+            ResponseEvent::OutputItemAdded(_)
+            | ResponseEvent::OutputTextDelta(_)
+            | ResponseEvent::OutputItemDone(_) => continue,
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    let stats_text = std::fs::read_to_string(stats_path(&fixture)).expect("stats written");
+    let lines: Vec<&str> = stats_text.lines().collect();
+    assert!(
+        lines.contains(&"v4/command"),
+        "the v4 attempt must have been made: {stats_text}"
+    );
+    assert!(
+        lines.iter().any(|line| line.starts_with("send:fallback")),
+        "the rejected v4 command must fall back to session/send: {stats_text}"
+    );
+    bridge.kill("test end");
 }

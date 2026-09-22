@@ -106,7 +106,7 @@ async fn resume_session(
     session_id: &str,
     workspace_path: &str,
 ) -> Result<(), String> {
-    bridge
+    let resumed = bridge
         .request_with_compat_retry(
             "session/resume",
             serde_json::json!({
@@ -118,6 +118,7 @@ async fn resume_session(
             }),
         )
         .await?;
+    observe_protocol_version(bridge, &resumed);
     subscribe(bridge, session_id).await
 }
 
@@ -140,6 +141,7 @@ async fn create_session(
             }),
         )
         .await?;
+    observe_protocol_version(bridge, &created);
     let session_id = created
         .pointer("/session/sessionId")
         .and_then(serde_json::Value::as_str)
@@ -152,6 +154,17 @@ async fn create_session(
         .to_string();
     subscribe(bridge, &session_id).await?;
     Ok(session_id)
+}
+
+/// Pins the core's reported `protocol.version` onto the bridge so the
+/// persisted record can warn when a zcode.cjs update shifts it (issue #44).
+fn observe_protocol_version(bridge: &ZcodeWarmBridge, handshake_result: &serde_json::Value) {
+    if let Some(version) = handshake_result
+        .pointer("/protocol/version")
+        .and_then(serde_json::Value::as_u64)
+    {
+        bridge.observe_protocol_version(version);
+    }
 }
 
 /// Subscribes to the session's live `session/event` stream.

@@ -5,6 +5,7 @@ use pretty_assertions::assert_eq;
 
 use crate::zcode_warm_store::ZcodeWarmRecord;
 use crate::zcode_warm_store::load_record_from;
+use crate::zcode_warm_store::protocol_drift_message;
 use crate::zcode_warm_store::store_record_to;
 
 fn test_dir(name: &str) -> std::path::PathBuf {
@@ -21,6 +22,7 @@ fn sample_record() -> ZcodeWarmRecord {
         zcode_session_id: "sess_abc123".to_string(),
         workspace_path: "/repo".to_string(),
         last_event_seq: 42,
+        protocol_version: Some(1),
     }
 }
 
@@ -78,8 +80,32 @@ fn store_overwrites_a_previous_record() {
         zcode_session_id: "sess_fresh".to_string(),
         workspace_path: "/other".to_string(),
         last_event_seq: 0,
+        protocol_version: None,
     };
     store_record_to(&dir, &thread_id, &replaced);
     assert_eq!(load_record_from(&dir, &thread_id), Some(replaced));
     let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn protocol_version_change_produces_a_drift_warning() {
+    let old = sample_record();
+    let mut new = sample_record();
+    assert_eq!(
+        protocol_drift_message(&old, &new),
+        None,
+        "an unchanged version is not drift"
+    );
+    new.protocol_version = None;
+    assert_eq!(
+        protocol_drift_message(&old, &new),
+        None,
+        "an unknown new version carries no verdict"
+    );
+    new.protocol_version = Some(2);
+    let message = protocol_drift_message(&old, &new).expect("drift must warn");
+    assert!(
+        message.contains("v1") && message.contains("v2") && message.contains("sess_abc123"),
+        "the warning must name both versions and the session: {message}"
+    );
 }
