@@ -2113,6 +2113,7 @@ pub(super) fn realtime_text_for_event(msg: &EventMsg) -> Option<(String, Option<
         | EventMsg::CollabCloseEnd(_)
         | EventMsg::CollabResumeBegin(_)
         | EventMsg::CollabResumeEnd(_)
+        | EventMsg::BridgeToolActivity(_)
         | EventMsg::SubAgentActivity(_) => None,
     }
 }
@@ -2929,6 +2930,10 @@ async fn try_run_sampling_request(
                 if let Some(event) = consumer.consume_diff(turn_context.as_ref(), call_id, &delta) {
                     sess.send_event(&turn_context, event).await;
                 }
+            }
+            ResponseEvent::BridgeToolActivity(activity) => {
+                sess.send_event(&turn_context, EventMsg::BridgeToolActivity(activity))
+                    .await;
             }
             ResponseEvent::ReasoningSummaryDelta {
                 delta,

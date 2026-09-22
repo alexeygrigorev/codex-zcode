@@ -4,6 +4,7 @@ use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::config_types::Verbosity as VerbosityConfig;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
+use codex_protocol::protocol::BridgeToolActivityEvent;
 use codex_protocol::protocol::ModelVerification;
 use codex_protocol::protocol::RateLimitSnapshot;
 use codex_protocol::protocol::TokenUsage;
@@ -110,6 +111,12 @@ pub enum ResponseEvent {
         call_id: Option<String>,
         delta: String,
     },
+    /// Tool activity reported by a bridged external core (the ZCode warm
+    /// bridge). Display only: the tool already executed on the far side of
+    /// the wire, so this must never become a `ResponseItem` (the
+    /// ToolCallRuntime would execute it again) nor enter model-visible
+    /// history.
+    BridgeToolActivity(BridgeToolActivityEvent),
     ReasoningSummaryDelta {
         delta: String,
         summary_index: i64,

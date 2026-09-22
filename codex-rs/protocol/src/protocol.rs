@@ -1549,6 +1549,11 @@ pub enum EventMsg {
     ReasoningContentDelta(ReasoningContentDeltaEvent),
     ReasoningRawContentDelta(ReasoningRawContentDeltaEvent),
 
+    /// Live tool activity inside a bridged external agent core (the ZCode
+    /// warm bridge). Display only: the tool executed on the far side of the
+    /// bridge, so there is no matching tool call in this session's history.
+    BridgeToolActivity(BridgeToolActivityEvent),
+
     /// Collab interaction: agent spawn begin.
     CollabAgentSpawnBegin(CollabAgentSpawnBeginEvent),
     /// Collab interaction: agent spawn end.
@@ -1963,6 +1968,35 @@ pub struct AgentMessageContentDeltaEvent {
     pub turn_id: String,
     pub item_id: String,
     pub delta: String,
+}
+
+/// Lifecycle of one bridged tool call, mirrored from the external core's
+/// `tool_call_scheduled` / `tool_call_result` / `tool_call_error` events.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, TS, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BridgeToolActivityStatus {
+    /// The core scheduled the call; `detail` summarizes the input.
+    Started,
+    /// The call finished successfully; `detail` carries an output preview.
+    Completed,
+    /// The call failed; `detail` carries the error message.
+    Failed,
+}
+
+/// Live status of one tool call executing inside a bridged external agent
+/// core (the ZCode warm bridge). Display only: the tool ran on the far side
+/// of the bridge, so this never becomes a `ResponseItem` and must not enter
+/// model-visible history.
+#[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema, PartialEq, Eq)]
+pub struct BridgeToolActivityEvent {
+    /// The external core's id for the tool call.
+    pub call_id: String,
+    pub tool: String,
+    pub status: BridgeToolActivityStatus,
+    /// Bounded human-readable detail (input summary, output preview, or
+    /// error message), capped by the bridge before emission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema)]

@@ -84,7 +84,7 @@ fn map_api_error_distinguishes_capacity_from_slow_down() {
 fn map_api_error_promotes_rate_limit_stream_to_rate_limit() {
     let message =
         "[1302][Rate limit reached for requests] [20260920065300c5262d40cfa74eab]".to_string();
-    let err = map_api_error(ApiError::Stream(message.clone()));
+    let err = map_api_error(ApiError::Stream(message));
     assert_eq!(
         err.to_codex_protocol_error(),
         CodexErrorInfo::RateLimitExceeded

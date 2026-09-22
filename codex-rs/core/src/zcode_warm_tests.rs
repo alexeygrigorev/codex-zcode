@@ -12,6 +12,8 @@ use super::warm_mode_from_value;
 use crate::client::ZcodeRuntime;
 use codex_api::ResponseEvent;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::BridgeToolActivityEvent;
+use codex_protocol::protocol::BridgeToolActivityStatus;
 
 fn assistant_message(text: &str) -> ResponseItem {
     ResponseItem::Message {
@@ -47,6 +49,8 @@ struct FakeServerOptions {
     /// auth-headers callbacks during the create handshake, recording each
     /// answer in the stats file.
     probes_runtime_callbacks: bool,
+    /// Emit `tool_call_*` session events around the turn's model output.
+    emits_tool_events: bool,
     /// `resultType` reported on the `turn.completed` payload.
     turn_result_type: &'static str,
 }
@@ -57,6 +61,7 @@ impl Default for FakeServerOptions {
             rejects_unknown_create_keys: false,
             probes_interactions: false,
             probes_runtime_callbacks: false,
+            emits_tool_events: false,
             turn_result_type: "success",
         }
     }
@@ -136,6 +141,12 @@ function handle(msg) {
       break;
     case "session/send": {
       const content = msg.params.content;
+      if (TOOL_EVENTS) {
+        emit({ sessionId: msg.params.sessionId, type: "tool_call_scheduled", payload: { toolCallId: "tc_1", toolName: "Bash", input: { command: "ls /tmp" } } });
+        emit({ sessionId: msg.params.sessionId, type: "tool_call_scheduled", payload: { toolCallId: "tc_2", toolName: "Read", input: { file: "/x" } } });
+        emit({ sessionId: msg.params.sessionId, type: "tool_call_result", payload: { toolCallId: "tc_1", result: { success: true, content: "out" }, duration: 3 } });
+        emit({ sessionId: msg.params.sessionId, type: "tool_call_error", payload: { toolCallId: "tc_2", error: { type: "ToolError", message: "boom" } } });
+      }
       if (!content.includes("nodelta")) {
         emit({ sessionId: msg.params.sessionId, type: "model.streaming", payload: { kind: "text_delta", delta: content.slice(0, 2) } });
         emit({ sessionId: msg.params.sessionId, type: "model.streaming", payload: { kind: "text_delta", delta: content.slice(2) } });
@@ -163,6 +174,7 @@ const DRIFT_KEY = "titleGenerationEnabled";
 const REJECT_DRIFT = %REJECT_DRIFT%;
 const PROBE_INTERACTIONS = %PROBE_INTERACTIONS%;
 const PROBE_RUNTIME = %PROBE_RUNTIME%;
+const TOOL_EVENTS = %TOOL_EVENTS%;
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => {
   buffer += chunk;
@@ -263,6 +275,14 @@ process.stdin.on("data", (chunk) => {
                 "false"
             },
         )
+        .replace(
+            "%TOOL_EVENTS%",
+            if options.emits_tool_events {
+                "true"
+            } else {
+                "false"
+            },
+        )
         .replace("%RESULT_TYPE%", options.turn_result_type);
     std::fs::write(&fixture, script).expect("write fake app-server fixture");
     fixture
@@ -351,6 +371,75 @@ async fn warm_turn_streams_deltas_and_completes_with_usage() {
         }
         other => panic!("expected Completed, got {other:?}"),
     }
+    bridge.kill("test end");
+}
+
+#[tokio::test]
+async fn warm_turn_maps_tool_call_events_to_bridge_activity() {
+    let fixture = write_fake_server_with(FakeServerOptions {
+        emits_tool_events: true,
+        ..FakeServerOptions::default()
+    });
+    let bridge = ZcodeWarmBridge::spawn(&test_runtime(&fixture), "/tmp", WarmMode::Yolo)
+        .expect("spawn fake app-server");
+    let session_id = bridge
+        .ensure_session("/tmp")
+        .await
+        .expect("session created");
+    let stream = bridge.turn(&session_id, "toolturn").expect("turn starts");
+    let mut rx = stream.rx_event;
+
+    let expected = [
+        BridgeToolActivityEvent {
+            call_id: "tc_1".to_string(),
+            tool: "Bash".to_string(),
+            status: BridgeToolActivityStatus::Started,
+            detail: Some(r#"{"command":"ls /tmp"}"#.to_string()),
+        },
+        BridgeToolActivityEvent {
+            call_id: "tc_2".to_string(),
+            tool: "Read".to_string(),
+            status: BridgeToolActivityStatus::Started,
+            detail: Some(r#"{"file":"/x"}"#.to_string()),
+        },
+        BridgeToolActivityEvent {
+            call_id: "tc_1".to_string(),
+            tool: "Bash".to_string(),
+            status: BridgeToolActivityStatus::Completed,
+            detail: Some("out".to_string()),
+        },
+        BridgeToolActivityEvent {
+            call_id: "tc_2".to_string(),
+            tool: "Read".to_string(),
+            status: BridgeToolActivityStatus::Failed,
+            detail: Some("boom".to_string()),
+        },
+    ];
+    for want in expected {
+        match next_event(&mut rx).await {
+            ResponseEvent::BridgeToolActivity(activity) => assert_eq!(activity, want),
+            other => panic!("expected BridgeToolActivity, got {other:?}"),
+        }
+    }
+    // The turn still streams and completes after the tool activity.
+    match next_event(&mut rx).await {
+        ResponseEvent::OutputItemAdded(item) => assert_eq!(item, assistant_message("")),
+        other => panic!("expected OutputItemAdded, got {other:?}"),
+    }
+    loop {
+        match next_event(&mut rx).await {
+            ResponseEvent::OutputTextDelta(_) => continue,
+            ResponseEvent::OutputItemDone(item) => {
+                assert_eq!(item, assistant_message("toolturn"));
+                break;
+            }
+            other => panic!("expected streamed output, got {other:?}"),
+        }
+    }
+    assert!(matches!(
+        next_event(&mut rx).await,
+        ResponseEvent::Completed { .. }
+    ));
     bridge.kill("test end");
 }
 
