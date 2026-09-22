@@ -449,9 +449,19 @@ impl ZcodeWarmBridge {
     ) {
         let frame = match method {
             "session/requestRuntimePreferences" => {
+                // Host-parity answer shape (#36). nativeSearchEnhancements
+                // stays off on purpose: the core gates its search runner's
+                // find/grep backend on it and our headless host has none.
+                // The other two fields match what the core's zod schema
+                // already defaults to when missing, so this is explicit
+                // parity rather than a behavior change.
                 serde_json::json!({
                     "id": id,
-                    "result": {"nativeSearchEnhancementsEnabled": false},
+                    "result": {
+                        "askUserQuestionAutoResolutionEnabled": true,
+                        "nativeSearchEnhancementsEnabled": false,
+                        "memoryEnabled": false,
+                    },
                 })
             }
             // Newer cores ask the host for provider/MCP auth material. The

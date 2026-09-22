@@ -177,7 +177,10 @@ process.stdin.on("data", (chunk) => {
       // The host answer to our runtime-preferences callback.
       const original = pendingPref.original;
       pendingPref = null;
-      if (!msg.result || msg.result.nativeSearchEnhancementsEnabled !== false) {
+      if (!msg.result
+        || msg.result.nativeSearchEnhancementsEnabled !== false
+        || msg.result.askUserQuestionAutoResolutionEnabled !== true
+        || msg.result.memoryEnabled !== false) {
         write({ id: original.id, error: { code: -32602, message: "host did not answer the runtime preferences callback" } });
       } else if (PROBE_INTERACTIONS) {
         const probeId = sendProbe("perm", original);
