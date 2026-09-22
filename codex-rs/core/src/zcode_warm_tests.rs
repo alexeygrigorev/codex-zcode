@@ -182,9 +182,27 @@ process.stdin.on("data", (chunk) => {
       } else if (PROBE_INTERACTIONS) {
         const probeId = sendProbe("perm", original);
         pendingPerm = { probeId, original };
+      } else if (PROBE_RUNTIME) {
+        const probeId = sendRuntimeProbe("headers", original);
+        pendingHeaders = { probeId, original };
       } else {
         handle(original);
       }
+      continue;
+    }
+    if (pendingHeaders !== null && msg.id === pendingHeaders.probeId) {
+      const original = pendingHeaders.original;
+      pendingHeaders = null;
+      stats("headers:" + (msg.error ? "rejected:" + msg.error.code : JSON.stringify(msg.result)));
+      const probeId = sendRuntimeProbe("mcpauth", original);
+      pendingMcpAuth = { probeId, original };
+      continue;
+    }
+    if (pendingMcpAuth !== null && msg.id === pendingMcpAuth.probeId) {
+      const original = pendingMcpAuth.original;
+      pendingMcpAuth = null;
+      stats("mcpauth:" + (msg.error ? "rejected:" + msg.error.code : JSON.stringify(msg.result)));
+      handle(original);
       continue;
     }
     if (pendingPerm !== null && msg.id === pendingPerm.probeId) {
@@ -229,6 +247,14 @@ process.stdin.on("data", (chunk) => {
         .replace(
             "%PROBE_INTERACTIONS%",
             if options.probes_interactions {
+                "true"
+            } else {
+                "false"
+            },
+        )
+        .replace(
+            "%PROBE_RUNTIME%",
+            if options.probes_runtime_callbacks {
                 "true"
             } else {
                 "false"
@@ -562,6 +588,34 @@ async fn yolo_bridge_rejects_interaction_callbacks() {
     );
     assert!(
         lines.contains(&"userinput:rejected:-32601"),
+        "stats: {stats_text}"
+    );
+    bridge.kill("test end");
+}
+
+#[tokio::test]
+async fn bridge_fast_fails_runtime_header_callbacks_with_host_fallback_shapes() {
+    let fixture = write_fake_server_with(FakeServerOptions {
+        probes_runtime_callbacks: true,
+        ..FakeServerOptions::default()
+    });
+    let bridge = ZcodeWarmBridge::spawn(&test_runtime(&fixture), "/tmp", WarmMode::Yolo)
+        .expect("spawn fake app-server");
+    bridge
+        .ensure_session("/tmp")
+        .await
+        .expect("session created");
+
+    let stats_text = std::fs::read_to_string(stats_path(&fixture)).expect("stats written");
+    let lines: Vec<&str> = stats_text.lines().collect();
+    assert!(
+        lines.contains(
+            &"headers:{\"errorMessage\":\"Provider request auth is unavailable\",\"headersApplied\":false}"
+        ),
+        "stats: {stats_text}"
+    );
+    assert!(
+        lines.contains(&"mcpauth:{\"ok\":false,\"reason\":\"official_auth_unavailable\"}"),
         "stats: {stats_text}"
     );
     bridge.kill("test end");

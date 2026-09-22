@@ -459,7 +459,9 @@ impl ZcodeWarmBridge {
             // leaving the CLI side hanging toward its 180 s timeout; mirror
             // the host's exact fallback shapes (issue #34).
             "interaction/requestProviderRuntimeHeaders" => {
-                warn!("ZCode warm provider runtime-headers callback: no auth resolver, failing fast");
+                warn!(
+                    "ZCode warm provider runtime-headers callback: no auth resolver, failing fast"
+                );
                 serde_json::json!({
                     "id": id,
                     "result": {
