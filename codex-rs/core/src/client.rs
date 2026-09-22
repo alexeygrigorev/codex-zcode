@@ -3036,13 +3036,18 @@ impl ModelClientSession {
                 // nothing in memory — a fresh process after a zcodex
                 // restart — the persisted per-thread record, if any, is
                 // adopted through `session/list` + `session/resume`.
-                let resume_seed = match slot
+                let dead_predecessor = slot
                     .as_ref()
                     .filter(|bridge| bridge.is_dead())
-                    .and_then(|bridge| bridge.session_id())
-                {
-                    Some(session_id) => zcode_warm::SessionSeed::Predecessor(session_id),
-                    None => match zcode_warm_store::load_record(&state.thread_id) {
+                    .map(|bridge| (bridge.session_id(), bridge.last_event_seq()));
+                let resume_seed = match dead_predecessor {
+                    Some((Some(session_id), last_event_seq)) => {
+                        zcode_warm::SessionSeed::Predecessor {
+                            session_id,
+                            last_event_seq,
+                        }
+                    }
+                    _ => match zcode_warm_store::load_record(&state.thread_id) {
                         Some(record) => zcode_warm::SessionSeed::Recorded(record),
                         None => zcode_warm::SessionSeed::Fresh,
                     },

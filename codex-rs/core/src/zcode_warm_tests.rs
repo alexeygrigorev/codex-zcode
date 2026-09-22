@@ -76,6 +76,9 @@ pub(crate) struct FakeServerOptions {
     /// Reject `v4/command` with method-not-found, exercising the prototype
     /// channel's legacy fallback.
     pub(crate) fails_v4_command: bool,
+    /// Answer `session/events` with three envelopes the previous bridge
+    /// never saw, so the resume catch-up has a gap to recover (issue #48).
+    pub(crate) missed_events: bool,
     /// Scripted `session/goal` behavior for the goal-mirror tests
     /// (`zcode_warm_goal_tests.rs`).
     pub(crate) goal_loop: GoalLoopMode,
@@ -112,6 +115,7 @@ impl Default for FakeServerOptions {
             exits_mid_turn: false,
             empty_session_list: false,
             fails_v4_command: false,
+            missed_events: false,
             goal_loop: GoalLoopMode::None,
         }
     }
@@ -229,6 +233,19 @@ function handle(msg) {
     case "session/subscribe":
       respond({ sessionId: msg.params.sessionId, eventSeq: 7, events: [] });
       break;
+    case "session/events": {
+      // Envelopes the previous bridge never read: three events above the
+      // subscribe head, so the resume catch-up has a gap to recover.
+      const events = MISSED_EVENTS
+        ? [
+            { seq: ++seqCounter, eventId: "ev_c1", sessionId: msg.params.sessionId, type: "model.streaming", payload: { kind: "text_delta", delta: "lo" } },
+            { seq: ++seqCounter, eventId: "ev_c2", sessionId: msg.params.sessionId, type: "turn.completed", payload: { response: "lost tail", resultType: "success" } },
+            { seq: ++seqCounter, eventId: "ev_c3", sessionId: msg.params.sessionId, type: "session.updated", payload: { note: "resumed" } },
+          ]
+        : [];
+      respond({ events });
+      break;
+    }
     case "session/send": {
       const content = msg.params.content;
       if (EXIT_MID_TURN) {
@@ -328,6 +345,7 @@ const FAIL_RESUME = %FAIL_RESUME%;
 const EXIT_MID_TURN = %EXIT_MID_TURN%;
 const EMPTY_LIST = %EMPTY_LIST%;
 const FAIL_V4 = %FAIL_V4%;
+const MISSED_EVENTS = %MISSED_EVENTS%;
 const GOAL_LOOP = %GOAL_LOOP%;
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => {
@@ -407,6 +425,7 @@ process.stdin.on("data", (chunk) => {
     if (msg.id !== undefined && msg.method) {
       const extra = msg.method === "session/send"
         ? ":" + msg.params.content
+        : msg.method === "session/events" ? ":" + msg.params.afterSeq
         : msg.method === "session/list" ? ":" + JSON.stringify(msg.params) : "";
       stats(msg.method.replace("session/", "") + extra);
       handle(msg);
@@ -484,6 +503,14 @@ process.stdin.on("data", (chunk) => {
         .replace(
             "%FAIL_V4%",
             if options.fails_v4_command {
+                "true"
+            } else {
+                "false"
+            },
+        )
+        .replace(
+            "%MISSED_EVENTS%",
+            if options.missed_events {
                 "true"
             } else {
                 "false"
@@ -1134,14 +1161,18 @@ async fn respawned_bridge_resumes_the_previous_session_instead_of_creating() {
     bridge.kill("simulated child death");
 
     // The replacement bridge is what the client builds after the child
-    // died: same runtime, the predecessor's session id handed over.
+    // died: same runtime, the predecessor's session id and last observed
+    // seq handed over.
     let fixture = write_fake_server();
     let bridge = ZcodeWarmBridge::spawn(
         &test_runtime(&fixture),
         "/tmp",
         WarmMode::Yolo,
         WarmPermissionPolicy::DenyAll,
-        SessionSeed::Predecessor(previous.clone()),
+        SessionSeed::Predecessor {
+            session_id: previous.clone(),
+            last_event_seq: 7,
+        },
     )
     .expect("spawn replacement app-server");
     let session_id = bridge
@@ -1161,6 +1192,60 @@ async fn respawned_bridge_resumes_the_previous_session_instead_of_creating() {
 }
 
 #[tokio::test]
+async fn resumed_bridge_catches_up_events_missed_while_disconnected() {
+    let fixture = write_fake_server();
+    let bridge = ZcodeWarmBridge::spawn(
+        &test_runtime(&fixture),
+        "/tmp",
+        WarmMode::Yolo,
+        WarmPermissionPolicy::DenyAll,
+        SessionSeed::Fresh,
+    )
+    .expect("spawn fake app-server");
+    let previous = bridge
+        .ensure_session("/tmp")
+        .await
+        .expect("session created");
+    assert_eq!(bridge.last_event_seq(), 7);
+    bridge.kill("simulated child death");
+
+    // The replacement resumes from the predecessor's seq; the fake server
+    // reports three envelopes the dead bridge never read.
+    let fixture = write_fake_server_with(FakeServerOptions {
+        missed_events: true,
+        ..FakeServerOptions::default()
+    });
+    let bridge = ZcodeWarmBridge::spawn(
+        &test_runtime(&fixture),
+        "/tmp",
+        WarmMode::Yolo,
+        WarmPermissionPolicy::DenyAll,
+        SessionSeed::Predecessor {
+            session_id: previous.clone(),
+            last_event_seq: 7,
+        },
+    )
+    .expect("spawn replacement app-server");
+    let session_id = bridge
+        .ensure_session("/tmp")
+        .await
+        .expect("session resumed");
+    assert_eq!(session_id, previous);
+    assert_eq!(
+        bridge.last_event_seq(),
+        10,
+        "replayed envelopes advance the tracked seq"
+    );
+
+    let stats_text = std::fs::read_to_string(stats_path(&fixture)).expect("stats written");
+    assert!(
+        stats_text.lines().any(|line| line == "events:7"),
+        "the catch-up must fetch from the predecessor's seq: {stats_text}"
+    );
+    bridge.kill("test end");
+}
+
+#[tokio::test]
 async fn resume_failure_falls_back_to_creating_a_fresh_session() {
     let fixture = write_fake_server_with(FakeServerOptions {
         fails_resume: true,
@@ -1171,7 +1256,10 @@ async fn resume_failure_falls_back_to_creating_a_fresh_session() {
         "/tmp",
         WarmMode::Yolo,
         WarmPermissionPolicy::DenyAll,
-        SessionSeed::Predecessor("sess_prev".to_string()),
+        SessionSeed::Predecessor {
+            session_id: "sess_prev".to_string(),
+            last_event_seq: 0,
+        },
     )
     .expect("spawn fake app-server");
     let session_id = bridge
@@ -1223,6 +1311,12 @@ async fn recorded_session_is_adopted_via_list_and_resume() {
     assert!(
         !lines.contains(&"create"),
         "an adopted session must not create a fresh one: {stats_text}"
+    );
+    // The recorded seq drives the catch-up fetch even though the subscribe
+    // head is behind it.
+    assert!(
+        stats_text.lines().any(|line| line == "events:41"),
+        "the adoption must catch up from the recorded seq: {stats_text}"
     );
     // The subscribe result pins the stream head, and the bridge folds it in.
     assert_eq!(bridge.last_event_seq(), 7);

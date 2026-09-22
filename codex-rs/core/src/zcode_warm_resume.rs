@@ -20,8 +20,15 @@
 //! is not re-asserted either. Subscribing stays live-only on purpose: the
 //! core returns an empty replay gap unless `afterSeq` is passed, and no
 //! collector is waiting during the handshake — replaying queued events
-//! could only deliver a stale `turn.completed` into a retry turn.
+//! through the stream could only deliver a stale `turn.completed` into a
+//! retry turn. What the interrupted turn's tail actually did is recovered
+//! separately: one bounded `session/events` fetch from the seed's
+//! `afterSeq` advances the seq tracking and logs what happened while no
+//! bridge was watching, without ever entering a collector (issue #48).
 
+use std::collections::BTreeMap;
+
+use tracing::info;
 use tracing::warn;
 
 use crate::zcode_warm::SessionSeed;
@@ -37,9 +44,12 @@ pub(crate) async fn establish_session(
     seed: &SessionSeed,
     mode: WarmMode,
 ) -> Result<String, String> {
-    let resume_session_id = match seed {
-        SessionSeed::Fresh => None,
-        SessionSeed::Predecessor(session_id) => Some(session_id.clone()),
+    let (resume_session_id, catch_up_from) = match seed {
+        SessionSeed::Fresh => (None, 0),
+        SessionSeed::Predecessor {
+            session_id,
+            last_event_seq,
+        } => (Some(session_id.clone()), *last_event_seq),
         SessionSeed::Recorded(record) => {
             if record.workspace_path != workspace_path {
                 warn!(
@@ -47,22 +57,22 @@ pub(crate) async fn establish_session(
                      fresh session",
                     record.workspace_path
                 );
-                None
+                (None, 0)
             } else if listed_session_exists(bridge, &record.zcode_session_id, workspace_path).await
             {
-                Some(record.zcode_session_id.clone())
+                (Some(record.zcode_session_id.clone()), record.last_event_seq)
             } else {
                 warn!(
                     "ZCode warm session record {} no longer exists server-side; creating a \
                      fresh session",
                     record.zcode_session_id
                 );
-                None
+                (None, 0)
             }
         }
     };
     if let Some(session_id) = resume_session_id {
-        match resume_session(bridge, &session_id, workspace_path).await {
+        match resume_session(bridge, &session_id, workspace_path, catch_up_from).await {
             Ok(()) => return Ok(session_id),
             Err(message) => {
                 warn!("ZCode warm session resume failed ({message}); creating a fresh session");
@@ -100,11 +110,13 @@ async fn listed_session_exists(
         })
 }
 
-/// Resumes and re-subscribes to a session that outlived the previous child.
+/// Resumes and re-subscribes to a session that outlived the previous child,
+/// then catches up on the events emitted while no bridge was watching.
 async fn resume_session(
     bridge: &ZcodeWarmBridge,
     session_id: &str,
     workspace_path: &str,
+    catch_up_from: u64,
 ) -> Result<(), String> {
     let resumed = bridge
         .request_with_compat_retry(
@@ -119,7 +131,9 @@ async fn resume_session(
         )
         .await?;
     observe_protocol_version(bridge, &resumed);
-    subscribe(bridge, session_id).await
+    subscribe(bridge, session_id).await?;
+    catch_up_missed_events(bridge, session_id, catch_up_from).await;
+    Ok(())
 }
 
 /// Creates the fresh-session fallback and subscribes to it.
@@ -189,3 +203,98 @@ async fn subscribe(bridge: &ZcodeWarmBridge, session_id: &str) -> Result<(), Str
     }
     Ok(())
 }
+
+/// Upper bound on one catch-up fetch, so a long outage cannot pull an
+/// unbounded replay. The persisted seq advances to the fetched edge, and a
+/// later adoption continues from there.
+const CATCH_UP_EVENT_LIMIT: u32 = 256;
+
+/// Recovers the tail of a turn that outlived the previous bridge: one
+/// stateless `session/events` fetch from the seed's seq. Replayed envelopes
+/// only advance the seq tracking and feed a diagnostic log line — the live
+/// subscription stays the sole event source, so a stale terminal event can
+/// never reach a retry turn's collector (issue #48).
+async fn catch_up_missed_events(bridge: &ZcodeWarmBridge, session_id: &str, after_seq: u64) {
+    if after_seq == 0 {
+        return;
+    }
+    let missed = match bridge
+        .request_with_compat_retry(
+            "session/events",
+            serde_json::json!({
+                "sessionId": session_id,
+                "afterSeq": after_seq,
+                "limit": CATCH_UP_EVENT_LIMIT,
+            }),
+        )
+        .await
+    {
+        Ok(missed) => missed,
+        Err(error) => {
+            // Best-effort: resume already succeeded, so the fetch only
+            // upgrades the diagnostics; never fail the handshake over it.
+            warn!(
+                "ZCode warm session {session_id} catch-up fetch failed ({error}); continuing \
+                   live-only"
+            );
+            return;
+        }
+    };
+    let events = missed
+        .pointer("/events")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for event in &events {
+        bridge.record_event_seq(event);
+    }
+    if let Some(summary) = missed_events_summary(session_id, after_seq, &events) {
+        info!("{summary}");
+    }
+}
+
+/// One-line diagnostic for what happened on the session while no bridge was
+/// watching, or `None` for an empty gap. Terminal turn events are collapsed
+/// to the latest one so a chatty goal loop cannot grow the line unboundedly.
+fn missed_events_summary(
+    session_id: &str,
+    after_seq: u64,
+    events: &[serde_json::Value],
+) -> Option<String> {
+    if events.is_empty() {
+        return None;
+    }
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut latest_terminal: Option<String> = None;
+    for event in events {
+        let event_type = event
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        *counts.entry(event_type).or_default() += 1;
+        if matches!(event_type, "turn.completed" | "turn.failed") {
+            let outcome = event
+                .pointer("/payload/resultType")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            latest_terminal = Some(format!("{event_type}({outcome})"));
+        }
+    }
+    let breakdown = counts
+        .iter()
+        .map(|(event_type, count)| format!("{event_type}×{count}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let truncated = if usize::try_from(CATCH_UP_EVENT_LIMIT)
+        .is_ok_and(|limit| events.len() >= limit) { "; fetch cap reached, a later adoption catches up the rest" } else { Default::default() };
+    let terminal = latest_terminal.unwrap_or_else(|| "none".to_string());
+    Some(format!(
+        "ZCode warm session {session_id}: {} event(s) while disconnected (after seq \
+         {after_seq}): {breakdown}; latest terminal turn: {terminal}{truncated}",
+        events.len()
+    ))
+}
+
+#[cfg(test)]
+#[path = "zcode_warm_resume_tests.rs"]
+mod tests;

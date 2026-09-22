@@ -119,8 +119,13 @@ pub(crate) enum SessionSeed {
     /// Establish a fresh session.
     Fresh,
     /// The bridge this one replaced died with this session established in
-    /// memory, so the session is worth resuming directly.
-    Predecessor(String),
+    /// memory, so the session is worth resuming directly. The predecessor's
+    /// last observed event seq lets the replacement catch up on everything
+    /// the dead bridge never read (issue #48).
+    Predecessor {
+        session_id: String,
+        last_event_seq: u64,
+    },
     /// A session recorded on disk for this Codex thread by a previous
     /// process: survive a full zcodex restart by confirming the record
     /// still exists server-side (`session/list`) before resuming it.
@@ -449,8 +454,9 @@ impl ZcodeWarmBridge {
     /// Folds a `session/event` envelope into [`Self::last_event_seq`].
     ///
     /// Older cores may omit `seq` on the envelope; those events are simply
-    /// not tracked.
-    fn record_event_seq(&self, event: &serde_json::Value) {
+    /// not tracked. Shared with the resume path, whose `session/events`
+    /// catch-up replays envelopes that never arrived live (issue #48).
+    pub(crate) fn record_event_seq(&self, event: &serde_json::Value) {
         if let Some(seq) = event.get("seq").and_then(serde_json::Value::as_u64) {
             self.observe_event_seq(seq);
         }
