@@ -454,6 +454,30 @@ impl ZcodeWarmBridge {
                     "result": {"nativeSearchEnhancementsEnabled": false},
                 })
             }
+            // Newer cores ask the host for provider/MCP auth material. The
+            // real host fast-fails when no resolver is registered instead of
+            // leaving the CLI side hanging toward its 180 s timeout; mirror
+            // the host's exact fallback shapes (issue #34).
+            "interaction/requestProviderRuntimeHeaders" => {
+                warn!("ZCode warm provider runtime-headers callback: no auth resolver, failing fast");
+                serde_json::json!({
+                    "id": id,
+                    "result": {
+                        "headersApplied": false,
+                        "errorMessage": "Provider request auth is unavailable",
+                    },
+                })
+            }
+            "interaction/requestOfficialMcpAuthHeaders" => {
+                warn!("ZCode warm official MCP auth-headers callback: no resolver, failing fast");
+                serde_json::json!({
+                    "id": id,
+                    "result": {
+                        "ok": false,
+                        "reason": "official_auth_unavailable",
+                    },
+                })
+            }
             "interaction/requestPermission" if self.mode == WarmMode::Build => {
                 let input_preview = params
                     .get("input")

@@ -43,6 +43,10 @@ struct FakeServerOptions {
     /// `interaction/requestUserInput` callbacks during the create handshake,
     /// recording each answer in the stats file.
     probes_interactions: bool,
+    /// Probe the host with the provider-runtime-headers and official-MCP
+    /// auth-headers callbacks during the create handshake, recording each
+    /// answer in the stats file.
+    probes_runtime_callbacks: bool,
     /// `resultType` reported on the `turn.completed` payload.
     turn_result_type: &'static str,
 }
@@ -52,6 +56,7 @@ impl Default for FakeServerOptions {
         Self {
             rejects_unknown_create_keys: false,
             probes_interactions: false,
+            probes_runtime_callbacks: false,
             turn_result_type: "success",
         }
     }
@@ -74,6 +79,8 @@ let buffer = "";
 let pendingPref = null;
 let pendingPerm = null;
 let pendingInput = null;
+let pendingHeaders = null;
+let pendingMcpAuth = null;
 function write(obj) { process.stdout.write(JSON.stringify(obj) + "\n"); }
 function emit(params) { write({ method: "session/event", params }); }
 function sendProbe(kind, original) {
@@ -86,6 +93,20 @@ function sendProbe(kind, original) {
   write({
     id: probeId,
     method: kind === "input" ? "interaction/requestUserInput" : "interaction/requestPermission",
+    params,
+  });
+  return probeId;
+}
+function sendRuntimeProbe(kind, original) {
+  const probeId = kind + "-" + original.id;
+  const params = kind === "headers"
+    ? { sessionId: "sess_fake", requestId: "req_h", providerId: "p", modelSelection: { modelId: "m", providerId: "p" } }
+    : { sessionId: "sess_fake", requestId: "req_m", mcpKey: "k", targetOrigin: "https://example.com", pluginId: "pl" };
+  write({
+    id: probeId,
+    method: kind === "headers"
+      ? "interaction/requestProviderRuntimeHeaders"
+      : "interaction/requestOfficialMcpAuthHeaders",
     params,
   });
   return probeId;
@@ -141,6 +162,7 @@ function handle(msg) {
 const DRIFT_KEY = "titleGenerationEnabled";
 const REJECT_DRIFT = %REJECT_DRIFT%;
 const PROBE_INTERACTIONS = %PROBE_INTERACTIONS%;
+const PROBE_RUNTIME = %PROBE_RUNTIME%;
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => {
   buffer += chunk;
