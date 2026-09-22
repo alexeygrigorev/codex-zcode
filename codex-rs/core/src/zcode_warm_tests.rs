@@ -53,6 +53,11 @@ struct FakeServerOptions {
     emits_tool_events: bool,
     /// `resultType` reported on the `turn.completed` payload.
     turn_result_type: &'static str,
+    /// Reject `session/resume` so the bridge's create fallback is exercised.
+    fails_resume: bool,
+    /// Answer `session/send`, emit one delta, then exit, so the collector is
+    /// left waiting when the child's stdout closes.
+    exits_mid_turn: bool,
 }
 
 impl Default for FakeServerOptions {
@@ -63,6 +68,8 @@ impl Default for FakeServerOptions {
             probes_runtime_callbacks: false,
             emits_tool_events: false,
             turn_result_type: "success",
+            fails_resume: false,
+            exits_mid_turn: false,
         }
     }
 }
@@ -133,6 +140,13 @@ function handle(msg) {
     return;
   }
   switch (msg.method) {
+    case "session/resume":
+      if (FAIL_RESUME) {
+        write({ id: msg.id, error: { code: -32000, message: "session not found: " + msg.params.sessionId } });
+      } else {
+        respond({ sessionId: msg.params.sessionId, session: { sessionId: msg.params.sessionId }, messages: [], settings: {} });
+      }
+      break;
     case "session/create":
       respond({ session: { sessionId: "sess_fake" }, protocol: { name: "ZCode Protocol", version: 1 } });
       break;
@@ -141,6 +155,11 @@ function handle(msg) {
       break;
     case "session/send": {
       const content = msg.params.content;
+      if (EXIT_MID_TURN) {
+        respond({ accepted: true, sessionId: msg.params.sessionId, stateRevision: 1 });
+        emit({ sessionId: msg.params.sessionId, type: "model.streaming", payload: { kind: "text_delta", delta: "pa" } });
+        process.exit(0);
+      }
       if (TOOL_EVENTS) {
         emit({ sessionId: msg.params.sessionId, type: "tool_call_scheduled", payload: { toolCallId: "tc_1", toolName: "Bash", input: { command: "ls /tmp" } } });
         emit({ sessionId: msg.params.sessionId, type: "tool_call_scheduled", payload: { toolCallId: "tc_2", toolName: "Read", input: { file: "/x" } } });
@@ -175,6 +194,8 @@ const REJECT_DRIFT = %REJECT_DRIFT%;
 const PROBE_INTERACTIONS = %PROBE_INTERACTIONS%;
 const PROBE_RUNTIME = %PROBE_RUNTIME%;
 const TOOL_EVENTS = %TOOL_EVENTS%;
+const FAIL_RESUME = %FAIL_RESUME%;
+const EXIT_MID_TURN = %EXIT_MID_TURN%;
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => {
   buffer += chunk;
@@ -283,6 +304,22 @@ process.stdin.on("data", (chunk) => {
                 "false"
             },
         )
+        .replace(
+            "%FAIL_RESUME%",
+            if options.fails_resume {
+                "true"
+            } else {
+                "false"
+            },
+        )
+        .replace(
+            "%EXIT_MID_TURN%",
+            if options.exits_mid_turn {
+                "true"
+            } else {
+                "false"
+            },
+        )
         .replace("%RESULT_TYPE%", options.turn_result_type);
     std::fs::write(&fixture, script).expect("write fake app-server fixture");
     fixture
@@ -323,8 +360,13 @@ fn warm_bridge_flag_parsing() {
 #[tokio::test]
 async fn warm_turn_streams_deltas_and_completes_with_usage() {
     let fixture = write_fake_server();
-    let bridge = ZcodeWarmBridge::spawn(&test_runtime(&fixture), "/tmp", WarmMode::Yolo)
-        .expect("spawn fake app-server");
+    let bridge = ZcodeWarmBridge::spawn(
+        &test_runtime(&fixture),
+        "/tmp",
+        WarmMode::Yolo,
+        /*resume_session_id*/ None,
+    )
+    .expect("spawn fake app-server");
     let session_id = bridge
         .ensure_session("/tmp")
         .await
@@ -380,8 +422,13 @@ async fn warm_turn_maps_tool_call_events_to_bridge_activity() {
         emits_tool_events: true,
         ..FakeServerOptions::default()
     });
-    let bridge = ZcodeWarmBridge::spawn(&test_runtime(&fixture), "/tmp", WarmMode::Yolo)
-        .expect("spawn fake app-server");
+    let bridge = ZcodeWarmBridge::spawn(
+        &test_runtime(&fixture),
+        "/tmp",
+        WarmMode::Yolo,
+        /*resume_session_id*/ None,
+    )
+    .expect("spawn fake app-server");
     let session_id = bridge
         .ensure_session("/tmp")
         .await
@@ -446,8 +493,13 @@ async fn warm_turn_maps_tool_call_events_to_bridge_activity() {
 #[tokio::test]
 async fn warm_bridge_reuses_one_session_across_turns() {
     let fixture = write_fake_server();
-    let bridge = ZcodeWarmBridge::spawn(&test_runtime(&fixture), "/tmp", WarmMode::Yolo)
-        .expect("spawn fake app-server");
+    let bridge = ZcodeWarmBridge::spawn(
+        &test_runtime(&fixture),
+        "/tmp",
+        WarmMode::Yolo,
+        /*resume_session_id*/ None,
+    )
+    .expect("spawn fake app-server");
     let session_id = bridge
         .ensure_session("/tmp")
         .await
@@ -477,8 +529,13 @@ async fn warm_bridge_reuses_one_session_across_turns() {
 #[tokio::test]
 async fn warm_turn_without_deltas_uses_final_response() {
     let fixture = write_fake_server();
-    let bridge = ZcodeWarmBridge::spawn(&test_runtime(&fixture), "/tmp", WarmMode::Yolo)
-        .expect("spawn fake app-server");
+    let bridge = ZcodeWarmBridge::spawn(
+        &test_runtime(&fixture),
+        "/tmp",
+        WarmMode::Yolo,
+        /*resume_session_id*/ None,
+    )
+    .expect("spawn fake app-server");
     let session_id = bridge
         .ensure_session("/tmp")
         .await
@@ -540,8 +597,13 @@ async fn warm_turn_reports_budget_exhaustion_instead_of_success() {
         turn_result_type: "error_max_turns",
         ..FakeServerOptions::default()
     });
-    let bridge = ZcodeWarmBridge::spawn(&test_runtime(&fixture), "/tmp", WarmMode::Yolo)
-        .expect("spawn fake app-server");
+    let bridge = ZcodeWarmBridge::spawn(
+        &test_runtime(&fixture),
+        "/tmp",
+        WarmMode::Yolo,
+        /*resume_session_id*/ None,
+    )
+    .expect("spawn fake app-server");
     let session_id = bridge
         .ensure_session("/tmp")
         .await
@@ -578,8 +640,13 @@ async fn compat_retry_strips_unrecognized_keys_and_retries_once() {
         rejects_unknown_create_keys: true,
         ..FakeServerOptions::default()
     });
-    let bridge = ZcodeWarmBridge::spawn(&test_runtime(&fixture), "/tmp", WarmMode::Yolo)
-        .expect("spawn fake app-server");
+    let bridge = ZcodeWarmBridge::spawn(
+        &test_runtime(&fixture),
+        "/tmp",
+        WarmMode::Yolo,
+        /*resume_session_id*/ None,
+    )
+    .expect("spawn fake app-server");
 
     let session_id = bridge
         .ensure_session("/tmp")
@@ -604,8 +671,13 @@ async fn compat_retry_strips_unrecognized_keys_and_retries_once() {
 #[tokio::test]
 async fn compat_retry_does_not_retry_unrelated_rejections() {
     let fixture = write_fake_server();
-    let bridge = ZcodeWarmBridge::spawn(&test_runtime(&fixture), "/tmp", WarmMode::Yolo)
-        .expect("spawn fake app-server");
+    let bridge = ZcodeWarmBridge::spawn(
+        &test_runtime(&fixture),
+        "/tmp",
+        WarmMode::Yolo,
+        /*resume_session_id*/ None,
+    )
+    .expect("spawn fake app-server");
 
     // A failed callback answer forces the handshake error path without any
     // unrecognized keys, so there must be exactly one create attempt.
@@ -637,8 +709,13 @@ async fn gated_bridge_creates_build_session_and_denies_interaction_callbacks() {
         probes_interactions: true,
         ..FakeServerOptions::default()
     });
-    let bridge = ZcodeWarmBridge::spawn(&test_runtime(&fixture), "/tmp", WarmMode::Build)
-        .expect("spawn fake app-server");
+    let bridge = ZcodeWarmBridge::spawn(
+        &test_runtime(&fixture),
+        "/tmp",
+        WarmMode::Build,
+        /*resume_session_id*/ None,
+    )
+    .expect("spawn fake app-server");
     bridge
         .ensure_session("/tmp")
         .await
@@ -664,8 +741,13 @@ async fn yolo_bridge_rejects_interaction_callbacks() {
         probes_interactions: true,
         ..FakeServerOptions::default()
     });
-    let bridge = ZcodeWarmBridge::spawn(&test_runtime(&fixture), "/tmp", WarmMode::Yolo)
-        .expect("spawn fake app-server");
+    let bridge = ZcodeWarmBridge::spawn(
+        &test_runtime(&fixture),
+        "/tmp",
+        WarmMode::Yolo,
+        /*resume_session_id*/ None,
+    )
+    .expect("spawn fake app-server");
     bridge
         .ensure_session("/tmp")
         .await
@@ -691,8 +773,13 @@ async fn bridge_fast_fails_runtime_header_callbacks_with_host_fallback_shapes() 
         probes_runtime_callbacks: true,
         ..FakeServerOptions::default()
     });
-    let bridge = ZcodeWarmBridge::spawn(&test_runtime(&fixture), "/tmp", WarmMode::Yolo)
-        .expect("spawn fake app-server");
+    let bridge = ZcodeWarmBridge::spawn(
+        &test_runtime(&fixture),
+        "/tmp",
+        WarmMode::Yolo,
+        /*resume_session_id*/ None,
+    )
+    .expect("spawn fake app-server");
     bridge
         .ensure_session("/tmp")
         .await
@@ -711,4 +798,106 @@ async fn bridge_fast_fails_runtime_header_callbacks_with_host_fallback_shapes() 
         "stats: {stats_text}"
     );
     bridge.kill("test end");
+}
+
+#[tokio::test]
+async fn respawned_bridge_resumes_the_previous_session_instead_of_creating() {
+    let fixture = write_fake_server();
+    let bridge = ZcodeWarmBridge::spawn(
+        &test_runtime(&fixture),
+        "/tmp",
+        WarmMode::Yolo,
+        /*resume_session_id*/ None,
+    )
+    .expect("spawn fake app-server");
+    let previous = bridge
+        .ensure_session("/tmp")
+        .await
+        .expect("session created");
+    bridge.kill("simulated child death");
+
+    // The replacement bridge is what the client builds after the child
+    // died: same runtime, the predecessor's session id handed over.
+    let fixture = write_fake_server();
+    let bridge = ZcodeWarmBridge::spawn(
+        &test_runtime(&fixture),
+        "/tmp",
+        WarmMode::Yolo,
+        Some(previous.clone()),
+    )
+    .expect("spawn replacement app-server");
+    let session_id = bridge
+        .ensure_session("/tmp")
+        .await
+        .expect("session resumed");
+    assert_eq!(session_id, previous);
+
+    let stats_text = std::fs::read_to_string(stats_path(&fixture)).expect("stats written");
+    let lines: Vec<&str> = stats_text.lines().collect();
+    assert!(lines.contains(&"resume"), "stats: {stats_text}");
+    assert!(
+        !lines.contains(&"create"),
+        "a resumed bridge must not create a fresh session: {stats_text}"
+    );
+    bridge.kill("test end");
+}
+
+#[tokio::test]
+async fn resume_failure_falls_back_to_creating_a_fresh_session() {
+    let fixture = write_fake_server_with(FakeServerOptions {
+        fails_resume: true,
+        ..FakeServerOptions::default()
+    });
+    let bridge = ZcodeWarmBridge::spawn(
+        &test_runtime(&fixture),
+        "/tmp",
+        WarmMode::Yolo,
+        Some("sess_prev".to_string()),
+    )
+    .expect("spawn fake app-server");
+    let session_id = bridge
+        .ensure_session("/tmp")
+        .await
+        .expect("fresh session created");
+    assert_eq!(session_id, "sess_fake");
+
+    let stats_text = std::fs::read_to_string(stats_path(&fixture)).expect("stats written");
+    let lines: Vec<&str> = stats_text.lines().collect();
+    assert!(lines.contains(&"resume"), "stats: {stats_text}");
+    assert!(lines.contains(&"create"), "stats: {stats_text}");
+    bridge.kill("test end");
+}
+
+#[tokio::test]
+async fn collector_fails_fast_when_the_app_server_exits_mid_turn() {
+    let fixture = write_fake_server_with(FakeServerOptions {
+        exits_mid_turn: true,
+        ..FakeServerOptions::default()
+    });
+    let bridge = ZcodeWarmBridge::spawn(
+        &test_runtime(&fixture),
+        "/tmp",
+        WarmMode::Yolo,
+        /*resume_session_id*/ None,
+    )
+    .expect("spawn fake app-server");
+    let session_id = bridge
+        .ensure_session("/tmp")
+        .await
+        .expect("session created");
+    let stream = bridge.turn(&session_id, "dying turn").expect("turn starts");
+    let mut rx = stream.rx_event;
+
+    let err = loop {
+        match tokio::time::timeout(Duration::from_secs(30), rx.recv()).await {
+            Ok(Some(Ok(_event))) => continue,
+            Ok(Some(Err(err))) => break err,
+            Ok(None) => panic!("stream closed without reporting the dead child"),
+            Err(_elapsed) => panic!("collector waited out the idle window instead of failing fast"),
+        }
+    };
+    assert!(
+        matches!(err, codex_api::ApiError::Stream(ref message) if message.contains("exited mid-turn")),
+        "got {err:?}"
+    );
 }

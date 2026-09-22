@@ -247,6 +247,7 @@ pub mod otel_init;
 mod zcode_process;
 mod zcode_warm;
 mod zcode_warm_events;
+mod zcode_warm_resume;
 
 // Captured environment bindings can be passed back to ThreadManager by internal reviewers.
 pub use environment_selection::TurnEnvironmentSnapshot;

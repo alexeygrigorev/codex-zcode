@@ -54,6 +54,7 @@ use crate::client::zcode_failure_message;
 use crate::client::zcode_stderr_tail;
 use crate::zcode_process;
 use crate::zcode_warm_events::bridge_tool_activity_from_notification;
+use crate::zcode_warm_resume;
 
 /// Env var enabling the warm bridge (`ZCODE_WARM=1`).
 const WARM_BRIDGE_ENV_VAR: &str = "ZCODE_WARM";
@@ -78,7 +79,7 @@ pub(crate) enum WarmMode {
 
 impl WarmMode {
     /// The `mode` value sent in `session/create`.
-    fn wire_session_mode(self) -> &'static str {
+    pub(crate) fn wire_session_mode(self) -> &'static str {
         match self {
             WarmMode::Yolo => "yolo",
             WarmMode::Build => "build",
@@ -217,6 +218,11 @@ pub(crate) struct ZcodeWarmBridge {
     /// Created once per bridge; concurrent first turns share the handshake
     /// and failed attempts leave the cell empty for a retry.
     session_id: tokio::sync::OnceCell<String>,
+    /// Session id of the bridge this one replaced when that bridge's child
+    /// died; `ensure_session` resumes it instead of creating fresh (issue
+    /// #42). Empty when there is nothing to resume or the predecessor was
+    /// abandoned for repeated failures while still alive.
+    resume_session_id: Option<String>,
     dead: Arc<AtomicBool>,
     consecutive_failures: AtomicU32,
     request_timeout: Duration,
@@ -241,6 +247,7 @@ impl ZcodeWarmBridge {
         runtime: &ZcodeRuntime,
         workspace_path: &str,
         mode: WarmMode,
+        resume_session_id: Option<String>,
     ) -> io::Result<Arc<Self>> {
         let mut command = Command::new(&runtime.node);
         command
@@ -318,6 +325,7 @@ impl ZcodeWarmBridge {
             stderr_tail,
             events,
             session_id: tokio::sync::OnceCell::new(),
+            resume_session_id,
             dead: Arc::clone(&dead),
             consecutive_failures: AtomicU32::new(0),
             request_timeout: REQUEST_TIMEOUT,
@@ -340,6 +348,10 @@ impl ZcodeWarmBridge {
             reader_dead.store(true, Ordering::Relaxed);
             if let Some(bridge) = reader_bridge.upgrade() {
                 bridge.fail_pending("ZCode warm app-server closed its output");
+                bridge.fail_collectors(
+                    "ZCode warm app-server exited mid-turn; the turn will be retried \
+                     in the same session",
+                );
             }
         });
 
@@ -366,6 +378,11 @@ impl ZcodeWarmBridge {
         zcode_stderr_tail(&self.stderr_tail)
     }
 
+    /// The established session id, if the handshake completed.
+    pub(crate) fn session_id(&self) -> Option<String> {
+        self.session_id.get().cloned()
+    }
+
     /// Kills the child and its process group and fails all waiters.
     ///
     /// Used instead of waiting for `Drop` when a turn must give up on the
@@ -376,6 +393,7 @@ impl ZcodeWarmBridge {
         }
         warn!("ZCode warm app-server killed: {reason}");
         self.fail_pending(reason);
+        self.fail_collectors(reason);
         if let Ok(mut child) = self.child.lock() {
             let _ = child.start_kill();
         }
@@ -390,6 +408,23 @@ impl ZcodeWarmBridge {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         for (_, sender) in state.pending.drain() {
             let _ = sender.send(Err(ProtocolRequestError::plain(reason)));
+        }
+    }
+
+    /// Fails any turn collector waiting on session events with a synthetic
+    /// `turn.failed` for the active session.
+    ///
+    /// Requests get their waiters failed directly, but a collector whose
+    /// `session/send` was already answered only watches the event stream;
+    /// without this it would wait out the whole idle window after the child
+    /// died instead of erroring into the stream-retry ladder immediately.
+    fn fail_collectors(&self, reason: &str) {
+        if let Some(session_id) = self.session_id.get() {
+            let _ = self.events.send(serde_json::json!({
+                "sessionId": session_id,
+                "type": "turn.failed",
+                "payload": { "error": { "message": reason } },
+            }));
         }
     }
 
@@ -627,7 +662,7 @@ impl ZcodeWarmBridge {
     /// schema can drift without a code change on our side; the desktop host
     /// answers the same drift by stripping the flagged fields and retrying.
     /// Drift is logged loudly so the protocol change gets noticed.
-    async fn request_with_compat_retry(
+    pub(crate) async fn request_with_compat_retry(
         &self,
         method: &str,
         params: serde_json::Value,
@@ -654,45 +689,21 @@ impl ZcodeWarmBridge {
         }
     }
 
-    /// Creates (once) and subscribes to the per-thread session.
+    /// Establishes (once) and subscribes to the per-thread session,
+    /// resuming the replaced bridge's session after an app-server respawn
+    /// (issue #42).
     ///
     /// The `OnceCell` makes concurrent first turns share one handshake while
     /// keeping no lock guard across the awaited requests.
     pub(crate) async fn ensure_session(&self, workspace_path: &str) -> Result<String, String> {
         self.session_id
-            .get_or_try_init(|| async {
-                let created = self
-                    .request_with_compat_retry(
-                        "session/create",
-                        serde_json::json!({
-                            "workspace": {
-                                "workspacePath": workspace_path,
-                                "workspaceKey": workspace_path,
-                            },
-                            "mode": self.mode.wire_session_mode(),
-                            "titleGenerationEnabled": false,
-                        }),
-                    )
-                    .await?;
-                let session_id = created
-                    .pointer("/session/sessionId")
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or_else(|| {
-                        format!(
-                            "session/create response carried no sessionId: {}",
-                            serde_json::to_string(&created).unwrap_or_default()
-                        )
-                    })?
-                    .to_string();
-                self.request_with_compat_retry(
-                    "session/subscribe",
-                    serde_json::json!({
-                        "sessionId": session_id,
-                        "deliveryKind": "desktop-continuous",
-                    }),
+            .get_or_try_init(|| {
+                zcode_warm_resume::establish_session(
+                    self,
+                    workspace_path,
+                    self.resume_session_id.as_deref(),
+                    self.mode,
                 )
-                .await?;
-                Ok(session_id)
             })
             .await
             .cloned()

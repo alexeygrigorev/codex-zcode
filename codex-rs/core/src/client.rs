@@ -3019,10 +3019,21 @@ impl ModelClientSession {
             {
                 Arc::clone(bridge)
             } else {
+                // A dead child is the respawn case: the replacement bridge
+                // picks the session back up via `session/resume`, so the
+                // retried turn stays in the server-side history and its
+                // provider cache (issue #42). A bridge abandoned for
+                // repeated failures while still alive starts fresh instead,
+                // so a wedged session cannot wedge its replacement.
+                let resume_session_id = slot
+                    .as_ref()
+                    .filter(|bridge| bridge.is_dead())
+                    .and_then(|bridge| bridge.session_id());
                 let bridge = zcode_warm::ZcodeWarmBridge::spawn(
                     runtime,
                     &workspace_path,
                     zcode_warm::warm_mode_from_env(),
+                    resume_session_id,
                 )
                 .map_err(|e| {
                     state
