@@ -40,33 +40,53 @@ fn assistant_message(text: &str) -> ResponseItem {
 /// the callback responder would hang the session handshake and time the test
 /// out.
 /// Options for the fake app-server fixture.
-struct FakeServerOptions {
+pub(crate) struct FakeServerOptions {
     /// Reject `session/create` with a zod unrecognized-key error to exercise
     /// the compat retry.
-    rejects_unknown_create_keys: bool,
+    pub(crate) rejects_unknown_create_keys: bool,
     /// Probe the host with `interaction/requestPermission` and
     /// `interaction/requestUserInput` callbacks during the create handshake,
     /// recording each answer in the stats file.
-    probes_interactions: bool,
+    pub(crate) probes_interactions: bool,
     /// Probe the host with the provider-runtime-headers and official-MCP
     /// auth-headers callbacks during the create handshake, recording each
     /// answer in the stats file.
-    probes_runtime_callbacks: bool,
+    pub(crate) probes_runtime_callbacks: bool,
     /// Emit `tool_call_*` session events around the turn's model output.
-    emits_tool_events: bool,
+    pub(crate) emits_tool_events: bool,
     /// `resultType` reported on the `turn.completed` payload.
-    turn_result_type: &'static str,
+    pub(crate) turn_result_type: &'static str,
     /// Reject `session/resume` so the bridge's create fallback is exercised.
-    fails_resume: bool,
+    pub(crate) fails_resume: bool,
     /// Answer `session/send`, emit one delta, then exit, so the collector is
     /// left waiting when the child's stdout closes.
-    exits_mid_turn: bool,
+    pub(crate) exits_mid_turn: bool,
     /// Answer `session/list` with no sessions, so a recorded session that
     /// the server forgot cannot be adopted.
-    empty_session_list: bool,
+    pub(crate) empty_session_list: bool,
     /// Reject `v4/command` with method-not-found, exercising the prototype
     /// channel's legacy fallback.
-    fails_v4_command: bool,
+    pub(crate) fails_v4_command: bool,
+    /// Scripted `session/goal` behavior for the goal-mirror tests
+    /// (`zcode_warm_goal_tests.rs`).
+    pub(crate) goal_loop: GoalLoopMode,
+}
+
+/// How the fake app-server answers `session/goal` and what goal-loop events it
+/// projects afterwards.
+pub(crate) enum GoalLoopMode {
+    /// `session/goal` falls through to the default method-not-found rejection.
+    None,
+    /// Reject the set with the active-turn protocol error.
+    FailSet,
+    /// Accept the set but report `startedTurn: false`.
+    NotStarted,
+    /// Run one goal turn, then project a verified completion.
+    Complete,
+    /// Run one goal turn, then project a paused target instead.
+    Paused,
+    /// Emit fourteen bare continuation turns and never settle.
+    Capped,
 }
 
 impl Default for FakeServerOptions {
@@ -81,15 +101,16 @@ impl Default for FakeServerOptions {
             exits_mid_turn: false,
             empty_session_list: false,
             fails_v4_command: false,
+            goal_loop: GoalLoopMode::None,
         }
     }
 }
 
-fn write_fake_server() -> PathBuf {
+pub(crate) fn write_fake_server() -> PathBuf {
     write_fake_server_with(FakeServerOptions::default())
 }
 
-fn write_fake_server_with(options: FakeServerOptions) -> PathBuf {
+pub(crate) fn write_fake_server_with(options: FakeServerOptions) -> PathBuf {
     let fixture = std::env::temp_dir().join(format!(
         "zcode-warm-fake-{}.cjs",
         uuid::Uuid::new_v4().simple()
@@ -214,6 +235,38 @@ function handle(msg) {
     case "session/stop":
       respond({ sessionId: msg.params.sessionId });
       break;
+    case "session/goal": {
+      stats("goal:" + JSON.stringify(msg.params));
+      if (msg.params.action === "pause") {
+        respond({ response: "", snapshot: {}, startedTurn: false });
+        break;
+      }
+      if (GOAL_LOOP === "failset") {
+        write({ id: msg.id, error: { code: -32000, message: "Cannot manage goals while a prompt is running" } });
+        break;
+      }
+      if (GOAL_LOOP === "notstarted") {
+        respond({ response: "ok", snapshot: {}, startedTurn: false });
+        break;
+      }
+      const target = { targetId: "tgt_1", objective: msg.params.objective, status: "active" };
+      emit({ sessionId: msg.params.sessionId, type: "session.updated", payload: { action: "set", source: "command", target } });
+      if (GOAL_LOOP === "capped") {
+        for (let i = 0; i < 14; i++) {
+          emit({ sessionId: msg.params.sessionId, type: "turn.completed", payload: { response: "step " + i, resultType: "success" } });
+        }
+        respond({ response: "Goal active", snapshot: {}, startedTurn: true });
+        break;
+      }
+      emit({ sessionId: msg.params.sessionId, type: "model.streaming", payload: { kind: "text_delta", delta: "go" } });
+      emit({ sessionId: msg.params.sessionId, type: "model.streaming", payload: { kind: "text_delta", delta: "al" } });
+      emit({ sessionId: msg.params.sessionId, type: "turn.completed", payload: { response: "goal work done", usage: { inputTokens: 7, outputTokens: 3, totalTokens: 10 }, resultType: "success" } });
+      emit({ sessionId: msg.params.sessionId, type: "session.updated", payload: { verificationId: "v_1", targetId: "tgt_1", status: "completed", goalIteration: 1, verification: { passed: GOAL_LOOP === "complete" } } });
+      const finalStatus = GOAL_LOOP === "paused" ? "paused" : "complete";
+      emit({ sessionId: msg.params.sessionId, type: "session.updated", payload: { action: "status_updated", source: "runtime", target: { ...target, status: finalStatus } } });
+      respond({ response: "Goal active", snapshot: {}, startedTurn: true });
+      break;
+    }
     default:
       write({ id: msg.id, error: { code: -32601, message: "unhandled " + msg.method } });
   }
@@ -250,6 +303,7 @@ const FAIL_RESUME = %FAIL_RESUME%;
 const EXIT_MID_TURN = %EXIT_MID_TURN%;
 const EMPTY_LIST = %EMPTY_LIST%;
 const FAIL_V4 = %FAIL_V4%;
+const GOAL_LOOP = %GOAL_LOOP%;
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => {
   buffer += chunk;
@@ -393,23 +447,34 @@ process.stdin.on("data", (chunk) => {
                 "false"
             },
         )
+        .replace(
+            "%GOAL_LOOP%",
+            match options.goal_loop {
+                GoalLoopMode::None => "null",
+                GoalLoopMode::FailSet => "\"failset\"",
+                GoalLoopMode::NotStarted => "\"notstarted\"",
+                GoalLoopMode::Complete => "\"complete\"",
+                GoalLoopMode::Paused => "\"paused\"",
+                GoalLoopMode::Capped => "\"capped\"",
+            },
+        )
         .replace("%RESULT_TYPE%", options.turn_result_type);
     std::fs::write(&fixture, script).expect("write fake app-server fixture");
     fixture
 }
 
-fn stats_path(fixture: &Path) -> PathBuf {
+pub(crate) fn stats_path(fixture: &Path) -> PathBuf {
     PathBuf::from(format!("{}.stats", fixture.display()))
 }
 
-fn test_runtime(fixture: &Path) -> ZcodeRuntime {
+pub(crate) fn test_runtime(fixture: &Path) -> ZcodeRuntime {
     ZcodeRuntime {
         node: "node".to_string(),
         cjs: fixture.to_string_lossy().to_string(),
     }
 }
 
-async fn next_event(
+pub(crate) async fn next_event(
     rx: &mut mpsc::Receiver<Result<ResponseEvent, codex_api::ApiError>>,
 ) -> ResponseEvent {
     tokio::time::timeout(Duration::from_secs(30), rx.recv())

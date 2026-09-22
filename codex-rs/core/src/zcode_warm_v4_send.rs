@@ -120,11 +120,12 @@ async fn v4_command_send(
     if let Some(delivery) = ack
         .pointer("/result/delivery")
         .and_then(serde_json::Value::as_str)
-        && delivery != "startNow" {
-            // The input was admitted into a queue rather than a turn; the
-            // events for it may not arrive within this turn's idle window.
-            warn!("v4/command sendText was queued rather than started (delivery={delivery})");
-        }
+        && delivery != "startNow"
+    {
+        // The input was admitted into a queue rather than a turn; the
+        // events for it may not arrive within this turn's idle window.
+        warn!("v4/command sendText was queued rather than started (delivery={delivery})");
+    }
     Ok(())
 }
 

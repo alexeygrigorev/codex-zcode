@@ -545,6 +545,14 @@ pub(crate) const ZCODE_GOAL_COMPLETE_MARKER: &str = "[GOAL:COMPLETE]";
 /// Marker line that reports a blocked goal on the ZCode wire.
 pub(crate) const ZCODE_GOAL_BLOCKED_MARKER: &str = "[GOAL:BLOCKED]";
 
+/// Whether a Codex goal is active for this prompt: the `update_goal` tool is
+/// in the tool list, which is the only goal signal the wire sees.
+pub(crate) fn zcode_goal_tools_active(tools: &[ToolSpec]) -> bool {
+    tools
+        .iter()
+        .any(|tool| matches!(tool, ToolSpec::Function(api_tool) if api_tool.name == "update_goal"))
+}
+
 /// Wire note teaching the ZCode model the goal-status protocol.
 ///
 /// The ZCode harness exposes a fixed toolset (`Agent`, `Bash`, ...) and refuses
@@ -555,9 +563,7 @@ pub(crate) const ZCODE_GOAL_BLOCKED_MARKER: &str = "[GOAL:BLOCKED]";
 /// translates it into a real `update_goal` function call that the normal
 /// registry path executes.
 fn zcode_goal_status_protocol(tools: &[ToolSpec]) -> Option<String> {
-    let goal_active = tools
-        .iter()
-        .any(|tool| matches!(tool, ToolSpec::Function(api_tool) if api_tool.name == "update_goal"));
+    let goal_active = zcode_goal_tools_active(tools);
     goal_active.then(|| {
         format!(
             "[Goal status protocol] This wire cannot call Codex-side tools such as update_goal. \
@@ -3059,11 +3065,34 @@ impl ModelClientSession {
         let turned = async {
             let session_id = bridge.ensure_session(&workspace_path).await?;
             let content = zcode_warm_turn_content(&prompt.input);
-            let stream = bridge.turn(
-                &session_id,
-                &content,
-                crate::zcode_warm_v4_send::channel_from_env(),
-            )?;
+            let channel = crate::zcode_warm_v4_send::channel_from_env();
+            // A goal-active prompt can hand its turn to the core's own goal
+            // loop (`session/goal` + the core's completion verifier, issue
+            // #40); anything the mirror cannot set up falls back to the plain
+            // warm prompt.
+            let stream =
+                match crate::zcode_warm_goal::mirrored_goal_objective(&prompt.tools, &prompt.input)
+                {
+                    Some(objective) => {
+                        match crate::zcode_warm_goal::turn_mirrored(
+                            &bridge,
+                            &session_id,
+                            &objective,
+                        )
+                        .await
+                        {
+                            Ok(stream) => stream,
+                            Err(error) => {
+                                warn!(
+                                    "ZCode warm goal mirror unavailable ({error}); \
+                                     sending the goal turn as a normal warm prompt"
+                                );
+                                bridge.turn(&session_id, &content, channel)?
+                            }
+                        }
+                    }
+                    None => bridge.turn(&session_id, &content, channel)?,
+                };
             Ok((stream, session_id))
         }
         .await;

@@ -130,7 +130,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 /// How long the collector waits for session events before declaring the
 /// turn stalled. Long tool runs inside the core are legitimate silence, so
 /// this reuses the stream idle bound.
-fn event_timeout() -> Duration {
+pub(crate) fn event_timeout() -> Duration {
     zcode_process::zcode_idle_timeout().unwrap_or(zcode_process::DEFAULT_ZCODE_STREAM_IDLE_TIMEOUT)
 }
 
@@ -407,6 +407,12 @@ impl ZcodeWarmBridge {
     /// The established session id, if the handshake completed.
     pub(crate) fn session_id(&self) -> Option<String> {
         self.session_id.get().cloned()
+    }
+
+    /// A live feed of this session's `session/event` notification params;
+    /// goal mirroring collects from it alongside the plain turn collector.
+    pub(crate) fn subscribe_events(&self) -> broadcast::Receiver<serde_json::Value> {
+        self.events.subscribe()
     }
 
     /// Highest `seq` seen on the session's event stream, or 0 before any.
@@ -958,7 +964,7 @@ impl ZcodeWarmBridge {
     }
 }
 
-fn assistant_message(text: String) -> ResponseItem {
+pub(crate) fn assistant_message(text: String) -> ResponseItem {
     ResponseItem::Message {
         id: None,
         role: "assistant".to_string(),
@@ -981,7 +987,7 @@ impl Drop for ZcodeWarmBridge {
     }
 }
 
-async fn stop_turn(bridge: &std::sync::Weak<ZcodeWarmBridge>, session_id: &str) {
+pub(crate) async fn stop_turn(bridge: &std::sync::Weak<ZcodeWarmBridge>, session_id: &str) {
     if let Some(bridge) = bridge.upgrade() {
         let _ = bridge
             .request(
@@ -1005,7 +1011,7 @@ async fn stop_turn(bridge: &std::sync::Weak<ZcodeWarmBridge>, session_id: &str) 
 /// retryable stream error, matching the `turn.failed` path, because
 /// provider-side execution failures are often transient. Unknown values
 /// (from newer cores) take the same conservative-as-transient path.
-fn zcode_completed_turn_error(result_type: &str) -> Option<ApiError> {
+pub(crate) fn zcode_completed_turn_error(result_type: &str) -> Option<ApiError> {
     match result_type {
         "success" => None,
         "cancelled" => Some(ApiError::InvalidRequest {
@@ -1029,7 +1035,7 @@ fn zcode_completed_turn_error(result_type: &str) -> Option<ApiError> {
     }
 }
 
-fn token_usage_from_turn_payload(payload: &serde_json::Value) -> TokenUsage {
+pub(crate) fn token_usage_from_turn_payload(payload: &serde_json::Value) -> TokenUsage {
     let usage = payload.get("usage");
     let field = |name: &str| {
         usage
@@ -1050,4 +1056,4 @@ fn token_usage_from_turn_payload(payload: &serde_json::Value) -> TokenUsage {
 
 #[cfg(test)]
 #[path = "zcode_warm_tests.rs"]
-mod tests;
+pub(crate) mod tests;
