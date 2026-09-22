@@ -5,6 +5,37 @@ use crate::TS;
 use serde::Deserialize;
 use serde::Serialize;
 
+/// Lifecycle of one tool call executing inside a bridged external agent core.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub enum BridgeToolActivityStatus {
+    /// The core scheduled the call; `detail` summarizes the input.
+    Started,
+    /// The call finished successfully; `detail` carries an output preview.
+    Completed,
+    /// The call failed; `detail` carries the error message.
+    Failed,
+}
+
+/// Live status of one tool call executing inside a bridged external agent
+/// core (the ZCode warm bridge). Display only: the tool ran on the far side
+/// of the bridge, so it has no matching item in the thread history.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct BridgeToolActivityNotification {
+    pub thread_id: String,
+    pub turn_id: String,
+    /// The external core's id for the tool call.
+    pub call_id: String,
+    pub tool: String,
+    pub status: BridgeToolActivityStatus,
+    /// Bounded human-readable detail (input summary, output preview, or
+    /// error message), capped by the bridge before emission.
+    pub detail: Option<String>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]

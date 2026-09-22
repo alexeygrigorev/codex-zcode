@@ -1,0 +1,6 @@
+---
+source: tui/src/chatwidget/tests/bridge_tool_activity_tests.rs
+assertion_line: 107
+expression: terminal.backend()
+---
+"• Running Bash (7s • esc to interrupt)                                          "

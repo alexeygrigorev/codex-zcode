@@ -11,6 +11,8 @@ use crate::thread_status::ThreadWatchManager;
 use codex_app_server_protocol::AccountRateLimitsUpdatedNotification;
 use codex_app_server_protocol::AdditionalPermissionProfile as V2AdditionalPermissionProfile;
 use codex_app_server_protocol::AuthRecoveryNotification;
+use codex_app_server_protocol::BridgeToolActivityNotification;
+use codex_app_server_protocol::BridgeToolActivityStatus as V2BridgeToolActivityStatus;
 use codex_app_server_protocol::CodexErrorInfo as V2CodexErrorInfo;
 use codex_app_server_protocol::CommandAction as V2ParsedCommand;
 use codex_app_server_protocol::CommandExecutionApprovalDecision;
@@ -406,6 +408,30 @@ pub(crate) async fn apply_bespoke_event_handling(
             };
             outgoing
                 .send_server_notification(ServerNotification::ModelRerouted(notification))
+                .await;
+        }
+        EventMsg::BridgeToolActivity(event) => {
+            let status = match event.status {
+                codex_protocol::protocol::BridgeToolActivityStatus::Started => {
+                    V2BridgeToolActivityStatus::Started
+                }
+                codex_protocol::protocol::BridgeToolActivityStatus::Completed => {
+                    V2BridgeToolActivityStatus::Completed
+                }
+                codex_protocol::protocol::BridgeToolActivityStatus::Failed => {
+                    V2BridgeToolActivityStatus::Failed
+                }
+            };
+            let notification = BridgeToolActivityNotification {
+                thread_id: conversation_id.to_string(),
+                turn_id: event_turn_id.clone(),
+                call_id: event.call_id,
+                tool: event.tool,
+                status,
+                detail: event.detail,
+            };
+            outgoing
+                .send_server_notification(ServerNotification::BridgeToolActivity(notification))
                 .await;
         }
         EventMsg::ModelVerification(event) => {

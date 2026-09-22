@@ -237,6 +237,8 @@ mod backend_banners_tests;
 #[cfg(feature = "bedrock")]
 #[path = "tests/bedrock_catalog_tests.rs"]
 mod bedrock_catalog_tests;
+#[path = "tests/bridge_tool_activity_tests.rs"]
+mod bridge_tool_activity_tests;
 #[path = "tests/collaboration_catalog_tests.rs"]
 mod collaboration_catalog_tests;
 #[path = "tests/compaction_tests.rs"]

@@ -1434,6 +1434,70 @@
       },
       "type": "object"
     },
+    "BridgeToolActivityNotification": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "description": "Live status of one tool call executing inside a bridged external agent core (the ZCode warm bridge). Display only: the tool ran on the far side of the bridge, so it has no matching item in the thread history.",
+      "properties": {
+        "callId": {
+          "description": "The external core's id for the tool call.",
+          "type": "string"
+        },
+        "detail": {
+          "description": "Bounded human-readable detail (input summary, output preview, or error message), capped by the bridge before emission.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "$ref": "#/definitions/BridgeToolActivityStatus"
+        },
+        "threadId": {
+          "type": "string"
+        },
+        "tool": {
+          "type": "string"
+        },
+        "turnId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "callId",
+        "status",
+        "threadId",
+        "tool",
+        "turnId"
+      ],
+      "title": "BridgeToolActivityNotification",
+      "type": "object"
+    },
+    "BridgeToolActivityStatus": {
+      "description": "Lifecycle of one tool call executing inside a bridged external agent core.",
+      "oneOf": [
+        {
+          "description": "The core scheduled the call; `detail` summarizes the input.",
+          "enum": [
+            "started"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The call finished successfully; `detail` carries an output preview.",
+          "enum": [
+            "completed"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The call failed; `detail` carries the error message.",
+          "enum": [
+            "failed"
+          ],
+          "type": "string"
+        }
+      ]
+    },
     "BrowserUseAccessApprovalLifetime": {
       "enum": [
         "turn",
@@ -16255,6 +16319,27 @@
             "params"
           ],
           "title": "Hook/startedNotification",
+          "type": "object"
+        },
+        {
+          "description": "Live tool activity inside a bridged external agent core (the ZCode warm bridge). Display only: the tool executed on the far side of the wire, so it has no matching item in the thread history.",
+          "properties": {
+            "method": {
+              "enum": [
+                "turn/bridgeToolActivity"
+              ],
+              "title": "Turn/bridgeToolActivityNotificationMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/BridgeToolActivityNotification"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "title": "Turn/bridgeToolActivityNotification",
           "type": "object"
         },
         {

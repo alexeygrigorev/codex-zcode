@@ -50,6 +50,8 @@ export type { AttestationGenerateResponse } from "./AttestationGenerateResponse"
 export type { AuthRecoveryNotification } from "./AuthRecoveryNotification";
 export type { AutoReviewDecisionSource } from "./AutoReviewDecisionSource";
 export type { AutoReviewRequirements } from "./AutoReviewRequirements";
+export type { BridgeToolActivityNotification } from "./BridgeToolActivityNotification";
+export type { BridgeToolActivityStatus } from "./BridgeToolActivityStatus";
 export type { BrowserUseAccessApprovalLifetime } from "./BrowserUseAccessApprovalLifetime";
 export type { BrowserUseConfig } from "./BrowserUseConfig";
 export type { BrowserUseOriginPolicy } from "./BrowserUseOriginPolicy";

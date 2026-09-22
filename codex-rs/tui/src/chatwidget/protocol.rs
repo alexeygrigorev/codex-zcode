@@ -175,6 +175,9 @@ impl ChatWidget {
             ServerNotification::HookCompleted(notification) => {
                 self.on_hook_completed(notification.run);
             }
+            ServerNotification::BridgeToolActivity(notification) => {
+                self.on_bridge_tool_activity(notification);
+            }
             ServerNotification::Error(notification) => {
                 if notification.will_retry {
                     if !from_replay {

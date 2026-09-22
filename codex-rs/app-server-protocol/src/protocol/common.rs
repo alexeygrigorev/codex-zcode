@@ -1936,6 +1936,11 @@ server_notification_definitions! {
     ThreadTokenUsageUpdated => "thread/tokenUsage/updated" (v2::ThreadTokenUsageUpdatedNotification),
     TurnStarted => "turn/started" (v2::TurnStartedNotification),
     HookStarted => "hook/started" (v2::HookStartedNotification),
+    /// Live tool activity inside a bridged external agent core (the ZCode
+    /// warm bridge). Display only: the tool executed on the far side of the
+    /// wire, so it has no matching item in the thread history.
+    #[experimental("turn/bridgeToolActivity")]
+    BridgeToolActivity => "turn/bridgeToolActivity" (v2::BridgeToolActivityNotification),
     TurnCompleted => "turn/completed" (v2::TurnCompletedNotification),
     HookCompleted => "hook/completed" (v2::HookCompletedNotification),
     TurnDiffUpdated => "turn/diff/updated" (v2::TurnDiffUpdatedNotification),

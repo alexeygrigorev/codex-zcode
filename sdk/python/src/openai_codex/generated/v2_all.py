@@ -435,6 +435,12 @@ class AutoReviewRequirements(BaseModel):
     required_on_models: Annotated[list[str] | None, Field(alias="requiredOnModels")] = None
 
 
+class BridgeToolActivityStatus(Enum):
+    started = "started"
+    completed = "completed"
+    failed = "failed"
+
+
 class BrowserUseAccessApprovalLifetime(Enum):
     turn = "turn"
     thread = "thread"
@@ -6686,6 +6692,25 @@ class AppsReadResponse(BaseModel):
     missing_app_ids: Annotated[list[str], Field(alias="missingAppIds")]
 
 
+class BridgeToolActivityNotification(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    call_id: Annotated[
+        str, Field(alias="callId", description="The external core's id for the tool call.")
+    ]
+    detail: Annotated[
+        str | None,
+        Field(
+            description="Bounded human-readable detail (input summary, output preview, or error message), capped by the bridge before emission."
+        ),
+    ] = None
+    status: BridgeToolActivityStatus
+    thread_id: Annotated[str, Field(alias="threadId")]
+    tool: str
+    turn_id: Annotated[str, Field(alias="turnId")]
+
+
 class BrowserUseConfig(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -9079,6 +9104,23 @@ class HookStartedServerNotification(BaseModel):
     ] = None
     method: Annotated[Literal["hook/started"], Field(title="Hook/startedNotificationMethod")]
     params: HookStartedNotification
+
+
+class TurnBridgeToolActivityServerNotification(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    emitted_at_ms: Annotated[
+        int | None,
+        Field(
+            alias="emittedAtMs",
+            description="Unix timestamp (in milliseconds) when app-server emitted this notification.",
+        ),
+    ] = None
+    method: Annotated[
+        Literal["turn/bridgeToolActivity"], Field(title="Turn/bridgeToolActivityNotificationMethod")
+    ]
+    params: BridgeToolActivityNotification
 
 
 class TurnDiffUpdatedServerNotification(BaseModel):
@@ -12657,6 +12699,7 @@ class ServerNotification(
         | ThreadTokenUsageUpdatedServerNotification
         | TurnStartedServerNotification
         | HookStartedServerNotification
+        | TurnBridgeToolActivityServerNotification
         | TurnCompletedServerNotification
         | HookCompletedServerNotification
         | TurnDiffUpdatedServerNotification
@@ -12745,6 +12788,7 @@ class ServerNotification(
         | ThreadTokenUsageUpdatedServerNotification
         | TurnStartedServerNotification
         | HookStartedServerNotification
+        | TurnBridgeToolActivityServerNotification
         | TurnCompletedServerNotification
         | HookCompletedServerNotification
         | TurnDiffUpdatedServerNotification
