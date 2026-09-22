@@ -790,6 +790,10 @@ impl ZcodeWarmBridge {
                     }
                     Some("turn.completed") => {
                         let payload = notification.get("payload").cloned().unwrap_or_default();
+                        let result_type = payload
+                            .get("resultType")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("success");
                         // Prefer the streamed text; fall back to the final
                         // response for turns whose deltas never arrived.
                         let response = if reply.is_empty() {
@@ -811,15 +815,22 @@ impl ZcodeWarmBridge {
                         {
                             return;
                         }
-                        let token_usage = token_usage_from_turn_payload(&payload);
-                        let _ = tx
-                            .send(Ok(codex_api::ResponseEvent::Completed {
-                                response_id: request_id.clone(),
-                                token_usage: Some(token_usage),
-                                usage_metadata: None,
-                                end_turn: Some(true),
-                            }))
-                            .await;
+                        match zcode_completed_turn_error(result_type) {
+                            Some(err) => {
+                                let _ = tx.send(Err(err)).await;
+                            }
+                            None => {
+                                let token_usage = token_usage_from_turn_payload(&payload);
+                                let _ = tx
+                                    .send(Ok(codex_api::ResponseEvent::Completed {
+                                        response_id: request_id.clone(),
+                                        token_usage: Some(token_usage),
+                                        usage_metadata: None,
+                                        end_turn: Some(true),
+                                    }))
+                                    .await;
+                            }
+                        }
                         return;
                     }
                     _ => {}
@@ -865,6 +876,43 @@ async fn stop_turn(bridge: &std::sync::Weak<ZcodeWarmBridge>, session_id: &str) 
                 serde_json::json!({ "sessionId": session_id }),
             )
             .await;
+    }
+}
+
+/// Classifies the `resultType` carried by a `turn.completed` payload into
+/// the API error Codex should act on, or `None` when the turn finished
+/// normally. ZCode reports turn-end reasons on the completed event itself;
+/// treating every completion as success made failed turns look clean.
+///
+/// Budget stops (`error_max_turns`, `error_max_budget`,
+/// `error_max_tool_calls`) and cancellations are deterministic: re-sending
+/// the identical prompt cannot succeed differently, so they surface as
+/// non-retryable invalid-request errors rather than entering the
+/// session-level stream retry ladder. `error_during_execution` stays a
+/// retryable stream error, matching the `turn.failed` path, because
+/// provider-side execution failures are often transient. Unknown values
+/// (from newer cores) take the same conservative-as-transient path.
+fn zcode_completed_turn_error(result_type: &str) -> Option<ApiError> {
+    match result_type {
+        "success" => None,
+        "cancelled" => Some(ApiError::InvalidRequest {
+            message: "ZCode warm turn was cancelled".to_string(),
+        }),
+        "error_max_turns" => Some(ApiError::InvalidRequest {
+            message: "ZCode warm turn stopped: max turns exhausted".to_string(),
+        }),
+        "error_max_budget" => Some(ApiError::InvalidRequest {
+            message: "ZCode warm turn stopped: turn budget exhausted".to_string(),
+        }),
+        "error_max_tool_calls" => Some(ApiError::InvalidRequest {
+            message: "ZCode warm turn stopped: max tool calls exhausted".to_string(),
+        }),
+        "error_during_execution" => Some(ApiError::Stream(
+            "ZCode warm turn failed during execution".to_string(),
+        )),
+        other => Some(ApiError::Stream(format!(
+            "ZCode warm turn ended with unknown resultType {other}"
+        ))),
     }
 }
 

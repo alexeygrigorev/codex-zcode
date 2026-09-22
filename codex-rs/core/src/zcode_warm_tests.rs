@@ -35,7 +35,6 @@ fn assistant_message(text: &str) -> ResponseItem {
 /// the callback responder would hang the session handshake and time the test
 /// out.
 /// Options for the fake app-server fixture.
-#[derive(Default)]
 struct FakeServerOptions {
     /// Reject `session/create` with a zod unrecognized-key error to exercise
     /// the compat retry.
@@ -44,6 +43,18 @@ struct FakeServerOptions {
     /// `interaction/requestUserInput` callbacks during the create handshake,
     /// recording each answer in the stats file.
     probes_interactions: bool,
+    /// `resultType` reported on the `turn.completed` payload.
+    turn_result_type: &'static str,
+}
+
+impl Default for FakeServerOptions {
+    fn default() -> Self {
+        Self {
+            rejects_unknown_create_keys: false,
+            probes_interactions: false,
+            turn_result_type: "success",
+        }
+    }
 }
 
 fn write_fake_server() -> PathBuf {
@@ -114,7 +125,7 @@ function handle(msg) {
         payload: {
           response: content + "!",
           usage: { inputTokens: 10, outputTokens: 2, totalTokens: 12, cacheReadTokens: 5, reasoningTokens: 1 },
-          resultType: "success",
+          resultType: "%RESULT_TYPE%",
         },
       });
       respond({ accepted: true, sessionId: msg.params.sessionId, stateRevision: 1 });
@@ -200,7 +211,8 @@ process.stdin.on("data", (chunk) => {
             } else {
                 "false"
             },
-        );
+        )
+        .replace("%RESULT_TYPE%", options.turn_result_type);
     std::fs::write(&fixture, script).expect("write fake app-server fixture");
     fixture
 }
@@ -349,6 +361,74 @@ async fn warm_turn_without_deltas_uses_final_response() {
         }
     };
     assert_eq!(final_text, "nodelta please!");
+    bridge.kill("test end");
+}
+
+#[test]
+fn turn_completed_result_types_classify() {
+    use codex_api::ApiError;
+
+    assert!(super::zcode_completed_turn_error("success").is_none());
+    for result_type in [
+        "cancelled",
+        "error_max_turns",
+        "error_max_budget",
+        "error_max_tool_calls",
+    ] {
+        assert!(
+            matches!(
+                super::zcode_completed_turn_error(result_type),
+                Some(ApiError::InvalidRequest { .. })
+            ),
+            "{result_type} must surface as a non-retryable error"
+        );
+    }
+    for result_type in ["error_during_execution", "something_new"] {
+        assert!(
+            matches!(
+                super::zcode_completed_turn_error(result_type),
+                Some(ApiError::Stream(_))
+            ),
+            "{result_type} must surface as a retryable stream error"
+        );
+    }
+}
+
+#[tokio::test]
+async fn warm_turn_reports_budget_exhaustion_instead_of_success() {
+    let fixture = write_fake_server_with(FakeServerOptions {
+        turn_result_type: "error_max_turns",
+        ..FakeServerOptions::default()
+    });
+    let bridge = ZcodeWarmBridge::spawn(&test_runtime(&fixture), "/tmp", WarmMode::Yolo)
+        .expect("spawn fake app-server");
+    let session_id = bridge
+        .ensure_session("/tmp")
+        .await
+        .expect("session created");
+    let stream = bridge.turn(&session_id, "nodelta").expect("turn starts");
+    let mut rx = stream.rx_event;
+
+    // The final response is flushed before the error so the partial
+    // reply stays in the transcript instead of vanishing with the turn.
+    let mut saw_partial_reply = false;
+    let err = loop {
+        match tokio::time::timeout(Duration::from_secs(30), rx.recv()).await {
+            Ok(Some(Ok(ResponseEvent::OutputItemDone(item)))) => {
+                assert_eq!(item, assistant_message("nodelta!"));
+                saw_partial_reply = true;
+            }
+            Ok(Some(Ok(_))) => continue,
+            Ok(Some(Err(err))) => break err,
+            Ok(None) => panic!("stream closed without reporting the failed turn"),
+            Err(_elapsed) => panic!("timed out waiting for the turn error"),
+        }
+    };
+    assert!(saw_partial_reply, "partial reply emitted before the error");
+    assert!(
+        matches!(err, codex_api::ApiError::InvalidRequest { ref message } if message.contains("max turns")),
+        "budget exhaustion must be non-retryable, got {err:?}"
+    );
     bridge.kill("test end");
 }
 
