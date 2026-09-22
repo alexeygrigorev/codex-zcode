@@ -137,6 +137,7 @@ use crate::responses_metadata::subagent_header_value;
 use crate::util::emit_feedback_auth_recovery_tags;
 use crate::zcode_process;
 use crate::zcode_warm;
+use crate::zcode_warm_store;
 use codex_feedback::FeedbackRequestTags;
 use codex_feedback::emit_feedback_request_tags_with_auth_env;
 use codex_login::auth::AgentIdentityAuthPolicy;
@@ -3024,16 +3025,26 @@ impl ModelClientSession {
                 // retried turn stays in the server-side history and its
                 // provider cache (issue #42). A bridge abandoned for
                 // repeated failures while still alive starts fresh instead,
-                // so a wedged session cannot wedge its replacement.
-                let resume_session_id = slot
+                // so a wedged session cannot wedge its replacement. With
+                // nothing in memory — a fresh process after a zcodex
+                // restart — the persisted per-thread record, if any, is
+                // adopted through `session/list` + `session/resume`.
+                let resume_seed = match slot
                     .as_ref()
                     .filter(|bridge| bridge.is_dead())
-                    .and_then(|bridge| bridge.session_id());
+                    .and_then(|bridge| bridge.session_id())
+                {
+                    Some(session_id) => zcode_warm::SessionSeed::Predecessor(session_id),
+                    None => match zcode_warm_store::load_record(&state.thread_id) {
+                        Some(record) => zcode_warm::SessionSeed::Recorded(record),
+                        None => zcode_warm::SessionSeed::Fresh,
+                    },
+                };
                 let bridge = zcode_warm::ZcodeWarmBridge::spawn(
                     runtime,
                     &workspace_path,
                     zcode_warm::warm_mode_from_env(),
-                    resume_session_id,
+                    resume_seed,
                 )
                 .map_err(|e| {
                     state
@@ -3048,14 +3059,25 @@ impl ModelClientSession {
         let turned = async {
             let session_id = bridge.ensure_session(&workspace_path).await?;
             let content = zcode_warm_turn_content(&prompt.input);
-            bridge.turn(&session_id, &content)
+            let stream = bridge.turn(&session_id, &content)?;
+            Ok((stream, session_id))
         }
         .await;
         match turned {
-            Ok(stream) => {
+            Ok((stream, session_id)) => {
                 // Spawn/protocol failures are environmental; a healthy
                 // session/send resets the consecutive-failure latch.
                 bridge.register_success();
+                // Best-effort: the record only upgrades the next process's
+                // first turn on this thread.
+                zcode_warm_store::store_record(
+                    &state.thread_id,
+                    &zcode_warm_store::ZcodeWarmRecord {
+                        zcode_session_id: session_id,
+                        workspace_path: workspace_path.clone(),
+                        last_event_seq: bridge.last_event_seq(),
+                    },
+                );
                 Ok(stream)
             }
             Err(e) => {

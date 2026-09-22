@@ -5,11 +5,13 @@ use std::time::Duration;
 use pretty_assertions::assert_eq;
 use tokio::sync::mpsc;
 
+use super::SessionSeed;
 use super::WarmMode;
 use super::ZcodeWarmBridge;
 use super::warm_bridge_enabled_from_value;
 use super::warm_mode_from_value;
 use crate::client::ZcodeRuntime;
+use crate::zcode_warm_store::ZcodeWarmRecord;
 use codex_api::ResponseEvent;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::BridgeToolActivityEvent;
@@ -58,6 +60,9 @@ struct FakeServerOptions {
     /// Answer `session/send`, emit one delta, then exit, so the collector is
     /// left waiting when the child's stdout closes.
     exits_mid_turn: bool,
+    /// Answer `session/list` with no sessions, so a recorded session that
+    /// the server forgot cannot be adopted.
+    empty_session_list: bool,
 }
 
 impl Default for FakeServerOptions {
@@ -70,6 +75,7 @@ impl Default for FakeServerOptions {
             turn_result_type: "success",
             fails_resume: false,
             exits_mid_turn: false,
+            empty_session_list: false,
         }
     }
 }
@@ -93,8 +99,11 @@ let pendingPerm = null;
 let pendingInput = null;
 let pendingHeaders = null;
 let pendingMcpAuth = null;
+// Event envelopes carry a monotonic seq; the subscribe result pins the
+// stream head it starts from.
+let seqCounter = 7;
 function write(obj) { process.stdout.write(JSON.stringify(obj) + "\n"); }
-function emit(params) { write({ method: "session/event", params }); }
+function emit(params) { params.seq = ++seqCounter; write({ method: "session/event", params }); }
 function sendProbe(kind, original) {
   const probeId = kind + "-" + original.id;
   const params = {
@@ -140,6 +149,24 @@ function handle(msg) {
     return;
   }
   switch (msg.method) {
+    case "session/list":
+      if (EMPTY_LIST) {
+        respond({ sessions: [] });
+      } else {
+        respond({
+          sessions: [{
+            sessionId: msg.params.sessionIds[0],
+            workspace: msg.params.workspace,
+            mode: "yolo",
+            status: "idle",
+            sessionKind: "main",
+            title: "",
+            createdAt: 0,
+            updatedAt: 0,
+          }],
+        });
+      }
+      break;
     case "session/resume":
       if (FAIL_RESUME) {
         write({ id: msg.id, error: { code: -32000, message: "session not found: " + msg.params.sessionId } });
@@ -151,7 +178,7 @@ function handle(msg) {
       respond({ session: { sessionId: "sess_fake" }, protocol: { name: "ZCode Protocol", version: 1 } });
       break;
     case "session/subscribe":
-      respond({ sessionId: msg.params.sessionId, eventSeq: 0, events: [] });
+      respond({ sessionId: msg.params.sessionId, eventSeq: 7, events: [] });
       break;
     case "session/send": {
       const content = msg.params.content;
@@ -196,6 +223,7 @@ const PROBE_RUNTIME = %PROBE_RUNTIME%;
 const TOOL_EVENTS = %TOOL_EVENTS%;
 const FAIL_RESUME = %FAIL_RESUME%;
 const EXIT_MID_TURN = %EXIT_MID_TURN%;
+const EMPTY_LIST = %EMPTY_LIST%;
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => {
   buffer += chunk;
@@ -264,7 +292,10 @@ process.stdin.on("data", (chunk) => {
       continue;
     }
     if (msg.id !== undefined && msg.method) {
-      stats(msg.method.replace("session/", "") + (msg.method === "session/send" ? ":" + msg.params.content : ""));
+      const extra = msg.method === "session/send"
+        ? ":" + msg.params.content
+        : msg.method === "session/list" ? ":" + JSON.stringify(msg.params) : "";
+      stats(msg.method.replace("session/", "") + extra);
       handle(msg);
       continue;
     }
@@ -320,6 +351,14 @@ process.stdin.on("data", (chunk) => {
                 "false"
             },
         )
+        .replace(
+            "%EMPTY_LIST%",
+            if options.empty_session_list {
+                "true"
+            } else {
+                "false"
+            },
+        )
         .replace("%RESULT_TYPE%", options.turn_result_type);
     std::fs::write(&fixture, script).expect("write fake app-server fixture");
     fixture
@@ -364,7 +403,7 @@ async fn warm_turn_streams_deltas_and_completes_with_usage() {
         &test_runtime(&fixture),
         "/tmp",
         WarmMode::Yolo,
-        /*resume_session_id*/ None,
+        SessionSeed::Fresh,
     )
     .expect("spawn fake app-server");
     let session_id = bridge
@@ -413,6 +452,9 @@ async fn warm_turn_streams_deltas_and_completes_with_usage() {
         }
         other => panic!("expected Completed, got {other:?}"),
     }
+    // The fake numbers event envelopes from 8 (subscribe pins head 7): two
+    // deltas then turn.completed. The bridge must have tracked the stream.
+    assert_eq!(bridge.last_event_seq(), 10);
     bridge.kill("test end");
 }
 
@@ -426,7 +468,7 @@ async fn warm_turn_maps_tool_call_events_to_bridge_activity() {
         &test_runtime(&fixture),
         "/tmp",
         WarmMode::Yolo,
-        /*resume_session_id*/ None,
+        SessionSeed::Fresh,
     )
     .expect("spawn fake app-server");
     let session_id = bridge
@@ -497,7 +539,7 @@ async fn warm_bridge_reuses_one_session_across_turns() {
         &test_runtime(&fixture),
         "/tmp",
         WarmMode::Yolo,
-        /*resume_session_id*/ None,
+        SessionSeed::Fresh,
     )
     .expect("spawn fake app-server");
     let session_id = bridge
@@ -533,7 +575,7 @@ async fn warm_turn_without_deltas_uses_final_response() {
         &test_runtime(&fixture),
         "/tmp",
         WarmMode::Yolo,
-        /*resume_session_id*/ None,
+        SessionSeed::Fresh,
     )
     .expect("spawn fake app-server");
     let session_id = bridge
@@ -601,7 +643,7 @@ async fn warm_turn_reports_budget_exhaustion_instead_of_success() {
         &test_runtime(&fixture),
         "/tmp",
         WarmMode::Yolo,
-        /*resume_session_id*/ None,
+        SessionSeed::Fresh,
     )
     .expect("spawn fake app-server");
     let session_id = bridge
@@ -644,7 +686,7 @@ async fn compat_retry_strips_unrecognized_keys_and_retries_once() {
         &test_runtime(&fixture),
         "/tmp",
         WarmMode::Yolo,
-        /*resume_session_id*/ None,
+        SessionSeed::Fresh,
     )
     .expect("spawn fake app-server");
 
@@ -675,7 +717,7 @@ async fn compat_retry_does_not_retry_unrelated_rejections() {
         &test_runtime(&fixture),
         "/tmp",
         WarmMode::Yolo,
-        /*resume_session_id*/ None,
+        SessionSeed::Fresh,
     )
     .expect("spawn fake app-server");
 
@@ -713,7 +755,7 @@ async fn gated_bridge_creates_build_session_and_denies_interaction_callbacks() {
         &test_runtime(&fixture),
         "/tmp",
         WarmMode::Build,
-        /*resume_session_id*/ None,
+        SessionSeed::Fresh,
     )
     .expect("spawn fake app-server");
     bridge
@@ -745,7 +787,7 @@ async fn yolo_bridge_rejects_interaction_callbacks() {
         &test_runtime(&fixture),
         "/tmp",
         WarmMode::Yolo,
-        /*resume_session_id*/ None,
+        SessionSeed::Fresh,
     )
     .expect("spawn fake app-server");
     bridge
@@ -777,7 +819,7 @@ async fn bridge_fast_fails_runtime_header_callbacks_with_host_fallback_shapes() 
         &test_runtime(&fixture),
         "/tmp",
         WarmMode::Yolo,
-        /*resume_session_id*/ None,
+        SessionSeed::Fresh,
     )
     .expect("spawn fake app-server");
     bridge
@@ -807,7 +849,7 @@ async fn respawned_bridge_resumes_the_previous_session_instead_of_creating() {
         &test_runtime(&fixture),
         "/tmp",
         WarmMode::Yolo,
-        /*resume_session_id*/ None,
+        SessionSeed::Fresh,
     )
     .expect("spawn fake app-server");
     let previous = bridge
@@ -823,7 +865,7 @@ async fn respawned_bridge_resumes_the_previous_session_instead_of_creating() {
         &test_runtime(&fixture),
         "/tmp",
         WarmMode::Yolo,
-        Some(previous.clone()),
+        SessionSeed::Predecessor(previous.clone()),
     )
     .expect("spawn replacement app-server");
     let session_id = bridge
@@ -852,7 +894,7 @@ async fn resume_failure_falls_back_to_creating_a_fresh_session() {
         &test_runtime(&fixture),
         "/tmp",
         WarmMode::Yolo,
-        Some("sess_prev".to_string()),
+        SessionSeed::Predecessor("sess_prev".to_string()),
     )
     .expect("spawn fake app-server");
     let session_id = bridge
@@ -869,6 +911,114 @@ async fn resume_failure_falls_back_to_creating_a_fresh_session() {
 }
 
 #[tokio::test]
+async fn recorded_session_is_adopted_via_list_and_resume() {
+    let fixture = write_fake_server();
+    let bridge = ZcodeWarmBridge::spawn(
+        &test_runtime(&fixture),
+        "/tmp",
+        WarmMode::Yolo,
+        SessionSeed::Recorded(ZcodeWarmRecord {
+            zcode_session_id: "sess_fake".to_string(),
+            workspace_path: "/tmp".to_string(),
+            last_event_seq: 41,
+        }),
+    )
+    .expect("spawn fake app-server");
+    let session_id = bridge
+        .ensure_session("/tmp")
+        .await
+        .expect("recorded session adopted");
+    assert_eq!(session_id, "sess_fake");
+
+    let stats_text = std::fs::read_to_string(stats_path(&fixture)).expect("stats written");
+    let lines: Vec<&str> = stats_text.lines().collect();
+    let listed = lines
+        .iter()
+        .find(|line| line.starts_with("list:"))
+        .expect("adoption must confirm the record through session/list");
+    assert!(
+        listed.contains("\"sessionIds\":[\"sess_fake\"]") && listed.contains("\"workspace\""),
+        "the identity query must pin the recorded session: {listed}"
+    );
+    assert!(lines.contains(&"resume"), "stats: {stats_text}");
+    assert!(
+        !lines.contains(&"create"),
+        "an adopted session must not create a fresh one: {stats_text}"
+    );
+    // The subscribe result pins the stream head, and the bridge folds it in.
+    assert_eq!(bridge.last_event_seq(), 7);
+    bridge.kill("test end");
+}
+
+#[tokio::test]
+async fn recorded_session_missing_on_the_server_creates_a_fresh_one() {
+    let fixture = write_fake_server_with(FakeServerOptions {
+        empty_session_list: true,
+        ..FakeServerOptions::default()
+    });
+    let bridge = ZcodeWarmBridge::spawn(
+        &test_runtime(&fixture),
+        "/tmp",
+        WarmMode::Yolo,
+        SessionSeed::Recorded(ZcodeWarmRecord {
+            zcode_session_id: "sess_gone".to_string(),
+            workspace_path: "/tmp".to_string(),
+            last_event_seq: 0,
+        }),
+    )
+    .expect("spawn fake app-server");
+    let session_id = bridge
+        .ensure_session("/tmp")
+        .await
+        .expect("fresh session created");
+    assert_eq!(session_id, "sess_fake");
+
+    let stats_text = std::fs::read_to_string(stats_path(&fixture)).expect("stats written");
+    let lines: Vec<&str> = stats_text.lines().collect();
+    assert!(
+        lines.iter().any(|line| line.starts_with("list:")),
+        "the record must be confirmed through session/list: {stats_text}"
+    );
+    assert!(
+        !lines.contains(&"resume"),
+        "a session the server forgot must not be resumed: {stats_text}"
+    );
+    assert!(lines.contains(&"create"), "stats: {stats_text}");
+    bridge.kill("test end");
+}
+
+#[tokio::test]
+async fn recorded_session_in_another_workspace_creates_a_fresh_one() {
+    let fixture = write_fake_server();
+    let bridge = ZcodeWarmBridge::spawn(
+        &test_runtime(&fixture),
+        "/tmp",
+        WarmMode::Yolo,
+        SessionSeed::Recorded(ZcodeWarmRecord {
+            zcode_session_id: "sess_elsewhere".to_string(),
+            workspace_path: "/elsewhere".to_string(),
+            last_event_seq: 3,
+        }),
+    )
+    .expect("spawn fake app-server");
+    let session_id = bridge
+        .ensure_session("/tmp")
+        .await
+        .expect("fresh session created");
+    assert_eq!(session_id, "sess_fake");
+
+    let stats_text = std::fs::read_to_string(stats_path(&fixture)).expect("stats written");
+    let lines: Vec<&str> = stats_text.lines().collect();
+    assert!(
+        !lines.iter().any(|line| line.starts_with("list:")),
+        "a workspace-mismatched record must be rejected locally: {stats_text}"
+    );
+    assert!(!lines.contains(&"resume"), "stats: {stats_text}");
+    assert!(lines.contains(&"create"), "stats: {stats_text}");
+    bridge.kill("test end");
+}
+
+#[tokio::test]
 async fn collector_fails_fast_when_the_app_server_exits_mid_turn() {
     let fixture = write_fake_server_with(FakeServerOptions {
         exits_mid_turn: true,
@@ -878,7 +1028,7 @@ async fn collector_fails_fast_when_the_app_server_exits_mid_turn() {
         &test_runtime(&fixture),
         "/tmp",
         WarmMode::Yolo,
-        /*resume_session_id*/ None,
+        SessionSeed::Fresh,
     )
     .expect("spawn fake app-server");
     let session_id = bridge

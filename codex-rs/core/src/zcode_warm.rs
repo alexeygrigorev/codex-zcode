@@ -33,6 +33,7 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU32;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -105,6 +106,21 @@ pub(crate) fn warm_mode_from_env() -> WarmMode {
 /// abandoned for the rest of the Codex thread and every turn falls back to
 /// the spawn-per-turn path.
 pub(crate) const ZCODE_WARM_MAX_CONSECUTIVE_FAILURES: u32 = 2;
+
+/// Where a replacement bridge looks for the session to pick back up
+/// (issue #42). Both resume seeds fall back to `session/create` when the
+/// pick-up fails, so a lost session only ever costs the cache warmth.
+pub(crate) enum SessionSeed {
+    /// Establish a fresh session.
+    Fresh,
+    /// The bridge this one replaced died with this session established in
+    /// memory, so the session is worth resuming directly.
+    Predecessor(String),
+    /// A session recorded on disk for this Codex thread by a previous
+    /// process: survive a full zcodex restart by confirming the record
+    /// still exists server-side (`session/list`) before resuming it.
+    Recorded(crate::zcode_warm_store::ZcodeWarmRecord),
+}
 
 /// Requests are answered or the turn fails quickly: session creation takes
 /// ~2s in practice and send acceptance is sub-second, so anything past this
@@ -218,11 +234,14 @@ pub(crate) struct ZcodeWarmBridge {
     /// Created once per bridge; concurrent first turns share the handshake
     /// and failed attempts leave the cell empty for a retry.
     session_id: tokio::sync::OnceCell<String>,
-    /// Session id of the bridge this one replaced when that bridge's child
-    /// died; `ensure_session` resumes it instead of creating fresh (issue
-    /// #42). Empty when there is nothing to resume or the predecessor was
-    /// abandoned for repeated failures while still alive.
-    resume_session_id: Option<String>,
+    /// Where this bridge looks for a session to pick back up in
+    /// [`Self::ensure_session`] (issue #42): a dead predecessor's session,
+    /// a record persisted by an earlier process, or nothing.
+    resume_seed: SessionSeed,
+    /// Highest `seq` observed on this session's event stream; persisted
+    /// with the session id so a later process knows where catch-up would
+    /// start from.
+    last_event_seq: AtomicU64,
     dead: Arc<AtomicBool>,
     consecutive_failures: AtomicU32,
     request_timeout: Duration,
@@ -247,7 +266,7 @@ impl ZcodeWarmBridge {
         runtime: &ZcodeRuntime,
         workspace_path: &str,
         mode: WarmMode,
-        resume_session_id: Option<String>,
+        resume_seed: SessionSeed,
     ) -> io::Result<Arc<Self>> {
         let mut command = Command::new(&runtime.node);
         command
@@ -325,7 +344,8 @@ impl ZcodeWarmBridge {
             stderr_tail,
             events,
             session_id: tokio::sync::OnceCell::new(),
-            resume_session_id,
+            resume_seed,
+            last_event_seq: AtomicU64::new(0),
             dead: Arc::clone(&dead),
             consecutive_failures: AtomicU32::new(0),
             request_timeout: REQUEST_TIMEOUT,
@@ -381,6 +401,26 @@ impl ZcodeWarmBridge {
     /// The established session id, if the handshake completed.
     pub(crate) fn session_id(&self) -> Option<String> {
         self.session_id.get().cloned()
+    }
+
+    /// Highest `seq` seen on the session's event stream, or 0 before any.
+    pub(crate) fn last_event_seq(&self) -> u64 {
+        self.last_event_seq.load(Ordering::Relaxed)
+    }
+
+    /// Folds an observed sequence number into [`Self::last_event_seq`].
+    pub(crate) fn observe_event_seq(&self, seq: u64) {
+        self.last_event_seq.fetch_max(seq, Ordering::Relaxed);
+    }
+
+    /// Folds a `session/event` envelope into [`Self::last_event_seq`].
+    ///
+    /// Older cores may omit `seq` on the envelope; those events are simply
+    /// not tracked.
+    fn record_event_seq(&self, event: &serde_json::Value) {
+        if let Some(seq) = event.get("seq").and_then(serde_json::Value::as_u64) {
+            self.observe_event_seq(seq);
+        }
     }
 
     /// Kills the child and its process group and fails all waiters.
@@ -464,6 +504,7 @@ impl ZcodeWarmBridge {
         if msg.get("method").and_then(|m| m.as_str()) == Some("session/event")
             && let Some(params) = msg.get("params")
         {
+            self.record_event_seq(params);
             let _ = self.events.send(params.clone());
         }
     }
@@ -689,9 +730,9 @@ impl ZcodeWarmBridge {
         }
     }
 
-    /// Establishes (once) and subscribes to the per-thread session,
-    /// resuming the replaced bridge's session after an app-server respawn
-    /// (issue #42).
+    /// Establishes (once) and subscribes to the per-thread session, picking
+    /// up the predecessor's session after an app-server respawn or the
+    /// recorded session after a full zcodex restart (issue #42).
     ///
     /// The `OnceCell` makes concurrent first turns share one handshake while
     /// keeping no lock guard across the awaited requests.
@@ -701,7 +742,7 @@ impl ZcodeWarmBridge {
                 zcode_warm_resume::establish_session(
                     self,
                     workspace_path,
-                    self.resume_session_id.as_deref(),
+                    &self.resume_seed,
                     self.mode,
                 )
             })
