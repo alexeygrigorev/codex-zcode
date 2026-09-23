@@ -105,13 +105,13 @@ fn mirror_selector_requires_env_goal_tool_and_objective() {
     );
 }
 
-fn synthesized_completion_items(call_id: &str) -> Vec<ResponseItem> {
+fn synthesized_goal_items(status: &str, call_id: &str) -> Vec<ResponseItem> {
     vec![
         ResponseItem::FunctionCall {
             id: None,
             name: "update_goal".to_string(),
             namespace: None,
-            arguments: r#"{"status":"complete"}"#.to_string(),
+            arguments: format!(r#"{{"status":"{status}"}}"#),
             encrypted_function_args: Some(Vec::new()),
             call_id: call_id.to_string(),
             internal_chat_message_metadata_passthrough: None,
@@ -135,7 +135,7 @@ fn selector_skips_the_agent_loop_round_after_a_mirrored_completion() {
             user_message(&continuation_prompt("Ship the release notes")),
             assistant_message("goal work done".to_string()),
         ],
-        synthesized_completion_items(&format!("{MIRROR_CALL_ID_PREFIX}req")),
+        synthesized_goal_items("complete", &format!("{MIRROR_CALL_ID_PREFIX}req")),
     ]
     .concat();
     assert_eq!(
@@ -152,6 +152,25 @@ fn selector_skips_the_agent_loop_round_after_a_mirrored_completion() {
     assert_eq!(
         mirrored_goal_objective_for(Some("1"), &tools, &reactivated).as_deref(),
         Some("Ship the changelog")
+    );
+}
+
+#[test]
+fn selector_skips_the_agent_loop_round_after_a_capped_block() {
+    let tools = vec![goal_tool_spec()];
+    let answered_round = [
+        vec![
+            user_message(&continuation_prompt("Finish it by 2027")),
+            assistant_message("capped-cycle work".to_string()),
+        ],
+        synthesized_goal_items("blocked", &format!("{MIRROR_CALL_ID_PREFIX}req")),
+    ]
+    .concat();
+    assert_eq!(
+        mirrored_goal_objective_for(Some("1"), &tools, &answered_round),
+        None,
+        "the round after a capped block must degrade to a plain warm turn; \
+         re-mirroring the same objective is what loops forever (issue #53)"
     );
 }
 
@@ -314,7 +333,7 @@ async fn the_round_after_a_mirrored_completion_does_not_restart_the_core_goal_lo
         user_message(&continuation_prompt(objective)),
         assistant_message("goal".to_string()),
     ];
-    second.extend(synthesized_completion_items(&call_id));
+    second.extend(synthesized_goal_items("complete", &call_id));
     assert_eq!(
         mirrored_goal_objective_for(Some("1"), &tools, &second),
         None,
@@ -325,7 +344,9 @@ async fn the_round_after_a_mirrored_completion_does_not_restart_the_core_goal_lo
         .turn(&session_id, "plain warm turn", TurnInputChannel::LegacySend)
         .expect("plain warm turn starts");
     loop {
-        if let ResponseEvent::Completed { .. } = next_event(&mut plain.rx_event).await { break }
+        if let ResponseEvent::Completed { .. } = next_event(&mut plain.rx_event).await {
+            break;
+        }
     }
 
     let stats = std::fs::read_to_string(stats_path(&fixture)).expect("stats file");
@@ -378,7 +399,7 @@ async fn mirrored_goal_turn_reports_paused_without_completion() {
 }
 
 #[tokio::test]
-async fn mirrored_goal_turn_caps_runaway_loops_and_pauses_the_goal() {
+async fn mirrored_goal_turn_caps_runaway_loops_and_reports_the_goal_blocked() {
     let fixture = write_fake_server_with(FakeServerOptions {
         goal_loop: GoalLoopMode::Capped,
         ..FakeServerOptions::default()
@@ -388,8 +409,19 @@ async fn mirrored_goal_turn_caps_runaway_loops_and_pauses_the_goal() {
     let mut completions = 0;
     loop {
         match next_event(&mut rx).await {
-            ResponseEvent::OutputItemDone(ResponseItem::FunctionCall { .. }) => {
-                panic!("a capped loop must not report completion")
+            ResponseEvent::OutputItemDone(ResponseItem::FunctionCall {
+                name,
+                arguments,
+                call_id,
+                ..
+            }) => {
+                // The capped cycle reports the goal blocked so the runtime
+                // stops scheduling continuations (issue #53); the call id
+                // prefix makes the follow-up round's output a selector
+                // sentinel, just like a completion.
+                assert_eq!(name, "update_goal");
+                assert_eq!(arguments, r#"{"status":"blocked"}"#);
+                assert!(call_id.starts_with(MIRROR_CALL_ID_PREFIX));
             }
             ResponseEvent::OutputItemDone(_) => completions += 1,
             ResponseEvent::Completed { end_turn, .. } => {
@@ -413,7 +445,7 @@ async fn mirrored_goal_turn_caps_runaway_loops_and_pauses_the_goal() {
         stats
             .lines()
             .any(|line| line.starts_with("goal:") && line.contains("\"action\":\"pause\"")),
-        "the core goal is paused so Codex-side audits stay in charge: {stats}"
+        "the core goal is paused so only the blocked report reaches Codex: {stats}"
     );
     bridge.kill("test end");
 }

@@ -17,7 +17,9 @@
 //! plain warm turn. A verified completion pauses the core goal and the
 //! selector refuses to re-mirror a continuation template already answered by
 //! a synthesized completion, so the agent loop's follow-up rounds cannot
-//! restart the settled core goal loop (issue #52).
+//! restart the settled core goal loop (issue #52). A capped cycle reports the
+//! goal blocked instead of leaving it active, so an unachievable objective
+//! ends its pursuit rather than re-mirroring forever (issue #53).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -53,8 +55,9 @@ const MIRROR_CALL_ID_PREFIX: &str = "zcode_goal_";
 /// Upper bound on core turns one mirrored request may span. The core's
 /// verifier re-prompts on every non-passing iteration and has no "blocked"
 /// verdict, so an unachievable goal would loop forever; past this cap the
-/// bridge stops the run and pauses the core goal without completion, handing
-/// control back to Codex's own continuation, budget, and blocked audits.
+/// bridge stops the run, pauses the core goal, and reports the Codex-side
+/// goal blocked so the runtime stops scheduling continuations instead of
+/// re-mirroring the same objective forever (issue #53).
 const MAX_MIRRORED_GOAL_TURNS: u32 = 12;
 
 /// The objective is user-authored data quoted back into a core prompt; cap it
@@ -70,11 +73,12 @@ fn goal_mirror_enabled_from_value(value: Option<&str>) -> bool {
 /// Extracts the active objective from the goal continuation template the
 /// Codex goal runtime rendered into the newest user message.
 ///
-/// The scan stops early at a synthesized mirror-completion output: such an
-/// output means this request is the agent loop's follow-up round for a goal
-/// turn whose completion was already reported, and re-mirroring there would
-/// restart the just-settled core goal loop (issue #52). Only a continuation
-/// template newer than the last mirror completion qualifies.
+/// The scan stops early at a synthesized mirror-outcome output (a verified
+/// completion or a capped-cycle block): such an output means this request is
+/// the agent loop's follow-up round for a goal turn whose outcome was already
+/// reported, and re-mirroring there would restart the just-settled core goal
+/// loop (issue #52). Only a continuation template newer than the last
+/// mirror-outcome output qualifies.
 fn goal_objective_from_prompt(input: &[ResponseItem]) -> Option<String> {
     let text = input.iter().rev().find_map(|item| match item {
         ResponseItem::Message { role, content, .. } if role.as_str() == "user" => Some(
@@ -138,9 +142,13 @@ fn mirrored_goal_objective_for(
 enum Settle {
     /// The core's verifier proved the goal complete; report it Codex-side.
     Complete,
-    /// The loop ended without a verified completion (paused, budget-limited,
-    /// cleared, or the turn cap); leave the Codex-side goal decision to the
-    /// normal continuation flow.
+    /// The turn cap ended the loop without a verified completion; report the
+    /// goal blocked Codex-side so the runtime stops scheduling continuations
+    /// and the pursuit cannot silently restart (issue #53).
+    Capped,
+    /// The loop ended without a verified completion through the core's own
+    /// decision (paused, budget-limited, or cleared); leave the Codex-side
+    /// goal decision to the normal continuation flow.
     WithoutComplete,
 }
 
@@ -320,7 +328,7 @@ pub(crate) async fn turn_mirrored(
                     if turns_seen >= MAX_MIRRORED_GOAL_TURNS {
                         warn!(
                             "ZCode warm goal loop hit the {MAX_MIRRORED_GOAL_TURNS}-turn cap; \
-                             pausing the core goal without completion"
+                             stopping the core goal and reporting it blocked"
                         );
                         if let Some(bridge) = collector_bridge.upgrade() {
                             let _ = bridge
@@ -339,7 +347,7 @@ pub(crate) async fn turn_mirrored(
                                 )
                                 .await;
                         }
-                        settle = Some(Settle::WithoutComplete);
+                        settle = Some(Settle::Capped);
                     }
                     reply = String::new();
                     started_output = false;
@@ -379,12 +387,17 @@ pub(crate) async fn turn_mirrored(
                 break;
             }
         }
-        if settle == Some(Settle::Complete) {
+        let settled_status = match settle {
+            Some(Settle::Complete) => Some("complete"),
+            Some(Settle::Capped) => Some("blocked"),
+            Some(Settle::WithoutComplete) | None => None,
+        };
+        if let Some(status) = settled_status {
             let item = ResponseItem::FunctionCall {
                 id: None,
                 name: "update_goal".to_string(),
                 namespace: None,
-                arguments: r#"{"status":"complete"}"#.to_string(),
+                arguments: format!(r#"{{"status":"{status}"}}"#),
                 encrypted_function_args: Some(Vec::new()),
                 call_id: format!("{MIRROR_CALL_ID_PREFIX}{request_id}"),
                 internal_chat_message_metadata_passthrough: None,
@@ -395,8 +408,10 @@ pub(crate) async fn turn_mirrored(
             // The core keeps a settled goal registered, and its `session/goal
             // set` restarts the loop from any prior status; pause so a later
             // mirror cannot hand the verifier the same objective again
-            // (issue #52).
-            if let Some(bridge) = collector_bridge.upgrade()
+            // (issue #52). The capped path already paused alongside its
+            // `session/stop`.
+            if settle == Some(Settle::Complete)
+                && let Some(bridge) = collector_bridge.upgrade()
                 && let Err(error) = bridge
                     .request_with_compat_retry(
                         "session/goal",
