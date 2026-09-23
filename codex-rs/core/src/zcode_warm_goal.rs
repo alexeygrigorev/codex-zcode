@@ -12,7 +12,8 @@
 //! maps the verified outcome back onto the same synthesized `update_goal`
 //! call the marker translation emits, so Codex-side bookkeeping is identical.
 //!
-//! Opt in with `ZCODE_WARM_GOAL=1`. The marker protocol remains the
+//! Opt out with `ZCODE_WARM_GOAL=0` (on by default since the live validation,
+//! issue #50). The marker protocol remains the
 //! spawn-per-turn mechanism, and any mirror setup failure falls back to a
 //! plain warm turn. A verified completion pauses the core goal and the
 //! selector refuses to re-mirror a continuation template already answered by
@@ -43,7 +44,9 @@ use crate::zcode_warm::token_usage_from_turn_payload;
 use crate::zcode_warm::zcode_completed_turn_error;
 use crate::zcode_warm_events::bridge_tool_activity_from_notification;
 
-/// Env var enabling goal mirroring for warm sessions (`ZCODE_WARM_GOAL=1`).
+/// Env var controlling goal mirroring for warm sessions (`ZCODE_WARM_GOAL`).
+/// On by default since the live validation (issue #50); set to `0`, `false`,
+/// or `no` to opt out.
 const GOAL_MIRROR_ENV_VAR: &str = "ZCODE_WARM_GOAL";
 
 /// Call-id prefix of the synthesized `update_goal` calls the mirror emits on a
@@ -64,10 +67,11 @@ const MAX_MIRRORED_GOAL_TURNS: u32 = 12;
 /// so a pathological goal cannot dominate the core's context.
 const OBJECTIVE_CHAR_BUDGET: usize = 4_000;
 
-/// Whether goal mirroring was requested via [`GOAL_MIRROR_ENV_VAR`]; unknown
-/// values keep the mirror off.
+/// Whether goal mirroring is enabled via [`GOAL_MIRROR_ENV_VAR`]: unset is
+/// the on-by-default flip, an affirmative value forces it on, and any other
+/// explicit value keeps the mirror off.
 fn goal_mirror_enabled_from_value(value: Option<&str>) -> bool {
-    matches!(value.map(str::trim), Some("1") | Some("true") | Some("yes"))
+    matches!(value.map(str::trim), None | Some("1" | "true" | "yes"))
 }
 
 /// Extracts the active objective from the goal continuation template the

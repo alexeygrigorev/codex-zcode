@@ -82,15 +82,24 @@ fn goal_objective_ignores_prompts_without_the_template() {
 }
 
 #[test]
-fn mirror_selector_requires_env_goal_tool_and_objective() {
+fn mirror_selector_defaults_on_and_requires_goal_tool_and_objective() {
     let tools = vec![goal_tool_spec()];
     let input = vec![user_message(&continuation_prompt("Refactor the parser"))];
     assert_eq!(
         mirrored_goal_objective_for(Some("1"), &tools, &input).as_deref(),
         Some("Refactor the parser")
     );
-    assert_eq!(mirrored_goal_objective_for(None, &tools, &input), None);
+    assert_eq!(
+        mirrored_goal_objective_for(None, &tools, &input).as_deref(),
+        Some("Refactor the parser"),
+        "the mirror is on by default since the live validation (issue #50)"
+    );
     assert_eq!(mirrored_goal_objective_for(Some("0"), &tools, &input), None);
+    assert_eq!(
+        mirrored_goal_objective_for(Some("false"), &tools, &input),
+        None
+    );
+    assert_eq!(mirrored_goal_objective_for(Some(""), &tools, &input), None);
 
     let plain_tools: Vec<ToolSpec> = Vec::new();
     assert_eq!(
