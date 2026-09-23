@@ -9,11 +9,17 @@
 //! teardown (graceful shutdown request, grace period, then force-kill
 //! whatever is left of the process tree).
 
+use std::collections::HashMap;
 use std::io;
 use std::process::ExitStatus;
+use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use tokio::process::Child;
+use tokio::sync::Mutex;
+use tokio::sync::OwnedMutexGuard;
 use tracing::warn;
 
 use codex_utils_pty::process_group::kill_child_process_group;
@@ -71,6 +77,57 @@ pub(crate) async fn idle_elapsed(idle_timeout: Option<Duration>) -> Duration {
     };
     tokio::time::sleep(idle_timeout).await;
     idle_timeout
+}
+
+/// Holds the single in-flight headless ZCode session for one working directory.
+///
+/// `stream_zcode` spawns a new `zcode.cjs` process for every model call, and
+/// each process mints its own session (`resume: false`) that can edit the
+/// tree. A compaction call or a second thread that starts while the first
+/// child is still running is a second writer on the same checkout. This
+/// permit is that checkout's lock: the next spawn waits until the current
+/// child task drops it.
+pub(crate) struct WorkspaceSessionPermit {
+    _guard: OwnedMutexGuard<()>,
+}
+
+struct WorkspaceSessionGates {
+    locks: StdMutex<HashMap<String, Arc<Mutex<()>>>>,
+}
+
+fn workspace_session_gates() -> &'static WorkspaceSessionGates {
+    static GATES: OnceLock<WorkspaceSessionGates> = OnceLock::new();
+    GATES.get_or_init(|| WorkspaceSessionGates {
+        locks: StdMutex::new(HashMap::new()),
+    })
+}
+
+/// Same directory even when one caller has a trailing slash and the other does not.
+fn workspace_session_key(cwd: &str) -> String {
+    let trimmed = cwd.trim();
+    if trimmed.len() > 1 {
+        trimmed.trim_end_matches('/').to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Waits until no other spawn-per-turn ZCode child is running in `cwd`.
+pub(crate) async fn acquire_workspace_session(cwd: &str) -> WorkspaceSessionPermit {
+    let mutex = {
+        let mut locks = workspace_session_gates()
+            .locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Arc::clone(
+            locks
+                .entry(workspace_session_key(cwd))
+                .or_insert_with(|| Arc::new(Mutex::new(()))),
+        )
+    };
+    WorkspaceSessionPermit {
+        _guard: mutex.lock_owned().await,
+    }
 }
 
 /// One NDJSON line from the ZCode stream, bounded by the idle timeout.

@@ -1,4 +1,8 @@
 use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -9,9 +13,79 @@ use tokio::process::Command;
 
 use super::DEFAULT_ZCODE_STREAM_IDLE_TIMEOUT;
 use super::ZcodeStreamLine;
+use super::acquire_workspace_session;
 use super::dispose_and_wait_once;
 use super::next_stream_line;
 use super::zcode_idle_timeout_from_value;
+
+#[tokio::test]
+async fn workspace_session_is_exclusive_for_one_directory() {
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let overlapped = Arc::new(AtomicBool::new(false));
+    let mut tasks = Vec::new();
+    for _ in 0..2 {
+        let in_flight = Arc::clone(&in_flight);
+        let overlapped = Arc::clone(&overlapped);
+        tasks.push(tokio::spawn(async move {
+            let _permit = acquire_workspace_session("/tmp/zcode-one-checkout").await;
+            if in_flight.fetch_add(1, Ordering::SeqCst) != 0 {
+                overlapped.store(true, Ordering::SeqCst);
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            in_flight.fetch_sub(1, Ordering::SeqCst);
+        }));
+    }
+    for task in tasks {
+        task.await.expect("session gate task");
+    }
+    assert!(!overlapped.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn trailing_slash_does_not_start_a_second_session() {
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let overlapped = Arc::new(AtomicBool::new(false));
+    let mut tasks = Vec::new();
+    for cwd in ["/tmp/zcode-same-checkout", "/tmp/zcode-same-checkout/"] {
+        let in_flight = Arc::clone(&in_flight);
+        let overlapped = Arc::clone(&overlapped);
+        tasks.push(tokio::spawn(async move {
+            let _permit = acquire_workspace_session(cwd).await;
+            if in_flight.fetch_add(1, Ordering::SeqCst) != 0 {
+                overlapped.store(true, Ordering::SeqCst);
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            in_flight.fetch_sub(1, Ordering::SeqCst);
+        }));
+    }
+    for task in tasks {
+        task.await.expect("session gate task");
+    }
+    assert!(!overlapped.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn workspace_sessions_in_different_directories_overlap() {
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let mut tasks = Vec::new();
+    for cwd in ["/tmp/zcode-checkout-a", "/tmp/zcode-checkout-b"] {
+        let barrier = Arc::clone(&barrier);
+        tasks.push(tokio::spawn(async move {
+            let _permit = acquire_workspace_session(cwd).await;
+            barrier.wait().await;
+        }));
+    }
+    let (first, second) = (
+        tasks.pop().expect("second task"),
+        tasks.pop().expect("first task"),
+    );
+    tokio::time::timeout(Duration::from_secs(2), async {
+        first.await.expect("session gate task");
+        second.await.expect("session gate task");
+    })
+    .await
+    .expect("different directories must not block each other");
+}
 
 fn test_command() -> Command {
     // Own process group, matching what the bridge does at spawn time, so

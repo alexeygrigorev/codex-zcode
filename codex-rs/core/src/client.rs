@@ -3230,6 +3230,10 @@ impl ModelClientSession {
         }
 
         tokio::spawn(async move {
+            // One headless ZCode session per checkout. Compaction and any
+            // other overlapping model call wait here instead of minting a
+            // second yolo process that edits the same tree.
+            let _workspace_session = zcode_process::acquire_workspace_session(&cwd).await;
             let prompt_file = match write_zcode_prompt_file(&user_text) {
                 Ok(path) => path,
                 Err(e) => {
