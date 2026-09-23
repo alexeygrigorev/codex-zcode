@@ -53,6 +53,14 @@ pub(crate) struct AgentNavigationState {
     pub(super) picker_refresh: Option<(ThreadId, Uuid)>,
 }
 
+fn append_still_running(label: String, others_running: usize) -> String {
+    match others_running {
+        0 => label,
+        1 => format!("{label} · 1 agent still running"),
+        n => format!("{label} · {n} agents still running"),
+    }
+}
+
 /// Direction of keyboard traversal through the stable picker order.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AgentNavigationDirection {
@@ -318,12 +326,31 @@ impl AgentNavigationState {
         Some(ordered_threads[next_idx].0)
     }
 
+    /// Agents other than the thread on screen that are still doing work.
+    ///
+    /// The displayed thread can finish, and the composer then looks idle, while siblings keep
+    /// editing and committing. Callers use this count so that idle view does not hide them.
+    pub(crate) fn running_agents_outside(
+        &self,
+        current_displayed_thread_id: Option<ThreadId>,
+    ) -> usize {
+        self.threads
+            .iter()
+            .filter(|(thread_id, entry)| {
+                entry.is_running
+                    && !entry.is_closed
+                    && Some(**thread_id) != current_displayed_thread_id
+            })
+            .count()
+    }
+
     /// Derives the contextual footer label for the currently displayed thread.
     ///
     /// This intentionally returns `None` until there is more than one tracked thread so
     /// single-thread sessions do not waste footer space restating the obvious. When metadata for
     /// the displayed thread is missing, the label falls back to the same generic naming rules used
-    /// by the picker.
+    /// by the picker. A count of siblings that are still running is appended so a finished
+    /// foreground thread does not look like the whole session has stopped.
     pub(crate) fn active_agent_label(
         &self,
         current_displayed_thread_id: Option<ThreadId>,
@@ -335,30 +362,33 @@ impl AgentNavigationState {
 
         let thread_id = current_displayed_thread_id?;
         let is_primary = primary_thread_id == Some(thread_id);
-        Some(
-            self.threads
-                .get(&thread_id)
-                .map(|entry| {
-                    if !is_primary
-                        && let Some(agent_path) = entry
-                            .agent_path
-                            .as_deref()
-                            .filter(|agent_path| !agent_path.trim().is_empty())
-                    {
-                        return format!("`{agent_path}`");
-                    }
-                    format_agent_picker_item_name(
-                        entry.agent_nickname.as_deref(),
-                        entry.agent_role.as_deref(),
-                        is_primary,
-                    )
-                })
-                .unwrap_or_else(|| {
-                    format_agent_picker_item_name(
-                        /*agent_nickname*/ None, /*agent_role*/ None, is_primary,
-                    )
-                }),
-        )
+        let label = self
+            .threads
+            .get(&thread_id)
+            .map(|entry| {
+                if !is_primary
+                    && let Some(agent_path) = entry
+                        .agent_path
+                        .as_deref()
+                        .filter(|agent_path| !agent_path.trim().is_empty())
+                {
+                    return format!("`{agent_path}`");
+                }
+                format_agent_picker_item_name(
+                    entry.agent_nickname.as_deref(),
+                    entry.agent_role.as_deref(),
+                    is_primary,
+                )
+            })
+            .unwrap_or_else(|| {
+                format_agent_picker_item_name(
+                    /*agent_nickname*/ None, /*agent_role*/ None, is_primary,
+                )
+            });
+        Some(append_still_running(
+            label,
+            self.running_agents_outside(Some(thread_id)),
+        ))
     }
 
     /// Builds the `/subagents` picker subtitle from the same canonical bindings used by key handling.
@@ -498,6 +528,22 @@ mod tests {
 
         assert!(subtitle.contains(previous.content.as_ref()));
         assert!(subtitle.contains(next.content.as_ref()));
+    }
+
+    #[test]
+    fn active_agent_label_names_siblings_that_are_still_running() {
+        let (mut state, main_thread_id, first_agent_id, second_agent_id) = populated_state();
+        state.mark_running(first_agent_id);
+        state.mark_running(second_agent_id);
+
+        assert_eq!(
+            state.active_agent_label(Some(main_thread_id), Some(main_thread_id)),
+            Some("Main [default] · 2 agents still running".to_string())
+        );
+        assert_eq!(
+            state.active_agent_label(Some(first_agent_id), Some(main_thread_id)),
+            Some("Robie [explorer] · 1 agent still running".to_string())
+        );
     }
 
     #[test]
