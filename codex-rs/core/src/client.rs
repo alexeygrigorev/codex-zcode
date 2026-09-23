@@ -3200,6 +3200,31 @@ impl ModelClientSession {
         } else {
             user_text
         };
+        // A thread-title request would open a second yolo session in this
+        // checkout and the model would do the user's task. Answer it here.
+        if let Some(reply) = zcode_process::side_request_reply(&user_text) {
+            let reply_bytes = reply.len();
+            let item = ResponseItem::Message {
+                id: None,
+                role: "assistant".to_string(),
+                content: vec![codex_protocol::models::ContentItem::OutputText { text: reply }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            };
+            let _ = tx.send(Ok(ResponseEvent::OutputItemDone(item))).await;
+            let _ = tx
+                .send(Ok(ResponseEvent::Completed {
+                    response_id: request_id_for_stream,
+                    token_usage: Some(zcode_token_usage(None, user_text.len(), reply_bytes)),
+                    usage_metadata: None,
+                    end_turn: Some(true),
+                }))
+                .await;
+            return Ok(codex_api::ResponseStream {
+                rx_event,
+                upstream_request_id: Some(request_id),
+            });
+        }
         // On every turn: runaway final replies trip the provider's output
         // limit and abort the whole turn mid-work.
         let user_text = format!("{user_text}{ZCODE_REPLY_BUDGET_NOTE}");

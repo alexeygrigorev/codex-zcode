@@ -16,7 +16,23 @@ use super::ZcodeStreamLine;
 use super::acquire_workspace_session;
 use super::dispose_and_wait_once;
 use super::next_stream_line;
+use super::side_request_reply;
 use super::zcode_idle_timeout_from_value;
+
+#[test]
+fn title_request_is_answered_without_a_session() {
+    let prompt = "developer: You are `/root`.\nuser: Generate a concise, single-line task title of at most 36 characters and under five words where possible. Do not answer the request.\n\nUser prompt:\nfind what's new here and add it as pages\n";
+    let reply = side_request_reply(prompt).expect("title request");
+    assert_eq!(reply, r#"{"title":"Find what's new here"}"#);
+}
+
+#[test]
+fn ordinary_turn_still_opens_a_session() {
+    assert_eq!(
+        side_request_reply("user: let's make sure everything is in English"),
+        None
+    );
+}
 
 #[tokio::test]
 async fn workspace_session_is_exclusive_for_one_directory() {

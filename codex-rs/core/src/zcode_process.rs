@@ -102,6 +102,75 @@ fn workspace_session_gates() -> &'static WorkspaceSessionGates {
     })
 }
 
+const TITLE_REQUEST_MARKER: &str = "Generate a concise, single-line task title";
+const TITLE_REQUEST_REFUSAL: &str = "Do not answer the request.";
+
+/// Reply for a thread-title request, which must not open a ZCode session.
+///
+/// Title generation starts a temporary Codex thread in the same checkout as
+/// the real turn, a few hundred milliseconds later. On this wire that thread
+/// becomes another `zcode.cjs --mode yolo` process, and the prompt still
+/// contains the user's task, so the model does the work. The title is taken
+/// from that prompt locally instead.
+pub(crate) fn side_request_reply(prompt: &str) -> Option<String> {
+    if prompt.contains(TITLE_REQUEST_MARKER) && prompt.contains(TITLE_REQUEST_REFUSAL) {
+        return Some(serde_json::json!({ "title": local_thread_title(prompt) }).to_string());
+    }
+    None
+}
+
+/// First few words of the user's own prompt, capped the way the title parser is.
+fn local_thread_title(prompt: &str) -> String {
+    let source = prompt
+        .split_once("User prompt:\n")
+        .map(|(_, rest)| rest)
+        .or_else(|| {
+            prompt
+                .split_once("Recent conversation messages:\n")
+                .map(|(_, rest)| rest)
+        })
+        .unwrap_or(prompt);
+    let line = source
+        .lines()
+        .map(str::trim)
+        .find(|line| {
+            !line.is_empty()
+                && !line.starts_with("Attached files:")
+                && !line.starts_with('<')
+                && !line.starts_with("developer:")
+        })
+        .unwrap_or("New task");
+    let line = line
+        .trim_start_matches("user:")
+        .trim_start_matches("assistant:")
+        .trim();
+    let mut title = String::new();
+    for (index, word) in line.split_whitespace().take(4).enumerate() {
+        if index > 0 {
+            title.push(' ');
+        }
+        if index == 0 {
+            let mut chars = word.chars();
+            if let Some(first) = chars.next() {
+                title.extend(first.to_uppercase());
+                title.push_str(chars.as_str());
+            }
+        } else {
+            title.push_str(word);
+        }
+    }
+    let title: String = title.chars().take(36).collect();
+    let title = title
+        .trim_end_matches(|character: char| matches!(character, '.' | '?' | '!' | ','))
+        .trim()
+        .to_string();
+    if title.is_empty() {
+        "New task".to_string()
+    } else {
+        title
+    }
+}
+
 /// Same directory even when one caller has a trailing slash and the other does not.
 fn workspace_session_key(cwd: &str) -> String {
     let trimmed = cwd.trim();
