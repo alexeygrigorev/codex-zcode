@@ -285,8 +285,12 @@ fn missed_events_summary(
         .map(|(event_type, count)| format!("{event_type}×{count}"))
         .collect::<Vec<_>>()
         .join(", ");
-    let truncated = if usize::try_from(CATCH_UP_EVENT_LIMIT)
-        .is_ok_and(|limit| events.len() >= limit) { "; fetch cap reached, a later adoption catches up the rest" } else { Default::default() };
+    let truncated =
+        if usize::try_from(CATCH_UP_EVENT_LIMIT).is_ok_and(|limit| events.len() >= limit) {
+            "; fetch cap reached, a later adoption catches up the rest"
+        } else {
+            Default::default()
+        };
     let terminal = latest_terminal.unwrap_or_else(|| "none".to_string());
     Some(format!(
         "ZCode warm session {session_id}: {} event(s) while disconnected (after seq \
