@@ -4,6 +4,7 @@ use std::path::Path;
 use pretty_assertions::assert_eq;
 use tokio::sync::mpsc;
 
+use super::MIRROR_CALL_ID_PREFIX;
 use super::goal_objective_from_prompt;
 use super::mirrored_goal_objective_for;
 use super::turn_mirrored;
@@ -18,8 +19,10 @@ use crate::zcode_warm::tests::stats_path;
 use crate::zcode_warm::tests::test_runtime;
 use crate::zcode_warm::tests::write_fake_server_with;
 use crate::zcode_warm_permissions::WarmPermissionPolicy;
+use crate::zcode_warm_v4_send::TurnInputChannel;
 use codex_api::ResponseEvent;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseItem;
 use codex_tools::JsonSchema;
 use codex_tools::ResponsesApiTool;
@@ -99,6 +102,56 @@ fn mirror_selector_requires_env_goal_tool_and_objective() {
     assert_eq!(
         mirrored_goal_objective_for(Some("1"), &tools, &no_template),
         None
+    );
+}
+
+fn synthesized_completion_items(call_id: &str) -> Vec<ResponseItem> {
+    vec![
+        ResponseItem::FunctionCall {
+            id: None,
+            name: "update_goal".to_string(),
+            namespace: None,
+            arguments: r#"{"status":"complete"}"#.to_string(),
+            encrypted_function_args: Some(Vec::new()),
+            call_id: call_id.to_string(),
+            internal_chat_message_metadata_passthrough: None,
+        },
+        ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: Some(call_id.to_string()),
+            name: None,
+            namespace: None,
+            output: FunctionCallOutputPayload::from_text("goal recorded".to_string()),
+            internal_chat_message_metadata_passthrough: None,
+        },
+    ]
+}
+
+#[test]
+fn selector_skips_the_agent_loop_round_after_a_mirrored_completion() {
+    let tools = vec![goal_tool_spec()];
+    let answered_round = [
+        vec![
+            user_message(&continuation_prompt("Ship the release notes")),
+            assistant_message("goal work done".to_string()),
+        ],
+        synthesized_completion_items(&format!("{MIRROR_CALL_ID_PREFIX}req")),
+    ]
+    .concat();
+    assert_eq!(
+        mirrored_goal_objective_for(Some("1"), &tools, &answered_round),
+        None,
+        "the function-output round must degrade to a plain warm turn, not \
+         restart the settled core goal loop"
+    );
+
+    // A goal re-set after the completion arrives as a newer continuation
+    // template and must mirror again.
+    let mut reactivated = answered_round;
+    reactivated.push(user_message(&continuation_prompt("Ship the changelog")));
+    assert_eq!(
+        mirrored_goal_objective_for(Some("1"), &tools, &reactivated).as_deref(),
+        Some("Ship the changelog")
     );
 }
 
@@ -196,6 +249,100 @@ async fn mirrored_goal_turn_sets_the_goal_and_reports_verified_completion() {
             && set_frame.contains("\"objective\":\"Write the epic poem\"")
             && set_frame.contains("\"sessionId\":\"sess_fake\""),
         "the set frame must carry the objective: {set_frame}"
+    );
+    assert!(
+        stats
+            .lines()
+            .any(|line| line.starts_with("goal:") && line.contains("\"action\":\"pause\"")),
+        "the verified completion pauses the core goal so a later mirror \
+         cannot restart it: {stats}"
+    );
+    bridge.kill("test end");
+}
+
+#[tokio::test]
+async fn the_round_after_a_mirrored_completion_does_not_restart_the_core_goal_loop() {
+    let fixture = write_fake_server_with(FakeServerOptions {
+        goal_loop: GoalLoopMode::Complete,
+        ..FakeServerOptions::default()
+    });
+    let bridge = ZcodeWarmBridge::spawn(
+        &test_runtime(&fixture),
+        "/tmp",
+        WarmMode::Yolo,
+        WarmPermissionPolicy::DenyAll,
+        SessionSeed::Fresh,
+    )
+    .expect("spawn fake app-server");
+    let session_id = bridge
+        .ensure_session("/tmp")
+        .await
+        .expect("session created");
+    let tools = vec![goal_tool_spec()];
+    let objective = "Write the epic poem";
+
+    // Round 1: the fresh continuation template mirrors into the core goal
+    // loop and reports the verified completion.
+    let first = vec![user_message(&continuation_prompt(objective))];
+    assert_eq!(
+        mirrored_goal_objective_for(Some("1"), &tools, &first).as_deref(),
+        Some(objective)
+    );
+    let mut rx = {
+        let stream = turn_mirrored(&bridge, &session_id, objective)
+            .await
+            .expect("mirror starts");
+        stream.rx_event
+    };
+    let mut call_id = String::new();
+    loop {
+        match next_event(&mut rx).await {
+            ResponseEvent::OutputItemDone(ResponseItem::FunctionCall {
+                call_id: synthesized,
+                ..
+            }) => call_id = synthesized,
+            ResponseEvent::Completed { .. } => break,
+            _ => {}
+        }
+    }
+    assert!(call_id.starts_with(MIRROR_CALL_ID_PREFIX));
+
+    // Round 2: the agent loop's function-output round still carries the
+    // template as its newest user message; the mirror must stay out and let
+    // client.rs send a plain warm turn.
+    let mut second = vec![
+        user_message(&continuation_prompt(objective)),
+        assistant_message("goal".to_string()),
+    ];
+    second.extend(synthesized_completion_items(&call_id));
+    assert_eq!(
+        mirrored_goal_objective_for(Some("1"), &tools, &second),
+        None,
+        "re-mirroring here restarted the core goal loop and re-completed the \
+         same goal eight times in the live run (issue #52)"
+    );
+    let mut plain = bridge
+        .turn(&session_id, "plain warm turn", TurnInputChannel::LegacySend)
+        .expect("plain warm turn starts");
+    loop {
+        if let ResponseEvent::Completed { .. } = next_event(&mut plain.rx_event).await { break }
+    }
+
+    let stats = std::fs::read_to_string(stats_path(&fixture)).expect("stats file");
+    assert_eq!(
+        (
+            stats
+                .lines()
+                .filter(|line| line.starts_with("goal:") && line.contains("\"action\":\"set\""))
+                .count(),
+            stats
+                .lines()
+                .filter(|line| line.starts_with("goal:") && line.contains("\"action\":\"pause\""))
+                .count(),
+        ),
+        (1, 1),
+        "exactly one mirrored set followed by its completion pause, with no \
+         restart for the answered round: {stats}"
     );
     bridge.kill("test end");
 }

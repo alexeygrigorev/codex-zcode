@@ -14,7 +14,10 @@
 //!
 //! Opt in with `ZCODE_WARM_GOAL=1`. The marker protocol remains the
 //! spawn-per-turn mechanism, and any mirror setup failure falls back to a
-//! plain warm turn.
+//! plain warm turn. A verified completion pauses the core goal and the
+//! selector refuses to re-mirror a continuation template already answered by
+//! a synthesized completion, so the agent loop's follow-up rounds cannot
+//! restart the settled core goal loop (issue #52).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -41,6 +44,12 @@ use crate::zcode_warm_events::bridge_tool_activity_from_notification;
 /// Env var enabling goal mirroring for warm sessions (`ZCODE_WARM_GOAL=1`).
 const GOAL_MIRROR_ENV_VAR: &str = "ZCODE_WARM_GOAL";
 
+/// Call-id prefix of the synthesized `update_goal` calls the mirror emits on a
+/// verified completion. The agent loop's follow-up round carries the matching
+/// function output in its input, which is how the selector recognizes a
+/// continuation template that has already been answered.
+const MIRROR_CALL_ID_PREFIX: &str = "zcode_goal_";
+
 /// Upper bound on core turns one mirrored request may span. The core's
 /// verifier re-prompts on every non-passing iteration and has no "blocked"
 /// verdict, so an unachievable goal would loop forever; past this cap the
@@ -60,6 +69,12 @@ fn goal_mirror_enabled_from_value(value: Option<&str>) -> bool {
 
 /// Extracts the active objective from the goal continuation template the
 /// Codex goal runtime rendered into the newest user message.
+///
+/// The scan stops early at a synthesized mirror-completion output: such an
+/// output means this request is the agent loop's follow-up round for a goal
+/// turn whose completion was already reported, and re-mirroring there would
+/// restart the just-settled core goal loop (issue #52). Only a continuation
+/// template newer than the last mirror completion qualifies.
 fn goal_objective_from_prompt(input: &[ResponseItem]) -> Option<String> {
     let text = input.iter().rev().find_map(|item| match item {
         ResponseItem::Message { role, content, .. } if role.as_str() == "user" => Some(
@@ -72,6 +87,13 @@ fn goal_objective_from_prompt(input: &[ResponseItem]) -> Option<String> {
                 .collect::<Vec<_>>()
                 .join("\n"),
         ),
+        ResponseItem::FunctionCallOutput {
+            call_id: Some(call_id),
+            ..
+        } if call_id.starts_with(MIRROR_CALL_ID_PREFIX) => {
+            // The empty sentinel fails the `<objective>` search below.
+            Some(String::new())
+        }
         _ => None,
     })?;
     let start = text.find("<objective>")? + "<objective>".len();
@@ -82,7 +104,8 @@ fn goal_objective_from_prompt(input: &[ResponseItem]) -> Option<String> {
 
 /// The objective to mirror for this prompt, when the mirror applies: mirroring
 /// enabled, a goal active (`update_goal` in the tool list), and the
-/// continuation template's objective recovered from the prompt.
+/// continuation template's objective recovered from a user message newer than
+/// any synthesized mirror-completion output.
 pub(crate) fn mirrored_goal_objective(
     tools: &[ToolSpec],
     input: &[ResponseItem],
@@ -128,7 +151,8 @@ enum Settle {
 /// from its own server-side history), then collects session events until the
 /// goal settles. On a verified completion the stream carries the same
 /// synthesized `update_goal` function call the marker translation produces, so
-/// the normal registry path records the status change.
+/// the normal registry path records the status change, and the core goal is
+/// paused so it cannot be restarted by a later mirror.
 pub(crate) async fn turn_mirrored(
     bridge: &Arc<ZcodeWarmBridge>,
     session_id: &str,
@@ -362,12 +386,29 @@ pub(crate) async fn turn_mirrored(
                 namespace: None,
                 arguments: r#"{"status":"complete"}"#.to_string(),
                 encrypted_function_args: Some(Vec::new()),
-                call_id: format!("zcode_goal_{request_id}"),
+                call_id: format!("{MIRROR_CALL_ID_PREFIX}{request_id}"),
                 internal_chat_message_metadata_passthrough: None,
             };
             let _ = tx
                 .send(Ok(codex_api::ResponseEvent::OutputItemDone(item)))
                 .await;
+            // The core keeps a settled goal registered, and its `session/goal
+            // set` restarts the loop from any prior status; pause so a later
+            // mirror cannot hand the verifier the same objective again
+            // (issue #52).
+            if let Some(bridge) = collector_bridge.upgrade()
+                && let Err(error) = bridge
+                    .request_with_compat_retry(
+                        "session/goal",
+                        serde_json::json!({
+                            "sessionId": collector_session,
+                            "action": "pause",
+                        }),
+                    )
+                    .await
+            {
+                warn!("ZCode warm goal pause after completion failed: {error}");
+            }
         }
         let _ = tx
             .send(Ok(codex_api::ResponseEvent::Completed {
