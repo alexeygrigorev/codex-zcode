@@ -123,7 +123,9 @@ Supporting scripts:
 - `tests/zcodex-integration.test.mjs` — end-to-end suite (exec, tool loop,
   model control, native subagent spawn);
   `node --test tests/zcodex-integration.test.mjs` from the repo
-  root on a machine with credentials
+  root on a machine with credentials. The model-control test prepares its
+  isolated ZCode HOME under `/tmp` automatically from `~/.zcode/cli/config.json`
+  and rebuilds it whenever the model slug goes stale.
 
 ## Environment
 

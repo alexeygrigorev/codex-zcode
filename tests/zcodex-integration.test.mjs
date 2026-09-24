@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { readFile, readdir } from "node:fs/promises";
+import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { accessSync, constants } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -103,19 +103,53 @@ function isolatedZcodeHomeCandidates() {
   ];
 }
 
-async function findIsolatedZcodeHome() {
+function modelSlugFromZcodexConfig(config) {
+  return config.match(/^\s*model\s*=\s*"([^"]+)"\s*$/m)?.[1];
+}
+
+async function preparedZcodeModel(candidate) {
+  try {
+    const config = JSON.parse(
+      await readFile(path.join(candidate, ".zcode/cli/config.json"), "utf8"),
+    );
+    return typeof config.model === "string" ? config.model : null;
+  } catch {
+    return null;
+  }
+}
+
+async function buildIsolatedZcodeHome(target, model) {
+  // The isolated HOME keeps the direct zcode.cjs spawn away from ~/.zcode.
+  // Copy the real CLI config and retarget the model to the zcodex slug.
+  const sourcePath = path.join(os.homedir(), ".zcode/cli/config.json");
+  let source;
+  try {
+    source = JSON.parse(await readFile(sourcePath, "utf8"));
+  } catch (error) {
+    throw new Error(
+      `Cannot prepare the isolated ZCode HOME from ${sourcePath}: ${error.message}`,
+    );
+  }
+  source.model = `zai/${model}`;
+  await mkdir(path.join(target, ".zcode/cli"), { recursive: true, mode: 0o700 });
+  await writeFile(
+    path.join(target, ".zcode/cli/config.json"),
+    JSON.stringify(source, null, 2),
+  );
+  return target;
+}
+
+async function findIsolatedZcodeHome(model) {
+  const expected = `zai/${model}`;
   const candidates = isolatedZcodeHomeCandidates();
   for (const candidate of candidates) {
-    try {
-      const configPath = path.join(candidate, ".zcode/cli/config.json");
-      accessSync(configPath, constants.F_OK);
+    if ((await preparedZcodeModel(candidate)) === expected) {
       return candidate;
-    } catch {
-      // try the next candidate
     }
   }
-  throw new Error(`No prepared zcodex ZCode HOME found; tried:
-${candidates.join("\n")}`);
+  // Missing or stale fixture: build the first candidate fresh from the real
+  // ZCode CLI config so the suite never runs against an outdated model slug.
+  return buildIsolatedZcodeHome(candidates[0], model);
 }
 
 async function latestRolloutItems(cwd) {
@@ -336,10 +370,10 @@ test("tool loop", async () => {
 // Expected runtime: usually a few seconds; capped at 120 seconds for 429 retry backoff.
 test("model control", async () => {
   const config = await readFile(zcodexConfigPath, "utf8");
-  const model = config.match(/^\s*model\s*=\s*"([^"]+)"\s*$/m)?.[1];
+  const model = modelSlugFromZcodexConfig(config);
   assert.ok(model, `Could not find the model slug in:\n${config}`);
 
-  const preparedHome = await findIsolatedZcodeHome();
+  const preparedHome = await findIsolatedZcodeHome(model);
   const preparedConfig = path.join(preparedHome, ".zcode/cli/config.json");
   accessSync(preparedConfig, constants.F_OK);
   const prepared = JSON.parse(await readFile(preparedConfig, "utf8"));
@@ -368,7 +402,7 @@ test("model control", async () => {
     ],
     {
       timeoutMs: 120_000,
-      env: { ...process.env, HOME: await findIsolatedZcodeHome() },
+      env: { ...process.env, HOME: preparedHome },
     },
   );
   assertExitZero("direct ZCode model-control stream", result);
