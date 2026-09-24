@@ -62,6 +62,7 @@ use crate::unified_exec::async_watcher::start_streaming_output;
 use crate::unified_exec::clamp_yield_time;
 use crate::unified_exec::generate_chunk_id;
 use crate::unified_exec::head_tail_buffer::HeadTailBuffer;
+use crate::unified_exec::process::OutputBuffers;
 use crate::unified_exec::process::OutputHandles;
 use crate::unified_exec::process::SpawnLifecycleHandle;
 use crate::unified_exec::process::UnifiedExecProcess;
@@ -398,7 +399,7 @@ async fn emit_failed_initial_exec_end_if_unstored(
     request: &ExecCommandRequest,
     cwd: PathUri,
     plugin_attribution: Option<PluginCommandAttribution>,
-    transcript: Arc<tokio::sync::Mutex<HeadTailBuffer>>,
+    output_buffer: Arc<tokio::sync::Mutex<OutputBuffers>>,
     fallback_output: String,
     message: String,
     wall_time: Duration,
@@ -416,7 +417,7 @@ async fn emit_failed_initial_exec_end_if_unstored(
         cwd,
         Some(request.process_id.to_string()),
         plugin_attribution,
-        transcript,
+        output_buffer,
         fallback_output,
         message,
         wall_time,
@@ -555,7 +556,7 @@ impl UnifiedExecProcessManager {
             )
         });
 
-        let transcript = process.transcript();
+        let output_buffer = Arc::clone(&process.output_handles().output_buffer);
         let model_context = context.step_context.model_context();
         let mut event_ctx = ToolEventCtx::new(
             context.session.as_ref(),
@@ -615,7 +616,7 @@ impl UnifiedExecProcessManager {
                 deferred_network_approval.clone(),
                 network_denial_monitor,
                 metrics_sidecar,
-                Arc::clone(&transcript),
+                Arc::clone(&output_buffer),
                 Arc::clone(&initial_exec_command_active),
             )
             .await;
@@ -681,7 +682,7 @@ impl UnifiedExecProcessManager {
                 &request,
                 cwd.clone(),
                 plugin_attribution.clone(),
-                Arc::clone(&transcript),
+                Arc::clone(&output_buffer),
                 text.clone(),
                 message.clone(),
                 wall_time,
@@ -702,7 +703,7 @@ impl UnifiedExecProcessManager {
                 &request,
                 cwd.clone(),
                 plugin_attribution.clone(),
-                Arc::clone(&transcript),
+                Arc::clone(&output_buffer),
                 text.clone(),
                 message.clone(),
                 wall_time,
@@ -780,7 +781,7 @@ impl UnifiedExecProcessManager {
                     &request,
                     cwd.clone(),
                     plugin_attribution.clone(),
-                    Arc::clone(&transcript),
+                    Arc::clone(&output_buffer),
                     text.clone(),
                     message.clone(),
                     wall_time,
@@ -803,7 +804,7 @@ impl UnifiedExecProcessManager {
                 cwd.clone(),
                 Some(process_id.to_string()),
                 plugin_attribution.clone(),
-                Arc::clone(&transcript),
+                Arc::clone(&output_buffer),
                 text.clone(),
                 exit,
                 wall_time,
@@ -1204,7 +1205,7 @@ impl UnifiedExecProcessManager {
         network_approval: Option<DeferredNetworkApproval>,
         network_denial_monitor: Option<tokio::task::JoinHandle<()>>,
         metrics_sidecar: Option<PluginMetricsSidecar>,
-        transcript: Arc<tokio::sync::Mutex<HeadTailBuffer>>,
+        output_buffer: Arc<tokio::sync::Mutex<OutputBuffers>>,
         initial_exec_command_active: Arc<AtomicBool>,
     ) {
         let plugin_metrics_sidecar =
@@ -1244,7 +1245,7 @@ impl UnifiedExecProcessManager {
             cwd,
             process_id,
             plugin_attribution,
-            transcript,
+            output_buffer,
             started_at,
             network_denial_monitor,
             plugin_metrics_sidecar,
@@ -1608,7 +1609,7 @@ impl UnifiedExecProcessManager {
             let mut wait_for_output = None;
             {
                 let mut guard = output_buffer.lock().await;
-                drained_output = std::mem::take(&mut *guard);
+                drained_output = std::mem::take(&mut guard.pending);
                 has_drained_output =
                     drained_output.retained_bytes() > 0 || drained_output.omitted_bytes() > 0;
                 if !has_drained_output {
