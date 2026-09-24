@@ -85,17 +85,23 @@ jobs:
       - name: Add project documentation
         run: cp ABOUT.md release/ABOUT.md
 
-      - uses: actions/download-artifact@v4
+      - name: Download linux-amd64 binary
+        uses: actions/download-artifact@v4
         with:
-          path: artifacts
+          name: zcodex-linux-amd64
+          path: release
+
+      - name: Download linux-arm64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: zcodex-linux-arm64
+          path: release
 
       - name: Prepare release assets
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p release
-          find artifacts -type f -print
-          find artifacts -type f -exec cp {} release/ \;
+          ls -lh release
           version="${GITHUB_REF_NAME#zcode-}"
           printf '%s\n' "$version" > release/VERSION
           sha256sum release/* > release/SHA256SUMS
