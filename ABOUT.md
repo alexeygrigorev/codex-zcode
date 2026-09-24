@@ -38,29 +38,28 @@ with this project.
 
 ## Download Release
 
-Download the matching binary from the latest GitHub Release, for example:
+Easiest: run `scripts/install-zcodex.sh`, which picks the right architecture
+and installs to `~/.local/bin/zcodex`.
 
-https://github.com/alexeygrigorev/codex-zcode/releases/tag/zcode-3.11.2-codex-0.153.4
-
-Linux AMD64 example (replace the tag with the release you want):
-
-```bash
-curl -fL \
-  https://github.com/alexeygrigorev/codex-zcode/releases/download/zcode-3.11.2-codex-0.153.4/zcodex-linux-amd64 \
-  -o ~/.local/bin/zcodex
-chmod +x ~/.local/bin/zcodex
-```
-
-Linux ARM64:
+Release binaries are fully stripped and shipped zstd-compressed as
+`zcodex-linux-<arch>.tar.zst` (a few dozen MB each instead of hundreds).
+Manual download, Linux AMD64 example (replace the tag with the release you
+want):
 
 ```bash
 curl -fL \
-  https://github.com/alexeygrigorev/codex-zcode/releases/download/zcode-3.11.2-codex-0.153.4/zcodex-linux-arm64 \
-  -o ~/.local/bin/zcodex
+  https://github.com/alexeygrigorev/codex-zcode/releases/download/zcode-3.11.2-codex-0.153.4/zcodex-linux-amd64.tar.zst \
+  -o zcodex.tar.zst
+tar --zstd -xf zcodex.tar.zst
+mv zcodex-linux-amd64 ~/.local/bin/zcodex
 chmod +x ~/.local/bin/zcodex
 ```
 
-Verify the downloaded file against `SHA256SUMS` from the same release.
+Linux ARM64: same, using `zcodex-linux-arm64.tar.zst` and
+`mv zcodex-linux-arm64 ~/.local/bin/zcodex`.
+
+Verify the downloaded `.tar.zst` against `SHA256SUMS` from the same release.
+Requires `tar` with zstd support (the `zstd` package).
 
 ## Quick Build
 
@@ -91,6 +90,11 @@ git push origin zcode-3.11.2-codex-0.153.4
 The workflow checks the Zcode extension, builds Linux AMD64 and ARM64 release
 binaries, verifies them, and publishes a GitHub Release with `SHA256SUMS`.
 Typical CI wall time is 40-45 minutes.
+
+The release profile keeps full DWARF and symbols in the binary, so the
+workflow archives a `*.debug` sidecar as a workflow-only artifact (for
+symbolicating crashes from a given release) and publishes fully stripped,
+zstd-compressed `.tar.zst` assets.
 
 ## Self-Contained Bundle
 
@@ -253,6 +257,8 @@ for example `zcode-3.11.2-codex-0.153.4`:
 The `VERSION` file in each GitHub Release holds `<ZCODE>-codex-<CODEX>`
 (the tag minus the leading `zcode-`). The workflow
 (`.github/workflows/zcode-release.yml`) triggers on `zcode-*-codex-*`.
+Re-releasing the same version pair (e.g. for packaging fixes) appends a
+revision suffix, as in `zcode-3.14.0-codex-0.155.1-r2`.
 
 `Cargo.toml` workspace version intentionally stays `0.0.0`: that marks
 every build as a source build, which keeps the upstream self-update

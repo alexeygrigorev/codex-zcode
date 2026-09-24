@@ -58,24 +58,29 @@ jobs:
       - name: Verify binary
         run: ./target/${{ matrix.target }}/release/zcodex --version
 
-      # The release profile keeps full DWARF in the binary (~75% of its size).
-      # Archive the debug info as a sidecar artifact for symbolication, then
-      # ship the stripped binary.
-      - name: Split debug symbols and strip binary
+      # The release profile keeps full DWARF plus the symbol table in the
+      # binary (~85% of its size). Archive both into a sidecar artifact for
+      # symbolication, then ship a fully stripped binary zstd-compressed
+      # (extract with `tar --zstd -xf`).
+      - name: Split debug symbols, strip, and compress binary
         shell: bash
         run: |
           set -euo pipefail
           bin="./target/${{ matrix.target }}/release/zcodex"
           objcopy --only-keep-debug "$bin" "../${{ matrix.asset_name }}.debug"
-          strip --strip-debug "$bin"
+          strip --strip-all "$bin"
           cp "$bin" "../${{ matrix.asset_name }}"
           "../${{ matrix.asset_name }}" --version
+          tar --use-compress-program='zstd -19 -T0' \
+            -cf "../${{ matrix.asset_name }}.tar.zst" \
+            -C .. "${{ matrix.asset_name }}"
+          ls -lh "../${{ matrix.asset_name }}".debug "../${{ matrix.asset_name }}".tar.zst
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.asset_name }}
-          path: ${{ matrix.asset_name }}
+          name: ${{ matrix.asset_name }}-tar-zst
+          path: ${{ matrix.asset_name }}.tar.zst
           if-no-files-found: error
 
       - name: Upload debug symbols artifact
@@ -104,13 +109,13 @@ jobs:
       - name: Download linux-amd64 binary
         uses: actions/download-artifact@v4
         with:
-          name: zcodex-linux-amd64
+          name: zcodex-linux-amd64-tar-zst
           path: release
 
       - name: Download linux-arm64 binary
         uses: actions/download-artifact@v4
         with:
-          name: zcodex-linux-arm64
+          name: zcodex-linux-arm64-tar-zst
           path: release
 
       - name: Prepare release assets
@@ -128,8 +133,8 @@ jobs:
           name: Codex ZCode ${{ github.ref_name }}
           generate_release_notes: true
           files: |
-            release/zcodex-linux-amd64
-            release/zcodex-linux-arm64
+            release/zcodex-linux-amd64.tar.zst
+            release/zcodex-linux-arm64.tar.zst
             release/ABOUT.md
             release/VERSION
             release/SHA256SUMS
