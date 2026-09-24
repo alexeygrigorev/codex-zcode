@@ -58,15 +58,31 @@ jobs:
       - name: Verify binary
         run: ./target/${{ matrix.target }}/release/zcodex --version
 
-      - name: Stage binary
+      # The release profile keeps full DWARF in the binary (~75% of its size).
+      # Archive the debug info as a sidecar artifact for symbolication, then
+      # ship the stripped binary.
+      - name: Split debug symbols and strip binary
         shell: bash
-        run: cp "./target/${{ matrix.target }}/release/zcodex" "../${{ matrix.asset_name }}"
+        run: |
+          set -euo pipefail
+          bin="./target/${{ matrix.target }}/release/zcodex"
+          objcopy --only-keep-debug "$bin" "../${{ matrix.asset_name }}.debug"
+          strip --strip-debug "$bin"
+          cp "$bin" "../${{ matrix.asset_name }}"
+          "../${{ matrix.asset_name }}" --version
 
-      - name: Upload artifact
+      - name: Upload binary artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset_name }}
           path: ${{ matrix.asset_name }}
+          if-no-files-found: error
+
+      - name: Upload debug symbols artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}-symbols
+          path: ${{ matrix.asset_name }}.debug
           if-no-files-found: error
 
   release:
