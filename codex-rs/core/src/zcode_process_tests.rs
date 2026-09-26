@@ -13,11 +13,17 @@ use tokio::process::Command;
 
 use super::DEFAULT_ZCODE_STREAM_IDLE_TIMEOUT;
 use super::ZcodeStreamLine;
-use super::acquire_workspace_session;
 use super::dispose_and_wait_once;
 use super::next_stream_line;
 use super::side_request_reply;
 use super::zcode_idle_timeout_from_value;
+use codex_file_system::acquire_zcode_session_in;
+
+/// A private lock directory so gate tests never touch the real Codex home
+/// (or the locks of sessions running on this machine).
+fn lock_dir() -> tempfile::TempDir {
+    tempfile::tempdir().expect("temp lock dir")
+}
 
 #[test]
 fn title_request_is_answered_without_a_session() {
@@ -36,14 +42,19 @@ fn ordinary_turn_still_opens_a_session() {
 
 #[tokio::test]
 async fn workspace_session_is_exclusive_for_one_directory() {
+    let dir = lock_dir();
+    let dir_path = dir.path().to_path_buf();
     let in_flight = Arc::new(AtomicUsize::new(0));
     let overlapped = Arc::new(AtomicBool::new(false));
     let mut tasks = Vec::new();
     for _ in 0..2 {
+        let dir = dir_path.clone();
         let in_flight = Arc::clone(&in_flight);
         let overlapped = Arc::clone(&overlapped);
         tasks.push(tokio::spawn(async move {
-            let _permit = acquire_workspace_session("/tmp/zcode-one-checkout").await;
+            let _permit = acquire_zcode_session_in(dir, "/tmp/zcode-one-checkout", "test-session")
+                .await
+                .expect("session permit");
             if in_flight.fetch_add(1, Ordering::SeqCst) != 0 {
                 overlapped.store(true, Ordering::SeqCst);
             }
@@ -59,14 +70,19 @@ async fn workspace_session_is_exclusive_for_one_directory() {
 
 #[tokio::test]
 async fn trailing_slash_does_not_start_a_second_session() {
+    let dir = lock_dir();
+    let dir_path = dir.path().to_path_buf();
     let in_flight = Arc::new(AtomicUsize::new(0));
     let overlapped = Arc::new(AtomicBool::new(false));
     let mut tasks = Vec::new();
     for cwd in ["/tmp/zcode-same-checkout", "/tmp/zcode-same-checkout/"] {
+        let dir = dir_path.clone();
         let in_flight = Arc::clone(&in_flight);
         let overlapped = Arc::clone(&overlapped);
         tasks.push(tokio::spawn(async move {
-            let _permit = acquire_workspace_session(cwd).await;
+            let _permit = acquire_zcode_session_in(dir, cwd, "test-session")
+                .await
+                .expect("session permit");
             if in_flight.fetch_add(1, Ordering::SeqCst) != 0 {
                 overlapped.store(true, Ordering::SeqCst);
             }
@@ -82,12 +98,17 @@ async fn trailing_slash_does_not_start_a_second_session() {
 
 #[tokio::test]
 async fn workspace_sessions_in_different_directories_overlap() {
+    let dir = lock_dir();
+    let dir_path = dir.path().to_path_buf();
     let barrier = Arc::new(tokio::sync::Barrier::new(2));
     let mut tasks = Vec::new();
     for cwd in ["/tmp/zcode-checkout-a", "/tmp/zcode-checkout-b"] {
+        let dir = dir_path.clone();
         let barrier = Arc::clone(&barrier);
         tasks.push(tokio::spawn(async move {
-            let _permit = acquire_workspace_session(cwd).await;
+            let _permit = acquire_zcode_session_in(dir, cwd, "test-session")
+                .await
+                .expect("session permit");
             barrier.wait().await;
         }));
     }
@@ -101,6 +122,58 @@ async fn workspace_sessions_in_different_directories_overlap() {
     })
     .await
     .expect("different directories must not block each other");
+}
+
+/// A separate lock holder — what another zcodex process would be — must
+/// block acquisition until it drops the checkout.
+#[tokio::test]
+async fn held_checkout_blocks_acquisition_until_released() {
+    let dir = lock_dir();
+    let dir_path = dir.path().to_path_buf();
+    let first =
+        acquire_zcode_session_in(dir_path.clone(), "/tmp/zcode-held-checkout", "test-session")
+            .await
+            .expect("first permit");
+    let mut second = tokio::spawn(async move {
+        acquire_zcode_session_in(dir_path, "/tmp/zcode-held-checkout", "test-session")
+            .await
+            .expect("second permit")
+    });
+    tokio::time::timeout(Duration::from_millis(500), &mut second)
+        .await
+        .expect_err("second acquire must wait while the checkout is held");
+    drop(first);
+    let _ = tokio::time::timeout(Duration::from_secs(5), second)
+        .await
+        .expect("second acquire completes after release")
+        .expect("second permit");
+}
+
+/// The same checkout reached through a symlink is one checkout, not two.
+#[cfg(unix)]
+#[tokio::test]
+async fn symlinked_checkout_shares_the_lock() {
+    let dir = lock_dir();
+    let dir_path = dir.path().to_path_buf();
+    let base = tempfile::tempdir().expect("temp checkout base");
+    let real = base.path().join("checkout");
+    std::fs::create_dir(&real).expect("create checkout dir");
+    let link = base.path().join("checkout-link");
+    std::os::unix::fs::symlink(&real, &link).expect("symlink checkout");
+
+    let _first =
+        acquire_zcode_session_in(dir_path.clone(), &real.to_string_lossy(), "test-session")
+            .await
+            .expect("first permit");
+    let link_path = link.to_string_lossy().to_string();
+    let second = tokio::spawn(async move {
+        acquire_zcode_session_in(dir_path, &link_path, "test-session")
+            .await
+            .expect("second permit")
+    });
+    tokio::time::timeout(Duration::from_millis(500), second)
+        .await
+        .expect_err("symlinked spelling must share the checkout lock");
 }
 
 fn test_command() -> Command {

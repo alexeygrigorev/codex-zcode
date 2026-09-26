@@ -2235,6 +2235,16 @@ if (prompt.includes("ZCODEFAKE=segments")) {
 } else if (prompt.includes("ZCODEFAKE=hard-fail")) {
   require("fs").writeSync(2, "Error: something else broke\n");
   process.exit(3);
+} else if (prompt.includes("ZCODEFAKE=overlap:")) {
+  const logPath = prompt.split("ZCODEFAKE=overlap:")[1].split("\n")[0].trim();
+  const fs = require("fs");
+  fs.appendFileSync(logPath, "enter\n");
+  const start = Date.now();
+  while (Date.now() - start < 300) {}
+  fs.appendFileSync(logPath, "exit\n");
+  emit({ type: "session.updated", sessionId: "sess-fake" });
+  emit({ type: "model.streaming", payload: { kind: "text_delta", delta: "serialized" } });
+  emit({ type: "result", response: "serialized" });
 } else {
   emit({ type: "model.streaming", payload: { kind: "text_delta", delta: "spawned unexpectedly" } });
   emit({ type: "result", response: "spawned unexpectedly" });
@@ -2351,6 +2361,7 @@ async fn zcode_stream_completes_text_segments_around_tool_calls() {
             cjs: cjs_path.to_string_lossy().into_owned(),
         },
         &prompt,
+        "test-thread".to_string(),
     )
     .await
     .expect("stream_zcode should launch the fake runtime");
@@ -2429,6 +2440,7 @@ async fn zcode_stream_final_reply_keeps_streamed_text_over_result_line() {
             cjs: cjs_path.to_string_lossy().into_owned(),
         },
         &prompt,
+        "test-thread".to_string(),
     )
     .await
     .expect("stream_zcode should launch the fake runtime");
@@ -2464,6 +2476,7 @@ async fn zcode_goal_marker_reply_emits_message_then_synthesized_call() {
             cjs: cjs_path.to_string_lossy().into_owned(),
         },
         &prompt,
+        "test-thread".to_string(),
     )
     .await
     .expect("stream_zcode should launch the fake runtime");
@@ -2529,6 +2542,7 @@ async fn zcode_goal_bookkeeping_continuation_skips_the_runtime() {
             cjs: cjs_path.to_string_lossy().into_owned(),
         },
         &prompt,
+        "test-thread".to_string(),
     )
     .await
     .expect("stream_zcode should short-circuit without spawning");
@@ -2580,6 +2594,7 @@ async fn zcode_real_tool_continuation_still_invokes_the_runtime() {
             cjs: cjs_path.to_string_lossy().into_owned(),
         },
         &prompt,
+        "test-thread".to_string(),
     )
     .await
     .expect("stream_zcode should launch the fake runtime");
@@ -2627,6 +2642,7 @@ async fn zcode_stream_respawns_when_harness_database_is_locked() {
             cjs: cjs_path.to_string_lossy().into_owned(),
         },
         &prompt,
+        "test-thread".to_string(),
     )
     .await
     .expect("stream_zcode should launch the fake runtime");
@@ -2671,6 +2687,7 @@ async fn zcode_stream_reports_non_lock_startup_failure_without_retry() {
             cjs: cjs_path.to_string_lossy().into_owned(),
         },
         &prompt,
+        "test-thread".to_string(),
     )
     .await
     .expect("stream_zcode should launch the fake runtime");
@@ -2691,6 +2708,98 @@ async fn zcode_stream_reports_non_lock_startup_failure_without_retry() {
         }
         other => panic!("expected a stream error, got {other:?}"),
     }
+}
+
+/// Two concurrent model calls in one checkout must never overlap the
+/// children they spawn: the second spawn waits for the first child's
+/// teardown because the checkout's session permit is held across the
+/// child's whole lifetime.
+#[tokio::test]
+async fn zcode_stream_never_runs_two_children_in_one_checkout() {
+    if !node_available() {
+        // The fake-runtime tests spawn `node`; nothing to verify without it.
+        return;
+    }
+    let cjs_path = write_fake_zcode_runtime();
+    let overlap_log = std::env::temp_dir().join(format!(
+        "zcode-fake-overlap-{}-{}.log",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be after the epoch")
+            .as_nanos()
+    ));
+    let prompt = Prompt {
+        input: vec![zcode_user_message(&format!(
+            "ZCODEFAKE=overlap:{}",
+            overlap_log.display()
+        ))],
+        ..Default::default()
+    };
+    let (first, second) = tokio::join!(
+        super::ModelClientSession::stream_zcode(
+            super::ZcodeRuntime {
+                node: "node".to_string(),
+                cjs: cjs_path.to_string_lossy().into_owned(),
+            },
+            &prompt,
+            "test-thread".to_string(),
+        ),
+        super::ModelClientSession::stream_zcode(
+            super::ZcodeRuntime {
+                node: "node".to_string(),
+                cjs: cjs_path.to_string_lossy().into_owned(),
+            },
+            &prompt,
+            "test-thread".to_string(),
+        ),
+    );
+    let (mut first, mut second) = (
+        first.expect("first stream should launch"),
+        second.expect("second stream should launch"),
+    );
+    let (first_events, second_events) = tokio::join!(
+        async {
+            let mut events = Vec::new();
+            while let Some(event) = first.rx_event.recv().await {
+                events.push(event.expect("first child should not fail"));
+            }
+            events
+        },
+        async {
+            let mut events = Vec::new();
+            while let Some(event) = second.rx_event.recv().await {
+                events.push(event.expect("second child should not fail"));
+            }
+            events
+        }
+    );
+    let _ = std::fs::remove_file(&cjs_path);
+
+    assert!(
+        matches!(first_events.last(), Some(ResponseEvent::Completed { .. })),
+        "first child did not complete: {first_events:?}"
+    );
+    assert!(
+        matches!(second_events.last(), Some(ResponseEvent::Completed { .. })),
+        "second child did not complete: {second_events:?}"
+    );
+
+    // The fake appends `enter` when it starts editing and `exit` when it
+    // stops; appends are atomic, so file order is time order. The two
+    // children's editing windows must never nest or interleave.
+    let log = std::fs::read_to_string(&overlap_log).expect("both children must have logged");
+    let _ = std::fs::remove_file(&overlap_log);
+    let mut depth: i32 = 0;
+    for line in log.lines() {
+        match line {
+            "enter" => depth += 1,
+            "exit" => depth -= 1,
+            other => panic!("unexpected log line {other:?} in {log:?}"),
+        }
+        assert!(depth == 0 || depth == 1, "children overlapped: {log:?}");
+    }
+    assert_eq!(depth, 0, "unbalanced enter/exit pairs: {log:?}");
 }
 
 #[test]
