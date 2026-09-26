@@ -188,6 +188,25 @@ impl<'call> ToolExecutor<ToolCall<'call>> for ZCodePromptTool {
             })?;
             let prompt_guard = ZcodePromptFileGuard { path: prompt_file };
             let prompt_file = &prompt_guard.path;
+            // Serialize invocations that share one ZCode session: a
+            // `--resume` child must not run as a second concurrent driver of
+            // that session (handoff restarts, retried calls). Held until the
+            // child is done. A prompt without a session id creates its own
+            // throwaway session, so there is nothing to exclude and no gate
+            // applies — different sessions in one checkout run in parallel
+            // by design.
+            let _resumed_session = match requested_session.as_deref() {
+                Some(session_id) => Some(
+                    codex_file_system::acquire_zcode_session(&cwd, session_id)
+                        .await
+                        .map_err(|error| {
+                            codex_extension_api::FunctionCallError::RespondToModel(format!(
+                                "could not reserve the ZCode session slot: {error}"
+                            ))
+                        })?,
+                ),
+                None => None,
+            };
             let mut command = Command::new(node);
             command
                 .arg("-e")
