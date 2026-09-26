@@ -3228,9 +3228,15 @@ dependencies = [
  "bytes",
  "codex-protocol",
  "codex-utils-absolute-path",
+ "codex-utils-home-dir",
  "codex-utils-path-uri",
  "futures",
+ "pretty_assertions",
  "serde",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

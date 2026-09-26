@@ -1,6 +1,7 @@
 mod environment_accessor;
 mod exec_permission_profile_serde;
 mod find_up;
+mod zcode_session_lock;
 
 use bytes::Bytes;
 use codex_protocol::config_types::WindowsSandboxLevel;
@@ -36,6 +37,9 @@ use std::path::Path;
 use std::pin::Pin;
 use std::task::Context;
 use std::task::Poll;
+pub use zcode_session_lock::ZcodeSessionPermit;
+pub use zcode_session_lock::acquire_zcode_session;
+pub use zcode_session_lock::acquire_zcode_session_in;
 
 /// Maximum chunk size returned by [`ExecutorFileSystem::read_file_stream`].
 pub const FILE_READ_CHUNK_SIZE: usize = 1024 * 1024;
