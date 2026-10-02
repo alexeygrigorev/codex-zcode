@@ -480,6 +480,134 @@ async fn turn_steer_rejects_context_only_input_without_merging_context() -> Resu
 }
 
 #[tokio::test]
+async fn turn_steer_text_reaches_next_model_request() -> Result<()> {
+    // Regression guard for follow-up messages doing nothing while a turn is
+    // running: an accepted steer must be injected into the input of the next
+    // sampling request, not just acknowledged and dropped.
+    skip_if_remote!(
+        Ok(()),
+        "uses a host-local command and cwd fixture unavailable to remote executors"
+    );
+
+    #[cfg(target_os = "windows")]
+    let shell_command = vec![
+        "powershell".to_string(),
+        "-Command".to_string(),
+        "Start-Sleep -Seconds 2".to_string(),
+    ];
+    #[cfg(not(target_os = "windows"))]
+    let shell_command = vec!["sleep".to_string(), "2".to_string()];
+
+    let tmp = TempDir::new()?;
+    let codex_home = tmp.path().join("codex_home");
+    std::fs::create_dir(&codex_home)?;
+    let working_directory = tmp.path().join("workdir");
+    std::fs::create_dir(&working_directory)?;
+
+    let server = create_mock_responses_server_sequence_unchecked(vec![
+        create_command_execution_sse_response(
+            shell_command,
+            Some(&working_directory),
+            Some(10_000),
+            "call_sleep",
+        )?,
+        create_final_assistant_message_sse_response("Done")?,
+    ])
+    .await;
+    write_mock_responses_config_toml_with_chatgpt_base_url(
+        &codex_home,
+        &server.uri(),
+        &server.uri(),
+    )?;
+    mount_analytics_capture(&server, &codex_home).await?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(&codex_home)
+        .without_managed_config()
+        .build_initialized()
+        .await?;
+
+    let ThreadStartResponse { thread, .. } = mcp
+        .start_thread(ThreadStartParams {
+            model: Some("mock-model".to_string()),
+            ..Default::default()
+        })
+        .await?;
+
+    let TurnStartResponse { turn } = mcp
+        .request(|request_id| ClientRequest::TurnStart {
+            request_id,
+            params: TurnStartParams {
+                thread_id: thread.id.clone(),
+                client_user_message_id: None,
+                input: vec![V2UserInput::Text {
+                    text: "run sleep".to_string(),
+                    text_elements: Vec::new(),
+                }],
+                cwd: Some(working_directory.clone()),
+                ..Default::default()
+            },
+        })
+        .await?;
+
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/started"),
+    )
+    .await??;
+
+    let steer_text = "skip the sleep and summarize";
+    let steer: TurnSteerResponse = mcp
+        .request(|request_id| ClientRequest::TurnSteer {
+            request_id,
+            params: TurnSteerParams {
+                thread_id: thread.id.clone(),
+                client_user_message_id: Some("client-steer-message-2".to_string()),
+                input: vec![V2UserInput::Text {
+                    text: steer_text.to_string(),
+                    text_elements: Vec::new(),
+                }],
+                responsesapi_client_metadata: None,
+                additional_context: None,
+                expected_turn_id: turn.id.clone(),
+            },
+        })
+        .await?;
+    assert_eq!(steer.turn_id, turn.id);
+
+    // The steer drains at the next tool-call boundary: the follow-up sampling
+    // request must carry the steered user message.
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+
+    let requests = server
+        .received_requests()
+        .await
+        .context("failed to fetch received requests")?;
+    let response_requests = requests
+        .iter()
+        .filter(|request| request.url.path().ends_with("/responses"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        response_requests.len(),
+        2,
+        "expected the steered turn to issue a second sampling request"
+    );
+    let body = response_requests[1]
+        .body_json::<Value>()
+        .context("request body should be JSON")?;
+    assert!(
+        body.to_string().contains(steer_text),
+        "steered follow-up text must appear in the next model request input"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn turn_steer_and_interrupt_work_on_resumed_thread() -> Result<()> {
     // The reported incident happened on a *resumed* thread, which carries two
     // identities: the new thread id and the original session id. Steers and

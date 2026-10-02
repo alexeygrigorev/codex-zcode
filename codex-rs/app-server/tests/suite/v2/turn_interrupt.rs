@@ -22,6 +22,8 @@ use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::TurnStartedNotification;
 use codex_app_server_protocol::TurnStatus;
+use codex_app_server_protocol::TurnSteerParams;
+use codex_app_server_protocol::TurnSteerResponse;
 use codex_app_server_protocol::UserInput as V2UserInput;
 use core_test_support::skip_if_remote;
 use pretty_assertions::assert_eq;
@@ -323,6 +325,151 @@ async fn turn_interrupt_resolves_pending_command_approval_request() -> Result<()
     .await??;
     assert_eq!(completed.thread_id, thread.id);
     assert_eq!(completed.turn.status, TurnStatus::Interrupted);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn turn_interrupt_with_pending_steer_aborts_and_thread_stays_usable() -> Result<()> {
+    // Regression guard for the reported "follow-up + Esc does nothing" incident:
+    // a steer accepted while a tool call is in flight must never delay the
+    // interrupt, and the thread must stay usable afterwards.
+    skip_if_remote!(
+        Ok(()),
+        "uses a host-local command and cwd fixture unavailable to remote executors"
+    );
+
+    #[cfg(target_os = "windows")]
+    let shell_command = vec![
+        "powershell".to_string(),
+        "-Command".to_string(),
+        "Start-Sleep -Seconds 30".to_string(),
+    ];
+    #[cfg(not(target_os = "windows"))]
+    let shell_command = vec!["sleep".to_string(), "30".to_string()];
+
+    let tmp = TempDir::new()?;
+    let codex_home = tmp.path().join("codex_home");
+    std::fs::create_dir(&codex_home)?;
+    let working_directory = tmp.path().join("workdir");
+    std::fs::create_dir(&working_directory)?;
+
+    let server = create_mock_responses_server_sequence_unchecked(vec![
+        create_command_execution_sse_response(
+            shell_command.clone(),
+            Some(&working_directory),
+            Some(30_000),
+            "call_sleep",
+        )?,
+        create_final_assistant_message_sse_response("recovered")?,
+    ])
+    .await;
+    MockResponsesConfig::new(&server.uri())
+        .with_sandbox_mode("workspace-write")
+        .with_root_config(r#"approvals_reviewer = "user""#)
+        .write(&codex_home)?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(&codex_home)
+        .build_initialized()
+        .await?;
+
+    let ThreadStartResponse { thread, .. } = mcp
+        .start_thread(ThreadStartParams {
+            model: Some("mock-model".to_string()),
+            ..Default::default()
+        })
+        .await?;
+
+    let TurnStartResponse { turn } = mcp
+        .request(|request_id| ClientRequest::TurnStart {
+            request_id,
+            params: TurnStartParams {
+                thread_id: thread.id.clone(),
+                client_user_message_id: None,
+                input: vec![V2UserInput::Text {
+                    text: "run the long check".to_string(),
+                    text_elements: Vec::new(),
+                }],
+                cwd: Some(working_directory.clone()),
+                ..Default::default()
+            },
+        })
+        .await?;
+    let turn_id = turn.id.clone();
+
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/started"),
+    )
+    .await??;
+
+    // Accept a steer while the long tool call is still in flight; it sits in
+    // the active turn's pending input, undrained.
+    let steer: TurnSteerResponse = mcp
+        .request(|request_id| ClientRequest::TurnSteer {
+            request_id,
+            params: TurnSteerParams {
+                thread_id: thread.id.clone(),
+                client_user_message_id: Some("client-steer-esc".to_string()),
+                input: vec![V2UserInput::Text {
+                    text: "actually stop and do this instead".to_string(),
+                    text_elements: Vec::new(),
+                }],
+                responsesapi_client_metadata: None,
+                additional_context: None,
+                expected_turn_id: turn_id.clone(),
+            },
+        })
+        .await?;
+    assert_eq!(steer.turn_id, turn_id);
+
+    // Esc "interrupt and send immediately": the interrupt must win even with
+    // the steer pending. The client resubmits the steer as a fresh turn after
+    // the abort, so core's contract here is a prompt abort plus a usable
+    // thread — not delivery of the pending steer.
+    let _: TurnInterruptResponse = mcp
+        .request(|request_id| ClientRequest::TurnInterrupt {
+            request_id,
+            params: TurnInterruptParams {
+                thread_id: thread.id.clone(),
+                turn_id: turn_id.clone(),
+            },
+        })
+        .await?;
+
+    let completed: TurnCompletedNotification = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_notification("turn/completed"),
+    )
+    .await??;
+    assert_eq!(completed.thread_id, thread.id);
+    assert_eq!(completed.turn.id, turn_id);
+    assert_eq!(completed.turn.status, TurnStatus::Interrupted);
+
+    // The thread must not be wedged: a fresh turn starts and completes.
+    let TurnStartResponse { turn: next_turn } = mcp
+        .request(|request_id| ClientRequest::TurnStart {
+            request_id,
+            params: TurnStartParams {
+                thread_id: thread.id.clone(),
+                client_user_message_id: None,
+                input: vec![V2UserInput::Text {
+                    text: "continue".to_string(),
+                    text_elements: Vec::new(),
+                }],
+                cwd: Some(working_directory),
+                ..Default::default()
+            },
+        })
+        .await?;
+    let next_completed: TurnCompletedNotification = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_notification("turn/completed"),
+    )
+    .await??;
+    assert_eq!(next_completed.turn.id, next_turn.id);
+    assert_eq!(next_completed.turn.status, TurnStatus::Completed);
 
     Ok(())
 }
