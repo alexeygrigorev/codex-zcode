@@ -1606,17 +1606,34 @@ impl TurnRequestProcessor {
             let thread_state = self.thread_state_manager.thread_state(thread_uuid).await;
             let is_running = matches!(thread.agent_status().await, AgentStatus::Running);
             {
+                // Thread state only learns a turn id when the listener
+                // processes Core's `TurnStarted`, and the agent-status watch
+                // lags the same way, so an interrupt that races a just-started
+                // turn (observed on warm-resumed threads, where replayed
+                // notifications widen the window) would be rejected as having
+                // nothing to interrupt. Core's active-turn state is the source
+                // of truth: reject only when core also has no such active
+                // turn. Locks stay short; no guard is held across the core
+                // query.
+                let tracked_turn_id = thread_state
+                    .lock()
+                    .await
+                    .active_turn_id()
+                    .map(str::to_string);
+                let turn_active_in_core = thread.active_turn_root(&turn_id).await.is_some();
                 let mut thread_state = thread_state.lock().await;
-                if let Some(active_turn_id) = thread_state.active_turn_id() {
+                if let Some(active_turn_id) = tracked_turn_id.as_deref() {
                     if active_turn_id != turn_id {
                         return Err(invalid_request(format!(
                             "expected active turn id {turn_id} but found {active_turn_id}"
                         )));
                     }
-                } else if thread_state.last_terminal_turn_id.as_deref() == Some(turn_id.as_str())
-                    || !is_running
-                {
-                    return Err(invalid_request("no active turn to interrupt"));
+                } else {
+                    let tracked_as_terminal =
+                        thread_state.last_terminal_turn_id.as_deref() == Some(turn_id.as_str());
+                    if !turn_active_in_core && (tracked_as_terminal || !is_running) {
+                        return Err(invalid_request("no active turn to interrupt"));
+                    }
                 }
                 thread_state.pending_interrupts.push(request_id.clone());
             }

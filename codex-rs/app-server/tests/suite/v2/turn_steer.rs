@@ -4,6 +4,7 @@ use anyhow::Context;
 use anyhow::Result;
 use app_test_support::TestAppServer;
 use app_test_support::create_command_execution_sse_response;
+use app_test_support::create_final_assistant_message_sse_response;
 use app_test_support::create_mock_responses_server_sequence;
 use app_test_support::create_mock_responses_server_sequence_unchecked;
 use app_test_support::write_mock_responses_config_toml_with_chatgpt_base_url;
@@ -17,8 +18,12 @@ use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCNotification;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ThreadItem;
+use codex_app_server_protocol::ThreadResumeParams;
+use codex_app_server_protocol::ThreadResumeResponse;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
+use codex_app_server_protocol::TurnInterruptParams;
+use codex_app_server_protocol::TurnInterruptResponse;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::TurnSteerParams;
@@ -470,6 +475,185 @@ async fn turn_steer_rejects_context_only_input_without_merging_context() -> Resu
             .to_string()
             .contains("<external_browser_info>tab one</external_browser_info>")
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn turn_steer_and_interrupt_work_on_resumed_thread() -> Result<()> {
+    // The reported incident happened on a *resumed* thread, which carries two
+    // identities: the new thread id and the original session id. Steers and
+    // interrupts must keep working across that identity split.
+    skip_if_remote!(
+        Ok(()),
+        "uses a host-local command and cwd fixture unavailable to remote executors"
+    );
+
+    #[cfg(target_os = "windows")]
+    let shell_command = vec![
+        "powershell".to_string(),
+        "-Command".to_string(),
+        "Start-Sleep -Seconds 30".to_string(),
+    ];
+    #[cfg(not(target_os = "windows"))]
+    let shell_command = vec!["sleep".to_string(), "30".to_string()];
+
+    let tmp = TempDir::new()?;
+    let codex_home = tmp.path().join("codex_home");
+    std::fs::create_dir(&codex_home)?;
+    let working_directory = tmp.path().join("workdir");
+    std::fs::create_dir(&working_directory)?;
+
+    let server = create_mock_responses_server_sequence_unchecked(vec![
+        create_final_assistant_message_sse_response("first answer")?,
+        create_command_execution_sse_response(
+            shell_command,
+            Some(&working_directory),
+            Some(30_000),
+            "call_sleep",
+        )?,
+        create_final_assistant_message_sse_response("recovered")?,
+    ])
+    .await;
+    write_mock_responses_config_toml_with_chatgpt_base_url(
+        &codex_home,
+        &server.uri(),
+        &server.uri(),
+    )?;
+    mount_analytics_capture(&server, &codex_home).await?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(&codex_home)
+        .without_managed_config()
+        .build_initialized()
+        .await?;
+
+    let ThreadStartResponse { thread, .. } = mcp
+        .start_thread(ThreadStartParams {
+            model: Some("mock-model".to_string()),
+            ..Default::default()
+        })
+        .await?;
+
+    // Complete one turn so the thread has a materialized rollout to resume.
+    let TurnStartResponse { .. } = mcp
+        .request(|request_id| ClientRequest::TurnStart {
+            request_id,
+            params: TurnStartParams {
+                thread_id: thread.id.clone(),
+                client_user_message_id: None,
+                input: vec![V2UserInput::Text {
+                    text: "say first".to_string(),
+                    text_elements: Vec::new(),
+                }],
+                cwd: Some(working_directory.clone()),
+                ..Default::default()
+            },
+        })
+        .await?;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+
+    let ThreadResumeResponse {
+        thread: resumed, ..
+    } = mcp
+        .request(|request_id| ClientRequest::ThreadResume {
+            request_id,
+            params: ThreadResumeParams {
+                thread_id: thread.id.clone(),
+                ..Default::default()
+            },
+        })
+        .await?;
+
+    // Start a long-running turn on the resumed handle.
+    let TurnStartResponse { turn } = mcp
+        .request(|request_id| ClientRequest::TurnStart {
+            request_id,
+            params: TurnStartParams {
+                thread_id: resumed.id.clone(),
+                client_user_message_id: None,
+                input: vec![V2UserInput::Text {
+                    text: "run the long check".to_string(),
+                    text_elements: Vec::new(),
+                }],
+                cwd: Some(working_directory.clone()),
+                ..Default::default()
+            },
+        })
+        .await?;
+    let turn_id = turn.id.clone();
+
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/started"),
+    )
+    .await??;
+
+    let steer: TurnSteerResponse = mcp
+        .request(|request_id| ClientRequest::TurnSteer {
+            request_id,
+            params: TurnSteerParams {
+                thread_id: resumed.id.clone(),
+                client_user_message_id: Some("client-steer-resumed".to_string()),
+                input: vec![V2UserInput::Text {
+                    text: "follow-up while running".to_string(),
+                    text_elements: Vec::new(),
+                }],
+                responsesapi_client_metadata: None,
+                additional_context: None,
+                expected_turn_id: turn_id.clone(),
+            },
+        })
+        .await?;
+    assert_eq!(steer.turn_id, turn_id);
+
+    // The interrupt-and-send path must abort promptly on the resumed thread.
+    let _: TurnInterruptResponse = mcp
+        .request(|request_id| ClientRequest::TurnInterrupt {
+            request_id,
+            params: TurnInterruptParams {
+                thread_id: resumed.id.clone(),
+                turn_id: turn_id.clone(),
+            },
+        })
+        .await?;
+
+    let completed: JSONRPCNotification = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+    assert_eq!(
+        completed.params.expect("turn/completed params")["turn"]["status"],
+        "interrupted"
+    );
+
+    // The resumed thread stays usable afterwards.
+    let TurnStartResponse { turn: next_turn } = mcp
+        .request(|request_id| ClientRequest::TurnStart {
+            request_id,
+            params: TurnStartParams {
+                thread_id: resumed.id.clone(),
+                client_user_message_id: None,
+                input: vec![V2UserInput::Text {
+                    text: "continue".to_string(),
+                    text_elements: Vec::new(),
+                }],
+                cwd: Some(working_directory),
+                ..Default::default()
+            },
+        })
+        .await?;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+    let _ = next_turn;
 
     Ok(())
 }
