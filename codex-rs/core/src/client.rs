@@ -230,6 +230,11 @@ fn reasoning_effort_for_request(
 
 const ZCODE_PROVIDER_ID: &str = "zai";
 
+/// Prefix for `call_id`s the Zcode wire synthesizes from the inner agent's
+/// streamed `toolCallId`s; used again to recognize those calls in follow-up
+/// request input and stay idempotent when the inner agent re-emits one.
+const ZCODE_TOOL_CALL_ID_PREFIX: &str = "zcode_tool_";
+
 struct PendingZcodeTool {
     zcode_name: String,
     name: String,
@@ -3361,6 +3366,37 @@ impl ModelClientSession {
             .input
             .iter()
             .any(|item| matches!(item, ResponseItem::FunctionCallOutput { .. }));
+        // Every mapped call in the follow-up input that already carries a
+        // recorded output was executed by the outer runtime in an earlier
+        // request. If the inner agent re-emits the same `toolCallId` (a
+        // retried identical call), the outer side must stay idempotent and
+        // not execute it a second time, so those ids are dropped here.
+        let answered_tool_ids: std::collections::HashSet<String> = {
+            let mapped_call_ids: std::collections::HashSet<&str> = prompt
+                .input
+                .iter()
+                .filter_map(|item| match item {
+                    ResponseItem::FunctionCall { call_id, .. }
+                        if call_id.starts_with(ZCODE_TOOL_CALL_ID_PREFIX) =>
+                    {
+                        Some(call_id.as_str())
+                    }
+                    _ => None,
+                })
+                .collect();
+            prompt
+                .input
+                .iter()
+                .filter_map(|item| match item {
+                    ResponseItem::FunctionCallOutput { call_id, .. } => call_id.as_deref(),
+                    ResponseItem::CustomToolCallOutput { call_id, .. } => Some(call_id.as_str()),
+                    _ => None,
+                })
+                .filter(|call_id| mapped_call_ids.contains(call_id))
+                .filter_map(|call_id| call_id.strip_prefix(ZCODE_TOOL_CALL_ID_PREFIX))
+                .map(str::to_string)
+                .collect()
+        };
         let user_text = if has_tool_results {
             format!(
                 "{user_text}\n\nContinuation: previous tool calls have already been executed. Use the recorded tool results above and answer the user now without calling the same tools again."
@@ -3755,8 +3791,11 @@ impl ModelClientSession {
                             .and_then(|p| p.get("toolName"))
                             .and_then(|v| v.as_str())
                             .unwrap_or_default();
-                        if !tool_call_id.is_empty() && !completed_tool_ids.contains(tool_call_id) {
-                            let call_id = format!("zcode_tool_{tool_call_id}");
+                        if !tool_call_id.is_empty()
+                            && !completed_tool_ids.contains(tool_call_id)
+                            && !answered_tool_ids.contains(tool_call_id)
+                        {
+                            let call_id = format!("{ZCODE_TOOL_CALL_ID_PREFIX}{tool_call_id}");
                             let mapped_name = normalize_zcode_tool_name(tool_name);
                             pending_tools.insert(
                                 tool_call_id.to_string(),
@@ -3836,9 +3875,13 @@ impl ModelClientSession {
                             .and_then(|p| p.get("toolCallId"))
                             .and_then(|v| v.as_str())
                             .unwrap_or_default();
-                        if tool_call_id.is_empty() || completed_tool_ids.contains(tool_call_id) {
-                            // Duplicate or malformed; authoritative input was
-                            // already emitted (or will be via fallback flush).
+                        if tool_call_id.is_empty()
+                            || completed_tool_ids.contains(tool_call_id)
+                            || answered_tool_ids.contains(tool_call_id)
+                        {
+                            // Duplicate, malformed, or already executed for
+                            // this thread; authoritative input was already
+                            // emitted (or will be via fallback flush).
                         } else if let Some(pending) = pending_tools.remove(tool_call_id) {
                             // Prefer authoritative `input` over accumulated
                             // deltas. Deltas are raw text fragments that can
@@ -3883,6 +3926,9 @@ impl ModelClientSession {
                             // Orphan `tool_call` without a prior
                             // `tool_input_start` (should not happen, but be
                             // robust): emit directly from authoritative input.
+                            if answered_tool_ids.contains(tool_call_id) {
+                                continue;
+                            }
                             let tool_name = payload
                                 .and_then(|p| p.get("toolName"))
                                 .and_then(|v| v.as_str())
@@ -3900,7 +3946,7 @@ impl ModelClientSession {
                                 namespace: None,
                                 arguments: authoritative,
                                 encrypted_function_args: Some(Vec::new()),
-                                call_id: format!("zcode_tool_{tool_call_id}"),
+                                call_id: format!("{ZCODE_TOOL_CALL_ID_PREFIX}{tool_call_id}"),
                                 internal_chat_message_metadata_passthrough: None,
                             };
                             if tx

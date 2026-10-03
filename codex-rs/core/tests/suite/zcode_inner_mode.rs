@@ -1,7 +1,7 @@
 #![allow(clippy::unwrap_used)]
 
-//! Regression test for the Zcode cold wire: a streamed tool call must have
-//! exactly one executor.
+//! Regression tests for the Zcode cold wire: a streamed tool call must have
+//! exactly one executor, and a re-emitted call_id must not run again.
 //!
 //! The client maps the inner ZCode agent's streamed `tool_call` events into
 //! Codex `function_call`s and executes them through the outer
@@ -11,8 +11,11 @@
 //! recorded. The spawn now uses `--mode build`, which denies inner execution
 //! while still streaming the call. The stub cjs here simulates the old
 //! behavior — under `--mode yolo` it appends an inner line to the probe file
-//! itself — so this test fails on the old argv (two lines) and passes only
-//! when the outer runtime is the single executor (one line).
+//! itself — so the first test fails on the old argv (two lines) and passes
+//! only when the outer runtime is the single executor (one line). The second
+//! test re-emits an already-executed `toolCallId` on the continuation request
+//! and asserts the outer runtime stays idempotent instead of executing the
+//! retried identical call again.
 
 use codex_model_provider_info::WireApi;
 use codex_protocol::protocol::SandboxPolicy;
@@ -60,13 +63,17 @@ impl Drop for EnvVarGuard {
 /// `session.updated` line, a `model.streaming` stream, and a final `result`.
 /// The first invocation streams one Bash `tool_call` whose command appends
 /// the outer line to the probe file; later invocations (the post-tool
-/// continuation request) only stream text so the turn ends. Under the old
-/// `--mode yolo` argv the stub also appends an inner line itself,
-/// reproducing the double execution this test guards against.
-fn write_stub_cjs(dir: &Path, probe: &Path) -> PathBuf {
+/// continuation request) only stream text so the turn ends — unless the
+/// behavior is [`StubBehavior::ReemitDuplicateCall`], where the first
+/// continuation re-emits the *same* `toolCallId` to simulate a retried
+/// identical call. Under the old `--mode yolo` argv the stub also appends an
+/// inner line itself, reproducing the double execution these tests guard
+/// against.
+fn write_stub_cjs(dir: &Path, probe: &Path, behavior: StubBehavior) -> PathBuf {
     let outer_command = format!("echo outer >> {}", probe.display());
     let outer_command_json = serde_json::to_string(&outer_command).unwrap();
     let probe_json = serde_json::to_string(&probe.display().to_string()).unwrap();
+    let reemit = matches!(behavior, StubBehavior::ReemitDuplicateCall);
     let cjs = dir.join("zcode-stub.cjs");
     let source = format!(
         r#"const fs = require("fs");
@@ -74,6 +81,7 @@ const argv = process.argv;
 const modeIndex = argv.indexOf("--mode");
 const mode = modeIndex >= 0 ? argv[modeIndex + 1] : "";
 const probe = {probe_json};
+const reemit = {reemit};
 const counter = `${{probe}}.invocations`;
 let seen = 0;
 try {{
@@ -89,8 +97,7 @@ if (mode === "yolo") {{
   fs.appendFileSync(probe, "inner\n");
 }}
 const emit = (value) => process.stdout.write(`${{JSON.stringify(value)}}\n`);
-emit({{ type: "session.updated", sessionId: "stub-session" }});
-if (seen === 0) {{
+const toolCall = () => {{
   emit({{
     type: "model.streaming",
     payload: {{ kind: "tool_input_start", toolCallId: "stub-tool-1", toolName: "Bash" }},
@@ -104,17 +111,28 @@ if (seen === 0) {{
       input: {{ command: {outer_command_json} }},
     }},
   }});
+}};
+emit({{ type: "session.updated", sessionId: "stub-session" }});
+if (seen === 0 || (reemit && seen === 1)) {{
+  toolCall();
 }} else {{
   emit({{
     type: "model.streaming",
     payload: {{ kind: "text_delta", delta: "done" }},
   }});
 }}
-emit({{ type: "result", response: seen === 0 ? "tool turn" : "done" }});
+emit({{ type: "result", response: seen === 0 || (reemit && seen === 1) ? "tool turn" : "done" }});
 "#
     );
     std::fs::write(&cjs, source).unwrap();
     cjs
+}
+
+/// What the stub's continuation invocations stream; see `write_stub_cjs`.
+#[derive(Clone, Copy)]
+enum StubBehavior {
+    SingleCall,
+    ReemitDuplicateCall,
 }
 
 fn node_available() -> bool {
@@ -124,16 +142,13 @@ fn node_available() -> bool {
         .is_ok_and(|output| output.status.success())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn zcode_cold_wire_executes_streamed_tool_call_once() {
-    if !node_available() {
-        eprintln!("node is not available; skipping the Zcode wire test");
-        return;
-    }
-
+/// Drives one turn through the cold wire against the stub cjs and returns
+/// how many lines the probe file ended up with (plus the spawn argv log for
+/// failure diagnostics).
+async fn drive_cold_wire(behavior: StubBehavior) -> (usize, String) {
     let work = TempDir::new().unwrap();
     let probe = work.path().join("probe.log");
-    let cjs = write_stub_cjs(work.path(), &probe);
+    let cjs = write_stub_cjs(work.path(), &probe, behavior);
     // `HOME` must not be the real one: the Zcode dispatch installs a model
     // override into `~/.zcode/cli/config.json` before spawning.
     let fake_home = TempDir::new().unwrap();
@@ -161,11 +176,39 @@ async fn zcode_cold_wire_executes_streamed_tool_call_once() {
         .count();
     let stub_argv_log =
         std::fs::read_to_string(probe.with_extension("log.invocations.argv")).unwrap_or_default();
+    (probe_lines, stub_argv_log)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zcode_cold_wire_executes_streamed_tool_call_once() {
+    if !node_available() {
+        eprintln!("node is not available; skipping the Zcode wire test");
+        return;
+    }
+
+    let (probe_lines, stub_argv_log) = drive_cold_wire(StubBehavior::SingleCall).await;
     assert_eq!(
         probe_lines, 1,
         "the streamed tool call must be executed exactly once by the outer \
          runtime; two lines mean the inner agent ran it too, zero lines mean \
          the outer execution never happened\n\
+         stub spawn argv log:\n{stub_argv_log}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zcode_cold_wire_ignores_retried_duplicate_call_id() {
+    if !node_available() {
+        eprintln!("node is not available; skipping the Zcode wire test");
+        return;
+    }
+
+    let (probe_lines, stub_argv_log) = drive_cold_wire(StubBehavior::ReemitDuplicateCall).await;
+    assert_eq!(
+        probe_lines, 1,
+        "the outer runtime must stay idempotent when the inner agent re-emits \
+         an already-executed call_id: the continuation's duplicate must be \
+         dropped, not executed a second time\n\
          stub spawn argv log:\n{stub_argv_log}"
     );
 }
