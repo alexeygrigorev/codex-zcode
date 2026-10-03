@@ -3368,8 +3368,8 @@ impl ModelClientSession {
         } else {
             user_text
         };
-        // A thread-title request would open a second yolo session in this
-        // checkout and the model would do the user's task. Answer it here.
+        // A thread-title request would open a second headless session in
+        // this checkout and the model would do the user's task. Answer it here.
         if let Some(reply) = zcode_process::side_request_reply(&user_text) {
             let reply_bytes = reply.len();
             let item = ResponseItem::Message {
@@ -3426,7 +3426,7 @@ impl ModelClientSession {
             // One headless ZCode child per ZCode session — machine-wide, not
             // just within this process. Compaction, the warm bridge, the
             // `zcode` tool, and any other zcodex process driving THIS
-            // session wait here instead of minting a second yolo process.
+            // session wait here instead of minting a second headless process.
             // Different sessions in the same checkout are independent by
             // design; running them in parallel is supported.
             let _workspace_session =
@@ -3484,11 +3484,22 @@ impl ModelClientSession {
                     .arg(ZCODE_PROMPT_LOADER)
                     .arg(&runtime.cjs)
                     .arg(prompt_file)
+                    // `build` instead of `yolo`: the tool_use blocks must
+                    // stream out for the outer ToolCallRuntime to execute
+                    // (and record) exactly once. Under yolo the headless
+                    // core executed the same calls inside its own agent
+                    // loop, duplicating every side effect with the inner
+                    // output unrecorded; under build it denies its own
+                    // headless execution immediately ("No permission
+                    // client configured") while still streaming the calls.
+                    // `plan` also denies but distorts the model's
+                    // tool-call emission (ExitPlanMode loops), so it is
+                    // not an option here.
                     .args([
                         "--output-format",
                         "stream-json",
                         "--mode",
-                        "yolo",
+                        "build",
                         "--cwd",
                         &cwd,
                     ])
