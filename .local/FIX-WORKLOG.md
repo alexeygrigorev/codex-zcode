@@ -186,5 +186,53 @@ nextest `suite::zcode_inner_mode`, via build guard:
   same pid DIAGNOSIS.md's ancestry probe showed; idle since 04:49). Left
   untouched; not the source of these counts.
 
+### Raw counts (nonce lines; expected 1 per command)
+
+This session was killed by its 60 m wall before the full 5×3 rerun finished;
+counts below are everything it banked (batch continued in background until
+session end; live log `/tmp/zc-dup2-repro/dup2-matrix.log`, transcripts
+`dup2-run-*.out` and probe files alongside). The complete 5×3 candidate matrix
+from the predecessor session (same sha-verified binary, 70 min earlier) is
+transcribed above and stands as the full matrix.
+
+| run | binary | shape | result (lines per nonce) |
+|-----|--------|-------|--------------------------|
+| control | installed (pre-fix) | a cold | **2** |
+| 1–5 | candidate | a cold | **1, 2, 2, 2, 2** |
+| 1–3 | candidate | c cold | fail+retry **1+1, 2+1, 2+0** (run3 rc=124 at the 300 s timeout — retry loop, same as predecessor's c3) |
+| — | candidate | b cold | not rerun (60 m wall); predecessor: -one 2/2/3/2/2, -two 1/1/2/1/0 |
+
+### Mechanism, confirmed in this session's transcripts
+
+- `dup2-run-a-cold-1.out` (clean run): 4× "No permission client configured for
+  Bash" narrations reached the inner model; the model obeyed "run exactly this
+  one command and nothing else" and did NOT re-issue → 1 line.
+- `dup2-run-a-cold-2.out` (duplicate): 2× deny narrations; the model's reply
+  explicitly discusses re-issuing the probe → 2 lines.
+
+So `--mode build` does stop the inner harness from executing (the deterministic
+second executor is gone), but the **denial narration is fed back to the inner
+model as if its command failed**, and whether the run duplicates is now the
+inner model's choice. The predecessor's matrix shows the worst case: model
+retries loop (6× executions of the fail command, run hits the 300 s timeout).
+The `call_id` idempotency in this commit cannot catch these retries — a re-issue
+carries a **new** `toolCallId`.
+
+### Verdict and recommended follow-up
+
+- Cold wire: **not fixed** — duplication is now intermittent (this session:
+  1/5 clean on shape a; predecessor: 0/5) instead of deterministic, with
+  amplification risk on failing commands. Shape b also lost executions in the
+  predecessor's runs (run5: second command never ran).
+- Warm path (`ZCODE_WARM=1`): clean everywhere, both sessions. It remains the
+  only deployable configuration; candidate is **not installed**.
+- Follow-up (requires one build, so it must be a later session): on the cold
+  wire, stop feeding the inner model the build-mode permission denial as a
+  command failure — translate/drop `permission.resolved deny` events from the
+  inner transcript (or replace them with the "already executed; use the
+  recorded outputs" framing the Continuation note already uses). Keep the
+  `call_id` idempotency; it is still correct for same-id re-emits.
+
+
 
 
