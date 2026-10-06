@@ -752,7 +752,7 @@ fn stream_message_rate_limit_detection() {
 }
 
 #[test]
-fn retry_delay_waits_a_minute_for_rate_limit_stream() {
+fn retry_delay_backs_off_exponentially_for_rate_limit_stream() {
     let error = CodexErr::Stream(
         "[1302][Rate limit reached for requests] [20260920065300c5262d40cfa74eab]".to_string(),
     );
@@ -761,6 +761,19 @@ fn retry_delay_waits_a_minute_for_rate_limit_stream() {
         Some(RATE_LIMIT_STREAM_RETRY_DELAY)
     );
     assert_eq!(RATE_LIMIT_STREAM_RETRY_DELAY, Duration::from_secs(60),);
+    assert_eq!(
+        error.retry_delay(/*retry_count*/ 2),
+        Some(Duration::from_secs(120)),
+    );
+    assert_eq!(
+        error.retry_delay(/*retry_count*/ 3),
+        Some(Duration::from_secs(240)),
+    );
+    assert_eq!(
+        error.retry_delay(/*retry_count*/ 100),
+        Some(RATE_LIMIT_STREAM_RETRY_MAX_DELAY),
+    );
+    assert_eq!(RATE_LIMIT_STREAM_RETRY_MAX_DELAY, Duration::from_secs(600),);
 
     let error = CodexErr::new(CodexErrorDetails::RateLimitExceeded("slow down".into()));
     assert_eq!(
@@ -776,4 +789,5 @@ fn retry_delay_waits_a_minute_for_rate_limit_stream() {
     let error = CodexErr::Stream("[1302][Rate limit reached for requests]".to_string())
         .with_retry_delay(advice);
     assert_eq!(error.retry_delay(/*retry_count*/ 1), Some(advice));
+    assert_eq!(error.retry_delay(/*retry_count*/ 5), Some(advice));
 }

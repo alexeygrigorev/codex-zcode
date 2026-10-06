@@ -40,6 +40,10 @@ const ERROR_MESSAGE_UI_MAX_BYTES: usize = 2 * 1024;
 /// a minute and typing `continue`.
 pub const RATE_LIMIT_STREAM_RETRY_DELAY: Duration = Duration::from_secs(60);
 
+/// Upper bound for the exponential growth of [`RATE_LIMIT_STREAM_RETRY_DELAY`]
+/// across consecutive retries of the same rate-limited request.
+pub const RATE_LIMIT_STREAM_RETRY_MAX_DELAY: Duration = Duration::from_secs(10 * 60);
+
 /// Returns true when a stream disconnect message looks like a rate limit
 /// rather than a generic transport failure.
 pub fn stream_message_looks_like_rate_limit(message: &str) -> bool {
@@ -393,9 +397,9 @@ impl CodexErr {
     /// Returns the delay before the given retry attempt, or `None` for a terminal error.
     ///
     /// The first retry is attempt one. Retryable errors use server advice when available,
-    /// rate-limit signals without advice wait [`RATE_LIMIT_STREAM_RETRY_DELAY`], and
-    /// everything else uses exponential backoff with jitter. Callers enforce their own
-    /// retry budgets.
+    /// rate-limit signals without advice wait [`RATE_LIMIT_STREAM_RETRY_DELAY`] and double
+    /// each consecutive retry up to [`RATE_LIMIT_STREAM_RETRY_MAX_DELAY`], and everything
+    /// else uses exponential backoff with jitter. Callers enforce their own retry budgets.
     pub fn retry_delay(&self, retry_count: u64) -> Option<Duration> {
         match self.details() {
             CodexErrorDetails::TurnAborted
@@ -444,7 +448,11 @@ impl CodexErr {
                         _ => false,
                     };
                     if is_rate_limit {
+                        let doubling =
+                            2u32.saturating_pow(retry_count.saturating_sub(1).min(31) as u32);
                         RATE_LIMIT_STREAM_RETRY_DELAY
+                            .saturating_mul(doubling)
+                            .min(RATE_LIMIT_STREAM_RETRY_MAX_DELAY)
                     } else {
                         backoff(retry_count)
                     }

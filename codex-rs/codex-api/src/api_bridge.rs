@@ -40,11 +40,11 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
         ApiError::Stream(msg) => {
             // A stream disconnect can carry the rate-limit body inline (for
             // example `[1302][Rate limit reached for requests]`). Promote it
-            // so the session retry loop waits about a minute and resumes
-            // automatically instead of surfacing a generic disconnect.
+            // so the session retry loop backs off and resumes automatically
+            // instead of surfacing a generic disconnect. The delay stays
+            // unset so the retry-count-aware policy computes it.
             if codex_protocol::error::stream_message_looks_like_rate_limit(&msg) {
                 CodexErr::new(CodexErrorDetails::RateLimitExceeded(msg))
-                    .with_retry_delay(codex_protocol::error::RATE_LIMIT_STREAM_RETRY_DELAY)
             } else {
                 CodexErr::Stream(msg)
             }

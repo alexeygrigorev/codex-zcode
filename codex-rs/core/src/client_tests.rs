@@ -2137,10 +2137,9 @@ fn zcode_turn_failure_error_maps_rate_limit_to_retryable_rate_limit() {
             delay,
         } => {
             assert_eq!(actual, message);
-            assert_eq!(
-                delay,
-                Some(codex_protocol::error::RATE_LIMIT_STREAM_RETRY_DELAY)
-            );
+            // No synthetic server advice: the session retry policy computes
+            // the (exponentially growing) rate-limit delay itself.
+            assert_eq!(delay, None);
         }
         other => panic!("expected rate limit error, got {other:?}"),
     }

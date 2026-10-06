@@ -93,9 +93,12 @@ fn map_api_error_promotes_rate_limit_stream_to_rate_limit() {
         err.retry_delay(/*retry_count*/ 1),
         Some(codex_protocol::error::RATE_LIMIT_STREAM_RETRY_DELAY)
     );
+    // No synthetic server advice, so the retry-count-aware policy grows the
+    // delay on consecutive retries instead of pinning it.
+    assert_eq!(err.server_retry_delay(), None);
     assert_eq!(
-        err.server_retry_delay(),
-        Some(codex_protocol::error::RATE_LIMIT_STREAM_RETRY_DELAY)
+        err.retry_delay(/*retry_count*/ 2),
+        Some(2 * codex_protocol::error::RATE_LIMIT_STREAM_RETRY_DELAY)
     );
 
     let err = map_api_error(ApiError::Stream(
