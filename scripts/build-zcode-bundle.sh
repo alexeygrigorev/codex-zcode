@@ -15,12 +15,12 @@ Usage: scripts/build-zcode-bundle.sh [options]
 
 Options:
   --out DIR     Output directory for the tarball (default: dist)
-  --skip-build  Reuse the existing codex-rs/target/dev-small/zcodex binary
+  --skip-build  Reuse the release/zcodex binary in the selected Cargo target
   -h, --help    Show this help
 EOF
 }
 
-out_dir="dist"
+out_dir="${ZCODE_BUNDLE_OUT_DIR:-dist}"
 skip_build=false
 
 while [[ $# -gt 0 ]]; do
@@ -39,7 +39,10 @@ mkdir -p "$out_dir"
 # ---------------------------------------------------------------- binary ----
 # Release profile: same as the GitHub release workflow (opt + thin LTO). The
 # dev-small binary is opt-level 0 and ~400 MB; not suitable for distribution.
-binary="codex-rs/target/release/zcodex"
+target_dir="${CARGO_TARGET_DIR:-${CARGO_BUILD_TARGET_DIR:-$root/codex-rs/target}}"
+# Cargo resolves relative target paths from its working directory (codex-rs).
+[[ "$target_dir" = /* ]] || target_dir="$root/codex-rs/$target_dir"
+binary="$target_dir/release/zcodex"
 if [[ "$skip_build" == false ]]; then
   echo "==> Building zcodex (cargo, release profile)"
   build_env=()
