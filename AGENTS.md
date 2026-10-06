@@ -318,3 +318,15 @@ Tests and features must support Linux, macOS and Windows unless feature is expli
 
 Codex supports running connected app-server and exec-server on different operating systems. See the
 `$remote-tests` skill for details about integration testing these configurations.
+
+## Development server storage process
+
+For new development worktrees and Cargo commands on the server, follow the
+[Quick Build process in ABOUT.md](ABOUT.md#quick-build): use
+`scripts/storagebox-dev.sh worktree TASK HEAD` and
+`scripts/storagebox-dev.sh run COMMAND ...`. New trees, targets/binaries,
+bundle outputs and temporary files belong on the existing `~/storagebox`
+SSHFS mount; the wrapper refuses a missing mount rather than filling root disk.
+Do not move existing worktrees/caches or the installed local launcher while
+workers use them. Existing quota/resource/build holds remain binding.
+Explicit independent local/CI workflows remain portable.
