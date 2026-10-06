@@ -1,0 +1,62 @@
+name: ZCode Release Windows
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zcode-release-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build windows-amd64
+    runs-on: windows-latest
+    timeout-minutes: 240
+    defaults:
+      run:
+        working-directory: codex-rs
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: codex-rs
+          key: zcode-release-x86_64-pc-windows-msvc
+          cache-on-failure: true
+
+      - name: Build Codex CLI with ZCode integration
+        run: cargo build --locked --release --target x86_64-pc-windows-msvc -p codex-cli --bin zcodex
+
+      - name: Verify binary
+        shell: bash
+        run: ./target/x86_64-pc-windows-msvc/release/zcodex.exe --version
+
+      # MSVC keeps debug info in a sidecar .pdb, so the .exe needs no stripping.
+      - name: Package binary
+        shell: pwsh
+        working-directory: ${{ github.workspace }}
+        run: |
+          Copy-Item codex-rs/target/x86_64-pc-windows-msvc/release/zcodex.exe zcodex-windows-amd64.exe
+          if (Test-Path codex-rs/target/x86_64-pc-windows-msvc/release/zcodex.pdb) {
+            Copy-Item codex-rs/target/x86_64-pc-windows-msvc/release/zcodex.pdb zcodex-windows-amd64.pdb
+          }
+          Get-ChildItem zcodex-windows-amd64.* | Compress-Archive -DestinationPath zcodex-windows-amd64.zip -Force
+          Get-Item zcodex-windows-amd64.* | Select-Object Name, Length
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zcodex-windows-amd64-zip
+          path: zcodex-windows-amd64.zip
+          if-no-files-found: error
