@@ -6,6 +6,7 @@ use codex_http_client::Request;
 use codex_http_client::TransportError;
 use codex_login::CodexAuth;
 use codex_models_manager::bundled_models_response;
+use codex_protocol::error::RATE_LIMIT_STREAM_RETRY_DELAY;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
@@ -490,9 +491,10 @@ async fn compact_v2_uses_local_backoff_despite_retry_after() -> Result<()> {
 }
 
 // TODO(anp) respect Retry-After
-/// Remote compaction v2 stream failures retry without using the enclosing response header.
+/// Remote compaction v2 stream rate limits ignore the enclosing response header
+/// and wait out the headerless rate-limit policy delay.
 #[tokio::test(flavor = "current_thread")]
-async fn compact_v2_stream_failure_uses_local_backoff_despite_retry_after() -> Result<()> {
+async fn compact_v2_stream_failure_waits_policy_delay_despite_retry_after() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let mut telemetry = RetryTelemetryCapture::install();
@@ -535,12 +537,11 @@ async fn compact_v2_stream_failure_uses_local_backoff_despite_retry_after() -> R
 
     test.codex.submit(Op::Compact).await?;
     let retry = telemetry.next_retry().await;
-    assert!((FIRST_RETRY_MIN_DELAY..FIRST_RETRY_MAX_DELAY).contains(&retry.delay));
     assert_eq!(
         retry,
         RetryTelemetryEvent {
             attempt: 1,
-            delay: retry.delay,
+            delay: RATE_LIMIT_STREAM_RETRY_DELAY,
             layer: "stream".into(),
             operation: "remote_compaction_v2".into(),
         }
@@ -604,12 +605,11 @@ async fn compact_v2_stream_failure_without_retry_after_exhausts_stream_retries()
 
     test.codex.submit(Op::Compact).await?;
     let retry = telemetry.next_retry().await;
-    assert!((FIRST_RETRY_MIN_DELAY..FIRST_RETRY_MAX_DELAY).contains(&retry.delay));
     assert_eq!(
         retry,
         RetryTelemetryEvent {
             attempt: 1,
-            delay: retry.delay,
+            delay: RATE_LIMIT_STREAM_RETRY_DELAY,
             layer: "stream".into(),
             operation: "remote_compaction_v2".into(),
         }
@@ -918,9 +918,10 @@ async fn compact_v2_overload_without_retry_after_exhausts_request_retries() -> R
 }
 
 // TODO(anp) respect Retry-After
-/// SSE failures currently retry with local backoff instead of the enclosing response header.
+/// SSE rate-limit failures ignore the enclosing response header and wait out the
+/// headerless rate-limit policy delay.
 #[tokio::test(flavor = "current_thread")]
-async fn sse_failure_uses_local_backoff_despite_retry_after() -> Result<()> {
+async fn sse_rate_limit_stream_waits_policy_delay_despite_retry_after() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let mut telemetry = RetryTelemetryCapture::install();
@@ -967,12 +968,11 @@ async fn sse_failure_uses_local_backoff_despite_retry_after() -> Result<()> {
 
     submit_user_input(&test, "retry the rate-limited stream").await?;
     let retry = telemetry.next_retry().await;
-    assert!((FIRST_RETRY_MIN_DELAY..FIRST_RETRY_MAX_DELAY).contains(&retry.delay));
     assert_eq!(
         retry,
         RetryTelemetryEvent {
             attempt: 1,
-            delay: retry.delay,
+            delay: RATE_LIMIT_STREAM_RETRY_DELAY,
             layer: "stream".into(),
             operation: "sampling".into(),
         }
@@ -1023,12 +1023,11 @@ async fn sse_failure_without_retry_after_exhausts_stream_retries(code: &str) -> 
 
     submit_user_input(&test, "exhaust the headerless rate-limited stream").await?;
     let retry = telemetry.next_retry().await;
-    assert!((FIRST_RETRY_MIN_DELAY..FIRST_RETRY_MAX_DELAY).contains(&retry.delay));
     assert_eq!(
         retry,
         RetryTelemetryEvent {
             attempt: 1,
-            delay: retry.delay,
+            delay: RATE_LIMIT_STREAM_RETRY_DELAY,
             layer: "stream".into(),
             operation: "sampling".into(),
         }

@@ -47,12 +47,12 @@ async fn guardian_retry_executes_only_after_a_completed_approval() -> Result<()>
         sse_failed(
             "first-review",
             "rate_limit_exceeded",
-            "temporary review error",
+            "temporary review error. Please try again in 1s.",
         ),
         sse_failed(
             "stream-retry",
             "rate_limit_exceeded",
-            "temporary review error",
+            "temporary review error. Please try again in 1s.",
         ),
         sse(vec![
             ev_assistant_message(
