@@ -230,6 +230,12 @@ fn reasoning_effort_for_request(
 
 const ZCODE_PROVIDER_ID: &str = "zai";
 
+/// When true, streamed ZCode `tool_call` events become Codex `function_call`s
+/// that ToolCallRuntime executes. Keep this false: inner `--mode yolo` already
+/// ran the call, and `--mode build` denies writes with "No permission client
+/// configured" because the cold spawn never attaches a permission client.
+const ZCODE_RELAY_INNER_TOOLS: bool = false;
+
 struct PendingZcodeTool {
     zcode_name: String,
     name: String,
@@ -3402,6 +3408,8 @@ impl ModelClientSession {
         // Captured before the prompt text moves into the spawn task; feeds
         // the token-usage fallback estimate for the Completed event.
         let prompt_bytes = user_text.len();
+        // Inner `--mode` follows Codex `/permissions` (Never → yolo).
+        let inner_mode = prompt.zcode_inner_mode.as_cli_arg();
 
         // A goal-status marker is translated by the previous invocation into
         // a synthesized `update_goal` call; the follow-up request that
@@ -3487,22 +3495,17 @@ impl ModelClientSession {
                     .arg(ZCODE_PROMPT_LOADER)
                     .arg(&runtime.cjs)
                     .arg(prompt_file)
-                    // `build` instead of `yolo`: the tool_use blocks must
-                    // stream out for the outer ToolCallRuntime to execute
-                    // (and record) exactly once. Under yolo the headless
-                    // core executed the same calls inside its own agent
-                    // loop, duplicating every side effect with the inner
-                    // output unrecorded; under build it denies its own
-                    // headless execution immediately ("No permission
-                    // client configured") while still streaming the calls.
-                    // `plan` also denies but distorts the model's
-                    // tool-call emission (ExitPlanMode loops), so it is
-                    // not an option here.
+                    // Inner `--mode` follows Codex `/permissions`:
+                    // `AskForApproval::Never` → `yolo` (sole executor).
+                    // Anything else → `build`, which denies writes because
+                    // this spawn never attaches a permission client.
+                    // Relaying streamed `tool_call` events into Codex
+                    // FunctionCalls would run the same side effects again.
                     .args([
                         "--output-format",
                         "stream-json",
                         "--mode",
-                        "build",
+                        inner_mode,
                         "--cwd",
                         &cwd,
                     ])
@@ -3749,7 +3752,7 @@ impl ModelClientSession {
                             break;
                         }
                     }
-                    if is_tool_input_start {
+                    if ZCODE_RELAY_INNER_TOOLS && is_tool_input_start {
                         let tool_call_id = payload
                             .and_then(|p| p.get("toolCallId"))
                             .and_then(|v| v.as_str())
@@ -3790,7 +3793,7 @@ impl ModelClientSession {
                             }
                         }
                     }
-                    if is_tool_input_delta {
+                    if ZCODE_RELAY_INNER_TOOLS && is_tool_input_delta {
                         let tool_call_id = payload
                             .and_then(|p| p.get("toolCallId"))
                             .and_then(|v| v.as_str())
@@ -3834,7 +3837,7 @@ impl ModelClientSession {
                             }
                         }
                     }
-                    if is_tool_call {
+                    if ZCODE_RELAY_INNER_TOOLS && is_tool_call {
                         let tool_call_id = payload
                             .and_then(|p| p.get("toolCallId"))
                             .and_then(|v| v.as_str())
@@ -3917,7 +3920,7 @@ impl ModelClientSession {
                             completed_tool_ids.insert(tool_call_id.to_string());
                         }
                     }
-                    if is_tool_input_end {
+                    if ZCODE_RELAY_INNER_TOOLS && is_tool_input_end {
                         // Do NOT emit here. ZCode sends `tool_input_end`
                         // before `tool_call`; emitting from accumulated deltas
                         // would persist pathological raw text and discard the
@@ -3975,7 +3978,7 @@ impl ModelClientSession {
             // capped, validated fallback instead. Skip when the turn already
             // failed (session.error) or stalled so a dead turn does not
             // sprout half-formed tools.
-            if failed.is_none() && stalled.is_none() {
+            if ZCODE_RELAY_INNER_TOOLS && failed.is_none() && stalled.is_none() {
                 for (tool_call_id, pending) in std::mem::take(&mut pending_tools) {
                     if completed_tool_ids.contains(&tool_call_id) {
                         continue;

@@ -7,6 +7,7 @@ use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::ImageDetail;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
+use codex_protocol::protocol::AskForApproval;
 use codex_tools::ToolSpec;
 use futures::Stream;
 use serde_json::Value;
@@ -39,6 +40,9 @@ pub struct Prompt {
     pub output_schema_strict: bool,
 
     pub(crate) cyber_access_program: Option<codex_protocol::turn_input::CyberAccessProgram>,
+
+    /// Permission mode for the ZCode cold spawn (`--mode`). Ignored on other wires.
+    pub(crate) zcode_inner_mode: ZcodeInnerMode,
 }
 
 impl Default for Prompt {
@@ -51,6 +55,38 @@ impl Default for Prompt {
             output_schema: None,
             output_schema_strict: true,
             cyber_access_program: None,
+            zcode_inner_mode: ZcodeInnerMode::default(),
+        }
+    }
+}
+
+/// Permission mode passed to the ZCode cold spawn as `--mode`.
+///
+/// Codex `/permissions` YOLO (`AskForApproval::Never`) maps to `Yolo`:
+/// the headless child is the sole tool executor. Any other approval policy
+/// maps to `Build`. The cold spawn never attaches a permission client, so
+/// `Build` denies inner writes with "No permission client configured".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ZcodeInnerMode {
+    #[default]
+    Yolo,
+    Build,
+}
+
+impl ZcodeInnerMode {
+    pub(crate) fn as_cli_arg(self) -> &'static str {
+        match self {
+            Self::Yolo => "yolo",
+            Self::Build => "build",
+        }
+    }
+
+    pub(crate) fn from_approval_policy(policy: AskForApproval) -> Self {
+        match policy {
+            AskForApproval::Never => Self::Yolo,
+            AskForApproval::OnRequest
+            | AskForApproval::UnlessTrusted
+            | AskForApproval::Granular(_) => Self::Build,
         }
     }
 }

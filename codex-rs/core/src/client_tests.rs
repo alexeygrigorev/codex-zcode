@@ -2371,7 +2371,7 @@ async fn zcode_stream_completes_text_segments_around_tool_calls() {
     }
     let _ = std::fs::remove_file(&cjs_path);
 
-    assert_eq!(events.len(), 10, "unexpected event sequence: {events:?}");
+    assert_eq!(events.len(), 7, "unexpected event sequence: {events:?}");
     assert!(matches!(
         &events[0],
         ResponseEvent::OutputItemAdded(ResponseItem::Message { .. })
@@ -2379,42 +2379,39 @@ async fn zcode_stream_completes_text_segments_around_tool_calls() {
     assert!(
         matches!(&events[1], ResponseEvent::OutputTextDelta(delta) if delta == "Let me check.")
     );
-    // The first segment completes with its own text before the tool item,
-    // so core finalizes text the user already watched stream in.
+    // The first segment completes before the inner tool event so core
+    // finalizes text the user already watched stream in. Inner `--mode yolo`
+    // executes the tool; streamed tool_call events are not relayed as Codex
+    // function_calls (that path re-ran every side effect).
     assert_eq!(
         completed_message_texts(&events[..3]),
         vec!["Let me check.".to_string()]
     );
     assert!(matches!(
         &events[3],
-        ResponseEvent::OutputItemAdded(ResponseItem::FunctionCall { name, .. }) if name == "exec_command"
-    ));
-    assert!(matches!(
-        &events[4],
-        ResponseEvent::ToolCallInputDelta { call_id: Some(call_id), .. } if call_id == "zcode_tool_t1"
-    ));
-    assert!(matches!(
-        &events[5],
-        ResponseEvent::OutputItemDone(ResponseItem::FunctionCall { name, .. }) if name == "exec_command"
-    ));
-    assert!(matches!(
-        &events[6],
         ResponseEvent::OutputItemAdded(ResponseItem::Message { .. })
     ));
     assert!(
-        matches!(&events[7], ResponseEvent::OutputTextDelta(delta) if delta == "Done checking.")
+        matches!(&events[4], ResponseEvent::OutputTextDelta(delta) if delta == "Done checking.")
     );
     assert!(matches!(
-        &events[8],
+        &events[5],
         ResponseEvent::OutputItemDone(ResponseItem::Message { .. })
     ));
     assert!(matches!(
-        &events[9],
+        &events[6],
         ResponseEvent::Completed {
             end_turn: Some(true),
             ..
         }
     ));
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            ResponseEvent::OutputItemDone(ResponseItem::FunctionCall { .. })
+        )),
+        "inner tool calls must not be relayed as Codex function_calls: {events:?}"
+    );
     // The result line ("stale result line") must not replace streamed text.
     assert_eq!(
         completed_message_texts(&events),

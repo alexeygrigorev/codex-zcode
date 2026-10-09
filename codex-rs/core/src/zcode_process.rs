@@ -94,7 +94,7 @@ const TITLE_REQUEST_REFUSAL: &str = "Do not answer the request.";
 ///
 /// Title generation starts a temporary Codex thread in the same checkout as
 /// the real turn, a few hundred milliseconds later. On this wire that thread
-/// becomes another `zcode.cjs --mode yolo` process, and the prompt still
+/// becomes another `zcode.cjs --mode <yolo|build>` process, and the prompt still
 /// contains the user's task, so the model does the work. The title is taken
 /// from that prompt locally instead.
 pub(crate) fn side_request_reply(prompt: &str) -> Option<String> {

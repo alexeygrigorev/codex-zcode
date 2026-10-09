@@ -84,6 +84,9 @@ pub(super) async fn run_remote_compact_v2_attempt(
         output_schema: None,
         output_schema_strict: true,
         cyber_access_program: turn_context.cyber_access_program,
+        zcode_inner_mode: crate::client_common::ZcodeInnerMode::from_approval_policy(
+            turn_context.approval_policy(),
+        ),
     };
 
     let mut responses_metadata = sess

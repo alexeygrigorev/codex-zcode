@@ -11,7 +11,7 @@ backend. The executable is `zcodex`, and its configuration lives in
 zcodex TUI / exec (terminal UI, approval flow, sandbox)
     | ModelClient WireApi::Zcode
     v
-node zcode.cjs --prompt <text> --json --mode yolo --cwd <dir>
+node zcode.cjs --prompt <text> --json --mode <yolo|build> --cwd <dir>
     |
     v
 ZCode headless agent (model, web search, internal tools)
@@ -19,7 +19,9 @@ ZCode headless agent (model, web search, internal tools)
 
 There is no HTTP proxy and no tool indirection. `WireApi::Zcode` spawns the
 ZCode headless CLI for each model turn and maps its JSON result into Codex's
-normal response stream.
+normal response stream. Inner `--mode` follows Codex `/permissions`: YOLO
+(`AskForApproval::Never`) spawns `--mode yolo` so the child is the sole tool
+executor; any other approval policy spawns `--mode build`.
 
 ## What You Need
 
