@@ -67,10 +67,37 @@ Use this for local development and testing. It uses an optimized enough, but
 fast local profile and does not create a release.
 
 ```bash
-cd codex-rs
-cargo build --profile dev-small -p codex-cli --bin zcodex
-./target/dev-small/zcodex
+scripts/storagebox-dev.sh run sh -c 'cd codex-rs && cargo build --profile dev-small -p codex-cli --bin zcodex'
+scripts/storagebox-dev.sh run sh -c '"$CARGO_TARGET_DIR/dev-small/zcodex" --version'
 ```
+
+On the development server, this is the default process: an existing SSHFS mount
+at `~/storagebox` holds new worktrees, target binaries, temporary build files and
+bundle outputs. The wrapper fails closed if the mount is absent or unusable.
+Create an owned worktree with `scripts/storagebox-dev.sh worktree TASK HEAD`,
+then work in `~/storagebox/worktrees/codex-zcode/TASK`. Local Git objects remain
+in the main clone. `scripts/storagebox-dev.sh paths` prints the actual selected
+paths without compiling. Override the mount with `ZCODE_STORAGEBOX_ROOT` or the
+per-task output name with `ZCODE_DEV_TASK`; both remain mount checked.
+A local per-task `flock` rejects concurrent wrapper commands using the same
+target/output; use distinct task names for independent writers.
+
+Use `scripts/storagebox-dev.sh run scripts/build-zcode-bundle.sh` for bundles.
+The bundle finder respects `CARGO_TARGET_DIR` (including relative paths) and
+`CARGO_BUILD_TARGET_DIR`. Its default output stays `dist` for independent local
+or CI use; the wrapper selects remote output and `TMPDIR`. Do not pass a local
+`--out`, Cargo `--target-dir` or command-local environment override when using
+the remote process. Direct local/CI builds are explicit independent workflows:
+`cd codex-rs && cargo build --profile dev-small -p codex-cli --bin zcodex`.
+
+SSHFS metadata round trips can slow compilation and outages can interrupt writes;
+timings below describe local builds, not a remote performance guarantee. Existing
+worktrees, target caches and installed `~/.local/lib/zcodex` runtimes are preserved.
+Keep the local installed launcher and ordinary Git remote backup for recovery.
+Cargo registry caches stay local. Mount capacity does not lift build holds or
+resource gates: retain 20 GiB projected free root disk (30 GiB warning) and an
+aggregate 512 MiB scratch bound. Builds still require task-specific admission;
+this setup does not authorize a new Rust build.
 
 Typical timings:
 

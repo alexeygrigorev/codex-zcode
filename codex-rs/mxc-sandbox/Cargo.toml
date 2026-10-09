@@ -24,6 +24,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 wxc_common = { workspace = true }
+codex-utils-absolute-path = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 appcontainer_common = { workspace = true }
@@ -39,6 +40,5 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
-codex-utils-absolute-path = { workspace = true }
 pretty_assertions = { workspace = true }
 tempfile = { workspace = true }
