@@ -1,6 +1,6 @@
 ---
 source: tui/src/history_cell/tests.rs
-assertion_line: 1847
+assertion_line: 1831
 expression: "render_lines(&lines).join(\"\\n\")"
 ---
 ╭──────────────────────────────────────────╮
@@ -8,5 +8,5 @@ expression: "render_lines(&lines).join(\"\\n\")"
 │                                          │
 │ model:       gpt-5.6-sol xhigh   fast  … │
 │ directory:   project                     │
-│ permissions: YOLO mode                   │
+│ permissions: YOLO mode   /permissions t… │
 ╰──────────────────────────────────────────╯

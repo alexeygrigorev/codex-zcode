@@ -333,6 +333,7 @@ impl HistoryCell for SessionHeaderHistoryCell {
         ];
 
         const CHANGE_MODEL_HINT_COMMAND: &str = "/model";
+        const CHANGE_PERMISSIONS_HINT_COMMAND: &str = "/permissions";
         const CHANGE_MODEL_HINT_EXPLANATION: &str = " to change";
         const DIR_LABEL: &str = "directory:";
         const PERMISSIONS_LABEL: &str = "permissions:";
@@ -386,6 +387,9 @@ impl HistoryCell for SessionHeaderHistoryCell {
             lines.push(make_row(vec![
                 Span::from(format!("{permissions_label} ")).dim(),
                 "YOLO mode".magenta().bold(),
+                "   ".dim(),
+                CHANGE_PERMISSIONS_HINT_COMMAND.cyan(),
+                CHANGE_MODEL_HINT_EXPLANATION.dim(),
             ]));
         }
 

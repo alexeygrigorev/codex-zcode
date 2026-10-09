@@ -1,12 +1,12 @@
 ---
 source: tui/src/history_cell/tests.rs
-assertion_line: 1866
+assertion_line: 1854
 expression: rendered
 ---
-╭───────────────────────────────────────╮
-│ >_ ZCode + Codex (vtest)              │
-│                                       │
-│ model:       gpt-5   /model to change │
-│ directory:   /tmp/project             │
-│ permissions: YOLO mode                │
-╰───────────────────────────────────────╯
+╭─────────────────────────────────────────────────╮
+│ >_ ZCode + Codex (vtest)                        │
+│                                                 │
+│ model:       gpt-5   /model to change           │
+│ directory:   /tmp/project                       │
+│ permissions: YOLO mode   /permissions to change │
+╰─────────────────────────────────────────────────╯

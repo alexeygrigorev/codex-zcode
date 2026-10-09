@@ -1847,6 +1847,10 @@ fn session_header_indicates_yolo_mode() {
     .with_yolo_mode(/*yolo_mode*/ true);
 
     let rendered = render_lines(&cell.display_lines(/*width*/ 80)).join("\n");
+    assert!(
+        rendered.contains("/permissions to change"),
+        "YOLO header must point at /permissions so the inner ZCode mode is changeable:\n{rendered}"
+    );
     insta::assert_snapshot!(rendered);
 }
 
