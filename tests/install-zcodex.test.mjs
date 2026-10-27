@@ -65,3 +65,18 @@ test("local mode refuses symlink destinations and incomplete options", (t) => {
   assert.equal(f.install().status, 1);
   assert.ok(lstatSync(join(f.installDir, "zcodex")).isDirectory());
 });
+
+test("local install preserves a FIFO destination", (t) => {
+  const f = fixture(t);
+  mkdirSync(f.installDir);
+  const destination = join(f.installDir, "zcodex");
+  const fifo = spawnSync("mkfifo", [destination], { encoding: "utf8" });
+  if (fifo.status !== 0 && /not supported|not implemented|operation not permitted/i.test(fifo.stderr)) {
+    t.skip("fixture filesystem cannot create FIFOs");
+    return;
+  }
+  assert.equal(fifo.status, 0, fifo.stderr);
+  assert.equal(f.install().status, 1);
+  assert.ok(lstatSync(destination).isFIFO());
+  assert.deepEqual(readdirSync(f.installDir), ["zcodex"]);
+});

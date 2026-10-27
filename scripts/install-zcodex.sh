@@ -35,8 +35,8 @@ if [[ -n "$local_binary" || -n "$local_install_dir" ]]; then
         exit 1
     fi
     destination="$local_install_dir/zcodex"
-    if [[ -L "$destination" || -d "$destination" ]]; then
-        echo "Refusing to replace a symlink or directory: $destination" >&2
+    if [[ -L "$destination" || ( -e "$destination" && ! -f "$destination" ) ]]; then
+        echo "Refusing to replace a non-regular destination: $destination" >&2
         exit 1
     fi
     mkdir -p "$local_install_dir"
