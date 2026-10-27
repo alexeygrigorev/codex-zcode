@@ -467,19 +467,28 @@ impl ZcodeWarmBridge {
     /// Used instead of waiting for `Drop` when a turn must give up on the
     /// child while the bridge handle may still be cached by the thread.
     pub(crate) fn kill(&self, reason: &str) {
-        if self.dead.swap(true, Ordering::Relaxed) {
-            return;
+        if !self.dead.swap(true, Ordering::Relaxed) {
+            warn!("ZCode warm app-server killed: {reason}");
+            self.fail_pending(reason);
+            self.fail_collectors(reason);
         }
-        warn!("ZCode warm app-server killed: {reason}");
-        self.fail_pending(reason);
-        self.fail_collectors(reason);
-        if let Ok(mut child) = self.child.lock()
-            && let Some(child) = child.as_mut()
+        // EOF can mark the reader dead while the process is still alive.
+        let owns_child = match self
+            .child
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
         {
-            let _ = child.start_kill();
+            Some(child) => {
+                let _ = child.start_kill();
+                true
+            }
+            None => false,
+        };
+        if owns_child {
+            codex_utils_pty::process_group::kill_process_group_by_pid(self.process_group_pid)
+                .unwrap_or_else(|error| warn!("ZCode process group kill failed: {error}"));
         }
-        codex_utils_pty::process_group::kill_process_group_by_pid(self.process_group_pid)
-            .unwrap_or_else(|e| warn!("ZCode warm process group kill failed: {e}"));
     }
 
     /// Closes this session and reaps the process before its checkout is released.
@@ -508,26 +517,55 @@ impl ZcodeWarmBridge {
             Ok(())
         };
         let _ = self.stdin.send(None);
-        let child = self
-            .child
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        let Some(mut child) = child else {
-            return close;
-        };
-        let exit = match tokio::time::timeout(grace, child.wait()).await {
-            Ok(Ok(status)) if status.success() => Ok(()),
-            Ok(Ok(status)) => Err(format!("ZCode process exited with {status}")),
-            Ok(Err(error)) => Err(format!("could not reap ZCode process: {error}")),
-            Err(_) => {
-                let _ = zcode_process::dispose_and_wait_once(&mut child).await;
-                Err("ZCode process required forced retirement".to_string())
+        let deadline = tokio::time::Instant::now() + grace;
+        let mut failure = None;
+        let exit = loop {
+            let status = {
+                let mut child = self
+                    .child
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                match child.as_mut() {
+                    Some(child) => child.try_wait(),
+                    None => break Ok(()),
+                }
+            };
+            match status {
+                Ok(Some(status)) => {
+                    drop(self.take_child_for_retirement());
+                    break if let Some(error) = failure {
+                        Err(error)
+                    } else if status.success() {
+                        Ok(())
+                    } else {
+                        Err(format!("ZCode process exited with {status}"))
+                    };
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    failure.get_or_insert_with(|| format!("could not reap ZCode process: {error}"));
+                    self.kill("child retirement failed");
+                }
             }
+            if failure.is_none() && tokio::time::Instant::now() >= deadline {
+                failure = Some("ZCode process required forced retirement".to_string());
+                self.kill("natural retirement timed out");
+            }
+            // Keep the child in the bridge across awaits so cancellation's
+            // retained-permit guard can synchronously kill and reap it.
+            tokio::time::sleep(Duration::from_millis(/*millis*/ 10)).await;
         };
         self.dead.store(true, Ordering::Relaxed);
         let _ = codex_utils_pty::process_group::kill_process_group_by_pid(self.process_group_pid);
         close.and(exit)
+    }
+
+    /// Transfers child ownership to an awaited or blocking retirement path.
+    pub(crate) fn take_child_for_retirement(&self) -> Option<Child> {
+        self.child
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
     }
 
     fn fail_pending(&self, reason: &str) {
@@ -1074,16 +1112,7 @@ pub(crate) fn assistant_message(text: String) -> ResponseItem {
 
 impl Drop for ZcodeWarmBridge {
     fn drop(&mut self) {
-        if self.dead.swap(true, Ordering::Relaxed) {
-            return;
-        }
-        if let Ok(mut child) = self.child.lock()
-            && let Some(child) = child.as_mut()
-        {
-            let _ = child.start_kill();
-        }
-        codex_utils_pty::process_group::kill_process_group_by_pid(self.process_group_pid)
-            .unwrap_or_else(|e| warn!("ZCode warm process group kill failed on drop: {e}"));
+        self.kill("bridge dropped");
     }
 }
 

@@ -35,6 +35,13 @@ struct EnvVarGuard {
 }
 
 impl EnvVarGuard {
+    fn unset(key: &'static str) -> Self {
+        let original = std::env::var_os(key);
+        unsafe {
+            std::env::remove_var(key);
+        }
+        Self { key, original }
+    }
     fn set(key: &'static str, value: &OsStr) -> Self {
         let original = std::env::var_os(key);
         unsafe {
@@ -92,6 +99,37 @@ if (mode === "yolo") {{
   fs.writeFileSync(writeProbe, "inner write\n");
 }}
 const emit = (value) => process.stdout.write(`${{JSON.stringify(value)}}\n`);
+if (argv.includes("app-server")) {{
+  const sessionId = "stub-session";
+  const notify = (type, payload) => emit({{ method: "session/event", params: {{ sessionId, type, payload }} }});
+  const ask = (toolName) => emit({{ id: "permission-" + toolName, method: "interaction/requestPermission", params: {{
+    sessionId, requestId: "req-" + toolName, toolName, riskLevel: "high", input: {{}} }} }});
+  require("readline").createInterface({{ input: process.stdin }}).on("line", (line) => {{
+    const msg = JSON.parse(line);
+    if (String(msg.id).startsWith("permission-")) {{
+      if (msg.result?.decision !== "allow") {{
+        notify("turn.completed", {{ response: "denied", resultType: "success" }});
+      }} else if (msg.id === "permission-Bash") {{
+        fs.appendFileSync(probe, "inner\n"); ask("Write");
+      }} else {{
+        fs.writeFileSync(probe + ".write", "inner write\n");
+        notify("tool_call_scheduled", {{ toolCallId: "bash", toolName: "Bash", input: {{ command: {outer_command_json} }} }});
+        notify("tool_call_scheduled", {{ toolCallId: "write", toolName: "Write", input: {{ file_path: probe + ".write", content: "outer write" }} }});
+        notify("turn.completed", {{ response: "done", resultType: "success" }});
+      }}
+      return;
+    }}
+    const reply = (result) => emit({{ id: msg.id, result }});
+    switch (msg.method) {{
+      case "session/create": reply({{ session: {{ sessionId }}, protocol: {{ version: 1 }} }}); break;
+      case "session/subscribe": reply({{ eventSeq: 0, events: [] }}); break;
+      case "session/setMode": reply({{}}); break;
+      case "session/send": reply({{ accepted: true }}); ask("Bash"); break;
+      case "session/close": reply({{ closed: true }}); break;
+      default: emit({{ id: msg.id, error: {{ code: -32601, message: "unsupported" }} }});
+    }}
+  }});
+}} else {{
 emit({{ type: "session.updated", sessionId: "stub-session" }});
 if (seen === 0) {{
   emit({{
@@ -123,6 +161,7 @@ if (seen === 0) {{
   }});
 }}
 emit({{ type: "result", response: seen === 0 ? "tool turn" : "done" }});
+}}
 "#
     );
     std::fs::write(&cjs, source).unwrap();
@@ -157,6 +196,7 @@ async fn run_inner_mode_probe(approval_policy: AskForApproval) -> InnerModeProbe
         EnvVarGuard::set("HOME", fake_home.path().as_os_str()),
     );
 
+    let _permission_guard = EnvVarGuard::unset("ZCODE_WARM_PERMISSIONS");
     let server = start_mock_server().await;
     let mut builder = test_codex().with_config(|config| {
         config.model_provider.wire_api = WireApi::Zcode;
@@ -195,7 +235,7 @@ async fn zcode_cold_wire_executes_streamed_tool_call_once() {
     let probe = run_inner_mode_probe(AskForApproval::Never).await;
     assert_eq!(probe.written_content, "inner write\n");
     assert!(
-        probe.argv_log.contains("\"--mode\",\"yolo\""),
+        probe.argv_log.contains("\"app-server\""),
         "Codex YOLO (`AskForApproval::Never`) must spawn `--mode yolo` so \
          inner writes are allowed\n\
          stub spawn argv log:\n{}",
@@ -326,23 +366,23 @@ async fn zcode_warm_wire_enforces_approval_policy_before_send() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn zcode_warm_wire_rejected_mode_falls_back_without_sending() {
+async fn zcode_warm_wire_rejected_mode_is_not_replayed() {
     if !node_available() {
         return;
     }
     assert_eq!(
         run_warm_mode_probe(ModeAcknowledgement::Reject, AskForApproval::Never, "build").await,
-        vec!["create:build", "setMode:build", "cold:build"]
+        vec!["create:build", "setMode:build"]
     );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn zcode_warm_fallback_retains_stricter_environment_mode() {
+async fn zcode_warm_stricter_environment_mode_failure_is_not_replayed() {
     if !node_available() {
         return;
     }
     assert_eq!(
         run_warm_mode_probe(ModeAcknowledgement::Reject, AskForApproval::Never, "build").await,
-        vec!["create:build", "setMode:build", "cold:build"]
+        vec!["create:build", "setMode:build"]
     );
 }
