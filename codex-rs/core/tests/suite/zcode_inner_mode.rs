@@ -75,6 +75,7 @@ const argv = process.argv;
 const modeIndex = argv.indexOf("--mode");
 const mode = modeIndex >= 0 ? argv[modeIndex + 1] : "";
 const probe = {probe_json};
+const writeProbe = `${{probe}}.write`;
 const counter = `${{probe}}.invocations`;
 let seen = 0;
 try {{
@@ -88,6 +89,7 @@ fs.appendFileSync(counter + ".argv", JSON.stringify(argv) + "\n");
 // must not append (that argv is the write-blocker regression).
 if (mode === "yolo") {{
   fs.appendFileSync(probe, "inner\n");
+  fs.writeFileSync(writeProbe, "inner write\n");
 }}
 const emit = (value) => process.stdout.write(`${{JSON.stringify(value)}}\n`);
 emit({{ type: "session.updated", sessionId: "stub-session" }});
@@ -103,6 +105,15 @@ if (seen === 0) {{
       toolCallId: "stub-tool-1",
       toolName: "Bash",
       input: {{ command: {outer_command_json} }},
+    }},
+  }});
+  emit({{
+    type: "model.streaming",
+    payload: {{
+      kind: "tool_call",
+      toolCallId: "stub-write-1",
+      toolName: "Write",
+      input: {{ file_path: writeProbe, content: "outer write\n" }},
     }},
   }});
 }} else {{
@@ -128,6 +139,7 @@ fn node_available() -> bool {
 struct InnerModeProbe {
     argv_log: String,
     probe_lines: usize,
+    written_content: String,
 }
 
 async fn run_inner_mode_probe(approval_policy: AskForApproval) -> InnerModeProbe {
@@ -168,6 +180,8 @@ async fn run_inner_mode_probe(approval_policy: AskForApproval) -> InnerModeProbe
     InnerModeProbe {
         argv_log,
         probe_lines,
+        written_content: std::fs::read_to_string(probe.with_extension("log.write"))
+            .unwrap_or_default(),
     }
 }
 
@@ -179,6 +193,7 @@ async fn zcode_cold_wire_executes_streamed_tool_call_once() {
     }
 
     let probe = run_inner_mode_probe(AskForApproval::Never).await;
+    assert_eq!(probe.written_content, "inner write\n");
     assert!(
         probe.argv_log.contains("\"--mode\",\"yolo\""),
         "Codex YOLO (`AskForApproval::Never`) must spawn `--mode yolo` so \
@@ -216,5 +231,130 @@ async fn zcode_cold_wire_follows_codex_approval_policy() {
          cold spawn has no permission client\n\
          stub spawn argv log:\n{}",
         probe.argv_log
+    );
+}
+
+#[derive(Clone, Copy)]
+enum ModeAcknowledgement {
+    Accept,
+    Reject,
+}
+
+async fn run_warm_mode_probe(
+    acknowledgement: ModeAcknowledgement,
+    approval_policy: AskForApproval,
+    warm_mode: &str,
+) -> Vec<String> {
+    let work = TempDir::new().unwrap();
+    let log = work.path().join("warm.log");
+    let cjs = work.path().join("warm-stub.cjs");
+    let source = r#"
+const fs = require("fs");
+const log = (value) => fs.appendFileSync(%LOG%, value + "\n");
+const emit = (value) => process.stdout.write(JSON.stringify(value) + "\n");
+if (!process.argv.includes("app-server")) {
+  const index = process.argv.indexOf("--mode");
+  log("cold:" + process.argv[index + 1]);
+  emit({ type: "result", response: "cold fallback denied effects" });
+} else {
+  require("readline").createInterface({ input: process.stdin }).on("line", (line) => {
+    const message = JSON.parse(line);
+    const reply = (result) => emit({ id: message.id, result });
+    switch (message.method) {
+      case "session/create":
+        log("create:" + message.params.mode);
+        reply({ session: { sessionId: "sess_warm_policy" }, protocol: { version: 1 } });
+        break;
+      case "session/subscribe":
+        reply({ eventSeq: 0, events: [] });
+        break;
+      case "session/setMode":
+        log("setMode:" + message.params.mode);
+        if (%REJECT%) emit({ id: message.id, error: { code: -32000, message: "mode rejected" } });
+        else reply({});
+        break;
+      case "session/send":
+        log("send");
+        reply({ accepted: true });
+        emit({ method: "session/event", params: { sessionId: message.params.sessionId, type: "turn.completed", payload: { response: "warm policy honored", resultType: "success" } } });
+        break;
+      default:
+        emit({ id: message.id, error: { code: -32601, message: "unsupported " + message.method } });
+    }
+  });
+}
+"#
+        .replace("%LOG%", &serde_json::to_string(&log).unwrap())
+        .replace("%REJECT%", match acknowledgement { ModeAcknowledgement::Accept => "false", ModeAcknowledgement::Reject => "true" });
+    std::fs::write(&cjs, source).unwrap();
+    let fake_home = TempDir::new().unwrap();
+    let _env_guards = (
+        EnvVarGuard::set("ZCODE_CJS", cjs.as_os_str()),
+        EnvVarGuard::set("ZCODE_WARM", OsStr::new("1")),
+        EnvVarGuard::set("ZCODE_WARM_MODE", OsStr::new(warm_mode)),
+        EnvVarGuard::set("HOME", fake_home.path().as_os_str()),
+    );
+    let server = start_mock_server().await;
+    let mut builder = test_codex().with_config(|config| {
+        config.model_provider.wire_api = WireApi::Zcode;
+    });
+    let test = builder
+        .build_with_auto_env(&server)
+        .await
+        .expect("build test Codex");
+    test.submit_turn_with_policies(
+        "report the enforced policy",
+        approval_policy,
+        SandboxPolicy::DangerFullAccess,
+    )
+    .await
+    .expect("turn completes");
+    std::fs::read_to_string(log)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zcode_warm_wire_enforces_approval_policy_before_send() {
+    if !node_available() {
+        return;
+    }
+    assert_eq!(
+        run_warm_mode_probe(
+            ModeAcknowledgement::Accept,
+            AskForApproval::OnRequest,
+            "yolo"
+        )
+        .await,
+        vec!["create:build", "setMode:build", "send"]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zcode_warm_wire_rejected_mode_falls_back_without_sending() {
+    if !node_available() {
+        return;
+    }
+    assert_eq!(
+        run_warm_mode_probe(
+            ModeAcknowledgement::Reject,
+            AskForApproval::OnRequest,
+            "yolo"
+        )
+        .await,
+        vec!["create:build", "setMode:build", "cold:build"]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zcode_warm_fallback_retains_stricter_environment_mode() {
+    if !node_available() {
+        return;
+    }
+    assert_eq!(
+        run_warm_mode_probe(ModeAcknowledgement::Reject, AskForApproval::Never, "build").await,
+        vec!["create:build", "setMode:build", "cold:build"]
     );
 }

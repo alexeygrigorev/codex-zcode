@@ -55,6 +55,7 @@ use crate::client::ZCODE_STDERR_TAIL_CAP;
 use crate::client::ZcodeRuntime;
 use crate::client::zcode_failure_message;
 use crate::client::zcode_stderr_tail;
+use crate::client_common::ZcodeInnerMode;
 use crate::zcode_process;
 use crate::zcode_warm_events::bridge_tool_activity_from_notification;
 use crate::zcode_warm_permissions::PermissionRequest;
@@ -66,8 +67,8 @@ use crate::zcode_warm_resume;
 const WARM_BRIDGE_ENV_VAR: &str = "ZCODE_WARM";
 
 /// Env var selecting the warm session mode (`ZCODE_WARM_MODE`): `yolo` (the
-/// default, ungated core-side execution) or `build` (the core asks before
-/// risky actions; the bridge denies).
+/// default when the turn allows it) or `build` (the core asks before risky
+/// actions). This override can strengthen, but never weaken, the turn policy.
 const WARM_MODE_ENV_VAR: &str = "ZCODE_WARM_MODE";
 
 /// How the warm session balances gating against tool access.
@@ -75,8 +76,7 @@ const WARM_MODE_ENV_VAR: &str = "ZCODE_WARM_MODE";
 /// `Yolo` is today's behavior: the core executes everything itself and
 /// permission callbacks never fire. `Build` creates the session in `build`
 /// mode so the core requests permission through `interaction/*` callbacks;
-/// the bridge answers every request with a denial and logs it, since there
-/// is no interactive approver on the Codex side of the wire.
+/// the bridge applies its configured permission policy and logs the answer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum WarmMode {
     Yolo,
@@ -93,18 +93,18 @@ impl WarmMode {
     }
 }
 
-/// Resolves [`WarmMode`] from the `ZCODE_WARM_MODE` value; unknown values
-/// stay on the default ungated mode.
-pub(crate) fn warm_mode_from_value(value: Option<&str>) -> WarmMode {
-    match value.map(str::trim) {
-        Some("build") => WarmMode::Build,
-        _ => WarmMode::Yolo,
+/// Resolves the warm mode without allowing an environment override to
+/// weaken the approval policy selected for this turn.
+pub(crate) fn warm_mode_from_value(value: Option<&str>, inner_mode: ZcodeInnerMode) -> WarmMode {
+    match (inner_mode, value.map(str::trim)) {
+        (ZcodeInnerMode::Build, _) | (ZcodeInnerMode::Yolo, Some("build")) => WarmMode::Build,
+        (ZcodeInnerMode::Yolo, _) => WarmMode::Yolo,
     }
 }
 
 /// [`warm_mode_from_value`] against the process environment.
-pub(crate) fn warm_mode_from_env() -> WarmMode {
-    warm_mode_from_value(std::env::var(WARM_MODE_ENV_VAR).ok().as_deref())
+pub(crate) fn warm_mode_from_env(inner_mode: ZcodeInnerMode) -> WarmMode {
+    warm_mode_from_value(std::env::var(WARM_MODE_ENV_VAR).ok().as_deref(), inner_mode)
 }
 
 /// Consecutive startup/protocol failures tolerated before the warm bridge is
@@ -607,7 +607,7 @@ impl ZcodeWarmBridge {
                     },
                 })
             }
-            "interaction/requestPermission" if self.mode == WarmMode::Build => {
+            "interaction/requestPermission" => {
                 let request = PermissionRequest::from_params(params);
                 let answer = self.permission_policy.resolve(&request);
                 // The core re-sends a pending interaction every second with a
@@ -644,7 +644,7 @@ impl ZcodeWarmBridge {
                     },
                 })
             }
-            "interaction/requestUserInput" if self.mode == WarmMode::Build => {
+            "interaction/requestUserInput" => {
                 let prompt = params
                     .get("prompt")
                     .and_then(serde_json::Value::as_str)
@@ -793,6 +793,26 @@ impl ZcodeWarmBridge {
             })
             .await
             .cloned()
+    }
+
+    /// Reasserts this turn's policy after session creation, resume, or reuse.
+    /// A failed acknowledgement must prevent submission of the turn.
+    pub(crate) async fn prepare_session(
+        &self,
+        workspace_path: &str,
+        mode: WarmMode,
+    ) -> Result<String, String> {
+        let session_id = self.ensure_session(workspace_path).await?;
+        self.request(
+            "session/setMode",
+            serde_json::json!({
+                "sessionId": session_id,
+                "mode": mode.wire_session_mode(),
+            }),
+        )
+        .await
+        .map_err(|error| format!("could not enforce warm session permission mode: {error}"))?;
+        Ok(session_id)
     }
 
     /// Sends one user turn and returns the mapped Codex event stream.

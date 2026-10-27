@@ -11,6 +11,7 @@ use super::ZcodeWarmBridge;
 use super::warm_bridge_enabled_from_value;
 use super::warm_mode_from_value;
 use crate::client::ZcodeRuntime;
+use crate::client_common::ZcodeInnerMode;
 use crate::zcode_warm_permissions::PermissionRequest;
 use crate::zcode_warm_permissions::RiskTier;
 use crate::zcode_warm_permissions::WarmPermissionPolicy;
@@ -67,6 +68,8 @@ pub(crate) struct FakeServerOptions {
     pub(crate) turn_result_type: &'static str,
     /// Reject `session/resume` so the bridge's create fallback is exercised.
     pub(crate) fails_resume: bool,
+    /// Reject mode enforcement to verify a turn is never submitted.
+    pub(crate) fails_set_mode: bool,
     /// Answer `session/send`, emit one delta, then exit, so the collector is
     /// left waiting when the child's stdout closes.
     pub(crate) exits_mid_turn: bool,
@@ -112,6 +115,7 @@ impl Default for FakeServerOptions {
             emits_tool_events: false,
             turn_result_type: "success",
             fails_resume: false,
+            fails_set_mode: false,
             exits_mid_turn: false,
             empty_session_list: false,
             fails_v4_command: false,
@@ -225,6 +229,14 @@ function handle(msg) {
         write({ id: msg.id, error: { code: -32000, message: "session not found: " + msg.params.sessionId } });
       } else {
         respond({ sessionId: msg.params.sessionId, session: { sessionId: msg.params.sessionId }, messages: [], settings: {} });
+      }
+      break;
+    case "session/setMode":
+      stats("enforced-mode:" + msg.params.mode);
+      if (FAIL_SET_MODE) {
+        write({ id: msg.id, error: { code: -32000, message: "mode rejected" } });
+      } else {
+        respond({});
       }
       break;
     case "session/create":
@@ -341,6 +353,7 @@ const PROBE_RUNTIME = %PROBE_RUNTIME%;
 const PERM_RISK = "%PERM_RISK%";
 const REANNOUNCE_PROBE = %REANNOUNCE_PROBE%;
 const TOOL_EVENTS = %TOOL_EVENTS%;
+const FAIL_SET_MODE = %FAIL_SET_MODE%;
 const FAIL_RESUME = %FAIL_RESUME%;
 const EXIT_MID_TURN = %EXIT_MID_TURN%;
 const EMPTY_LIST = %EMPTY_LIST%;
@@ -435,6 +448,14 @@ process.stdin.on("data", (chunk) => {
 });
 "#;
     let script = script
+        .replace(
+            "%FAIL_SET_MODE%",
+            if options.fails_set_mode {
+                "true"
+            } else {
+                "false"
+            },
+        )
         .replace(
             "%REJECT_DRIFT%",
             if options.rejects_unknown_create_keys {
@@ -924,11 +945,26 @@ async fn compat_retry_does_not_retry_unrelated_rejections() {
 
 #[test]
 fn warm_mode_value_parsing() {
-    assert_eq!(warm_mode_from_value(None), WarmMode::Yolo);
-    assert_eq!(warm_mode_from_value(Some("yolo")), WarmMode::Yolo);
-    assert_eq!(warm_mode_from_value(Some("garbage")), WarmMode::Yolo);
-    assert_eq!(warm_mode_from_value(Some("build")), WarmMode::Build);
-    assert_eq!(warm_mode_from_value(Some(" build ")), WarmMode::Build);
+    assert_eq!(
+        warm_mode_from_value(None, ZcodeInnerMode::Yolo),
+        WarmMode::Yolo
+    );
+    assert_eq!(
+        warm_mode_from_value(Some("yolo"), ZcodeInnerMode::Yolo),
+        WarmMode::Yolo
+    );
+    assert_eq!(
+        warm_mode_from_value(Some("garbage"), ZcodeInnerMode::Yolo),
+        WarmMode::Yolo
+    );
+    assert_eq!(
+        warm_mode_from_value(Some("build"), ZcodeInnerMode::Yolo),
+        WarmMode::Build
+    );
+    assert_eq!(
+        warm_mode_from_value(Some(" build "), ZcodeInnerMode::Yolo),
+        WarmMode::Build
+    );
 }
 
 #[tokio::test]
@@ -1077,7 +1113,7 @@ async fn reannounced_permission_request_is_answered_each_time() {
 }
 
 #[tokio::test]
-async fn yolo_bridge_rejects_interaction_callbacks() {
+async fn initially_yolo_bridge_can_answer_gated_interaction_callbacks() {
     let fixture = write_fake_server_with(FakeServerOptions {
         probes_interactions: true,
         ..FakeServerOptions::default()
@@ -1099,11 +1135,13 @@ async fn yolo_bridge_rejects_interaction_callbacks() {
     let lines: Vec<&str> = stats_text.lines().collect();
     assert!(lines.contains(&"mode:yolo"), "stats: {stats_text}");
     assert!(
-        lines.contains(&"permission:rejected:-32601"),
+        lines.contains(
+            &permission_stats_line(WarmPermissionPolicy::DenyAll, RiskTier::Medium).as_str()
+        ),
         "stats: {stats_text}"
     );
     assert!(
-        lines.contains(&"userinput:rejected:-32601"),
+        lines.contains(&"userinput:{\"action\":\"decline\",\"reason\":\"Declined by the Codex host: the warm ZCode bridge has no interactive approver\"}"),
         "stats: {stats_text}"
     );
     bridge.kill("test end");
@@ -1541,6 +1579,96 @@ async fn v4_send_failure_falls_back_to_legacy_send() {
     assert!(
         lines.iter().any(|line| line.starts_with("send:fallback")),
         "the rejected v4 command must fall back to session/send: {stats_text}"
+    );
+    bridge.kill("test end");
+}
+
+#[test]
+fn warm_mode_cannot_weaken_turn_approval_policy() {
+    for value in [None, Some("yolo"), Some("build"), Some("garbage")] {
+        assert_eq!(
+            warm_mode_from_value(value, ZcodeInnerMode::Build),
+            WarmMode::Build
+        );
+    }
+}
+
+#[tokio::test]
+async fn warm_reused_and_resumed_sessions_reassert_turn_mode() {
+    for seed in [
+        SessionSeed::Fresh,
+        SessionSeed::Predecessor {
+            session_id: "sess_previous".to_string(),
+            last_event_seq: 0,
+        },
+    ] {
+        let fixture = write_fake_server();
+        let bridge = ZcodeWarmBridge::spawn(
+            &test_runtime(&fixture),
+            "/tmp",
+            WarmMode::Yolo,
+            WarmPermissionPolicy::DenyAll,
+            seed,
+        )
+        .expect("spawn fake app-server");
+        for (mode, content) in [(WarmMode::Yolo, "first"), (WarmMode::Build, "second")] {
+            let session_id = bridge
+                .prepare_session("/tmp", mode)
+                .await
+                .expect("mode acknowledged");
+            let stream = bridge
+                .turn(&session_id, content, TurnInputChannel::LegacySend)
+                .expect("turn starts");
+            let mut rx = stream.rx_event;
+            loop {
+                if matches!(next_event(&mut rx).await, ResponseEvent::Completed { .. }) {
+                    break;
+                }
+            }
+        }
+        let stats = std::fs::read_to_string(stats_path(&fixture)).expect("read fake stats");
+        assert_eq!(
+            stats
+                .lines()
+                .filter(|line| line.starts_with("enforced-mode:") || line.starts_with("send:"))
+                .collect::<Vec<_>>(),
+            vec![
+                "enforced-mode:yolo",
+                "send:first",
+                "enforced-mode:build",
+                "send:second"
+            ]
+        );
+        bridge.kill("test end");
+    }
+}
+
+#[tokio::test]
+async fn warm_rejected_mode_does_not_prepare_a_turn() {
+    let fixture = write_fake_server_with(FakeServerOptions {
+        fails_set_mode: true,
+        ..Default::default()
+    });
+    let bridge = ZcodeWarmBridge::spawn(
+        &test_runtime(&fixture),
+        "/tmp",
+        WarmMode::Yolo,
+        WarmPermissionPolicy::DenyAll,
+        SessionSeed::Fresh,
+    )
+    .expect("spawn fake app-server");
+    let error = bridge
+        .prepare_session("/tmp", WarmMode::Build)
+        .await
+        .expect_err("mode rejection must fail preparation");
+    assert!(error.contains("mode rejected"), "{error}");
+    let stats = std::fs::read_to_string(stats_path(&fixture)).expect("read fake stats");
+    assert_eq!(
+        stats
+            .lines()
+            .filter(|line| line.starts_with("enforced-mode:") || line.starts_with("send:"))
+            .collect::<Vec<_>>(),
+        vec!["enforced-mode:build"]
     );
     bridge.kill("test end");
 }

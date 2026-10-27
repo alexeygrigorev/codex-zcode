@@ -3208,7 +3208,7 @@ impl ModelClientSession {
             match zcode_warm::ZcodeWarmBridge::spawn(
                 runtime,
                 &workspace_path,
-                zcode_warm::warm_mode_from_env(),
+                zcode_warm::warm_mode_from_env(prompt.zcode_inner_mode),
                 zcode_warm_permissions::WarmPermissionPolicy::from_env(),
                 resume_seed,
             ) {
@@ -3230,7 +3230,12 @@ impl ModelClientSession {
             }
         };
         let turned = async {
-            let session_id = bridge.ensure_session(&workspace_path).await?;
+            let session_id = bridge
+                .prepare_session(
+                    &workspace_path,
+                    zcode_warm::warm_mode_from_env(prompt.zcode_inner_mode),
+                )
+                .await?;
             let content = zcode_warm_turn_content(&prompt.input);
             let channel = crate::zcode_warm_v4_send::channel_from_env();
             // A goal-active prompt can hand its turn to the core's own goal
@@ -3408,8 +3413,13 @@ impl ModelClientSession {
         // Captured before the prompt text moves into the spawn task; feeds
         // the token-usage fallback estimate for the Completed event.
         let prompt_bytes = user_text.len();
-        // Inner `--mode` follows Codex `/permissions` (Never → yolo).
-        let inner_mode = prompt.zcode_inner_mode.as_cli_arg();
+        // A cold fallback must retain any stricter warm-mode override,
+        // including after the warm failure latch has disabled new spawns.
+        let inner_mode = if zcode_warm::warm_bridge_enabled() {
+            zcode_warm::warm_mode_from_env(prompt.zcode_inner_mode).wire_session_mode()
+        } else {
+            prompt.zcode_inner_mode.as_cli_arg()
+        };
 
         // A goal-status marker is translated by the previous invocation into
         // a synthesized `update_goal` call; the follow-up request that
