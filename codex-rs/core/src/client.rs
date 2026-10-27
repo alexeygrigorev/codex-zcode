@@ -893,14 +893,14 @@ fn zcodex_task_name_from_description(description: &str) -> String {
 
 /// Registers `model_slug` in the user's real ZCode config and selects it.
 ///
-/// The ZCode CLI resolves its config as `$HOME/.zcode/cli/config.json`
+/// The ZCode CLI resolves its config under Node's home as `.zcode/cli/config.json`
 /// (no flag or environment variable relocates it), and running under the
 /// standard home keeps `~/.gitconfig` and `~/.config/gh` visible to the
 /// tools ZCode launches. The model override is therefore merged into the
 /// real config instead of an isolated home copy.
 fn prepare_zcode_config(model_slug: &str) -> std::io::Result<()> {
-    let Some(home) = dirs::home_dir() else {
-        return Err(std::io::Error::other("HOME is not set"));
+    let Some(home) = crate::zcode_home::home_dir() else {
+        return Err(std::io::Error::other("ZCode home directory is unavailable"));
     };
     let config_path = home.join(".zcode").join("cli").join("config.json");
     let original: serde_json::Value =

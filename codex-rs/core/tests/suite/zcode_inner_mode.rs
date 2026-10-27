@@ -131,6 +131,17 @@ process.stdin.on("end", () => record("eof:" + process.pid));
         .replace("%REJECT_MODE%", if matches!(outcome, Outcome::RejectMode) { "true" } else { "false" });
     std::fs::write(&cjs, source).unwrap();
     let fake_home = TempDir::new().unwrap();
+    let other_home = TempDir::new().unwrap();
+    let fixture = serde_json::json!({
+        "model": "zai/fixture-before",
+        "provider": {"zai": {"models": {"fixture-before": {"name": "preserved"}}}},
+        "fixtureUnrelated": {"preserved": true}
+    });
+    for home in [fake_home.path(), other_home.path()] {
+        let directory = home.join(".zcode/cli");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("config.json"), fixture.to_string()).unwrap();
+    }
     let _guards = (
         EnvVarGuard::set("ZCODE_CJS", cjs.as_os_str()),
         EnvVarGuard::set(
@@ -141,7 +152,16 @@ process.stdin.on("end", () => record("eof:" + process.pid));
             }),
         ),
         EnvVarGuard::set("ZCODE_WARM_MODE", OsStr::new("yolo")),
-        EnvVarGuard::set("HOME", fake_home.path().as_os_str()),
+        EnvVarGuard::set(
+            "HOME",
+            if cfg!(windows) {
+                other_home.path()
+            } else {
+                fake_home.path()
+            }
+            .as_os_str(),
+        ),
+        EnvVarGuard::set("USERPROFILE", fake_home.path().as_os_str()),
     );
     let _permission_guard = match outcome {
         Outcome::DenyClient => EnvVarGuard::set("ZCODE_WARM_PERMISSIONS", OsStr::new("deny")),
@@ -153,8 +173,10 @@ process.stdin.on("end", () => record("eof:" + process.pid));
         }
     };
     let server = start_mock_server().await;
-    let mut builder =
-        test_codex().with_config(|config| config.model_provider.wire_api = WireApi::Zcode);
+    let mut builder = test_codex().with_config(|config| {
+        config.model_provider.wire_api = WireApi::Zcode;
+        config.model = Some("glm-5.3-flash".to_string());
+    });
     let test = builder
         .build_with_auto_env(&server)
         .await
@@ -201,6 +223,18 @@ process.stdin.on("end", () => record("eof:" + process.pid));
             "written by inner Write"
         );
     }
+    let mut expected = fixture.clone();
+    if approval == AskForApproval::Never && profile == PermissionProfile::Disabled {
+        expected["model"] = serde_json::json!("zai/glm-5.3-flash");
+        expected["provider"]["zai"]["models"]["glm-5.3-flash"] =
+            serde_json::json!({"name": "glm-5.3-flash"});
+    }
+    let read_fixture = |home: &std::path::Path| -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(home.join(".zcode/cli/config.json")).unwrap())
+            .unwrap()
+    };
+    assert_eq!(read_fixture(fake_home.path()), expected);
+    assert_eq!(read_fixture(other_home.path()), fixture);
     (lines, effects)
 }
 
