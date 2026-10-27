@@ -3,7 +3,10 @@
 //! End-to-end execution contract: actual permission callbacks, single inner
 //! execution, fresh cold lifecycles, warm reuse, and no replay after failure.
 
+use codex_core::StartThreadOptions;
 use codex_model_provider_info::WireApi;
+use codex_protocol::dynamic_tools::DynamicToolFunctionSpec;
+use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 use core_test_support::responses::start_mock_server;
@@ -52,6 +55,7 @@ enum Lifecycle {
 #[derive(Clone, Copy)]
 enum Outcome {
     Complete,
+    GoalContinuation,
     Disconnect,
     RejectMode,
     DenyClient,
@@ -109,6 +113,7 @@ require("readline").createInterface({ input: process.stdin }).on("line", (line) 
     return;
   }
   const reply = (result) => emit({ id: message.id, result });
+  if (message.method === "session/goal") record("goal");
   switch (message.method) {
     case "session/create": record("create:" + message.params.mode); reply({ session: { sessionId }, protocol: { version: 1 } }); break;
     case "session/subscribe": reply({ eventSeq: 0, events: [] }); break;
@@ -117,7 +122,7 @@ require("readline").createInterface({ input: process.stdin }).on("line", (line) 
       if (%REJECT_MODE%) emit({ id: message.id, error: { code: -32000, message: "mode rejected" } });
       else reply({});
       break;
-    case "session/send": record("send"); turn++; reply({ accepted: true }); permission("Bash"); break;
+    case "session/send": record("send"); record("content:" + JSON.stringify(message.params.content)); turn++; reply({ accepted: true }); permission("Bash"); break;
     case "session/close": record("close:" + process.pid); reply({ closed: true }); break;
     case "session/stop": reply({}); break;
     default: emit({ id: message.id, error: { code: -32601, message: "unsupported " + message.method } });
@@ -152,6 +157,7 @@ process.stdin.on("end", () => record("eof:" + process.pid));
             }),
         ),
         EnvVarGuard::set("ZCODE_WARM_MODE", OsStr::new("yolo")),
+        EnvVarGuard::set("ZCODE_WARM_GOAL", OsStr::new("1")),
         EnvVarGuard::set(
             "HOME",
             if cfg!(windows) {
@@ -168,33 +174,58 @@ process.stdin.on("end", () => record("eof:" + process.pid));
         Outcome::UnknownPolicy => {
             EnvVarGuard::set("ZCODE_WARM_PERMISSIONS", OsStr::new("unknown-policy"))
         }
-        Outcome::Complete | Outcome::Disconnect | Outcome::RejectMode => {
-            EnvVarGuard::unset("ZCODE_WARM_PERMISSIONS")
-        }
+        Outcome::Complete
+        | Outcome::GoalContinuation
+        | Outcome::Disconnect
+        | Outcome::RejectMode => EnvVarGuard::unset("ZCODE_WARM_PERMISSIONS"),
     };
     let server = start_mock_server().await;
     let mut builder = test_codex().with_config(|config| {
         config.model_provider.wire_api = WireApi::Zcode;
         config.model = Some("glm-5.3-flash".to_string());
     });
-    let test = builder
+    let mut test = builder
         .build_with_auto_env(&server)
         .await
         .expect("build test Codex");
-    for _ in 0..if matches!(outcome, Outcome::Complete) {
+    if matches!(outcome, Outcome::GoalContinuation) {
+        let started = test
+            .thread_manager
+            .start_thread(StartThreadOptions {
+                dynamic_tools: vec![DynamicToolSpec::Function(DynamicToolFunctionSpec {
+                    name: "update_goal".to_string(),
+                    description: "Report goal status.".to_string(),
+                    input_schema: serde_json::json!({"type": "object", "properties": {}}),
+                    defer_loading: false,
+                })],
+                ..StartThreadOptions::new(test.config.clone())
+            })
+            .await
+            .expect("start thread with active goal tool");
+        test.codex = started.thread;
+    }
+    for turn in 0..if matches!(outcome, Outcome::Complete | Outcome::GoalContinuation) {
         2
     } else {
         1
     } {
-        test.submit_turn_with_approval_and_permission_profile(
-            "execute the probe",
-            approval,
-            profile.clone(),
-        )
-        .await
-        .expect("outer turn completes");
-        if matches!((lifecycle, outcome), (Lifecycle::Cold, Outcome::Complete))
-            && approval == AskForApproval::Never
+        let message = match (outcome, turn) {
+            (Outcome::GoalContinuation, 0) => "Prior user history: migrate records once.",
+            (Outcome::GoalContinuation, _) => {
+                "New steering: verify the existing receipt; do not migrate again.\n<objective>Finish migration safely</objective>"
+            }
+            _ => "execute the probe",
+        };
+        test.submit_turn_with_approval_and_permission_profile(message, approval, profile.clone())
+            .await
+            .expect("outer turn completes");
+        if matches!(
+            (lifecycle, outcome),
+            (
+                Lifecycle::Cold,
+                Outcome::Complete | Outcome::GoalContinuation
+            )
+        ) && approval == AskForApproval::Never
             && profile == PermissionProfile::Disabled
         {
             let lines = std::fs::read_to_string(&log).unwrap();
@@ -214,7 +245,7 @@ process.stdin.on("end", () => record("eof:" + process.pid));
         .map(str::to_string)
         .collect();
     let effects = std::fs::read_to_string(&effect).unwrap_or_default();
-    if matches!(outcome, Outcome::Complete)
+    if matches!(outcome, Outcome::Complete | Outcome::GoalContinuation)
         && approval == AskForApproval::Never
         && profile == PermissionProfile::Disabled
     {
@@ -373,4 +404,43 @@ async fn zcode_client_preserves_explicit_permission_denials() {
             );
         }
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zcode_cold_goal_continuation_sends_history_and_new_steering() {
+    core_test_support::skip_if_remote!("ZCode inner execution is explicitly host-local");
+    let (log, effects) = probe(
+        Lifecycle::Cold,
+        Outcome::GoalContinuation,
+        AskForApproval::Never,
+        PermissionProfile::Disabled,
+    )
+    .await;
+    let contents = log
+        .iter()
+        .filter_map(|line| line.strip_prefix("content:"))
+        .map(|content| serde_json::from_str::<String>(content).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        (
+            contents.len(),
+            log.iter().filter(|line| *line == "send").count(),
+            log.iter().filter(|line| *line == "goal").count()
+        ),
+        (2, 2, 0)
+    );
+    for text in [
+        "Prior user history: migrate records once.",
+        "actual client allowed Bash and Write",
+        "New steering: verify the existing receipt; do not migrate again.",
+        "<objective>Finish migration safely</objective>",
+        "[Goal status protocol]",
+    ] {
+        assert!(
+            contents[1].contains(text),
+            "missing {text:?} in {}",
+            contents[1]
+        );
+    }
+    assert_eq!(effects, "inner\ninner\n");
 }

@@ -14,8 +14,9 @@
 //!
 //! Opt out with `ZCODE_WARM_GOAL=0` (on by default since the live validation,
 //! issue #50). The marker protocol remains the
-//! spawn-per-turn mechanism, and any mirror setup failure falls back to a
-//! plain warm turn. A verified completion pauses the core goal and the
+//! spawn-per-turn mechanism. A mirror setup failure ends the request without
+//! replaying it as a plain turn, because goal setup may already have started
+//! execution. A verified completion pauses the core goal and the
 //! selector refuses to re-mirror a continuation template already answered by
 //! a synthesized completion, so the agent loop's follow-up rounds cannot
 //! restart the settled core goal loop (issue #52). A capped cycle reports the
