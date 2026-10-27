@@ -120,19 +120,14 @@ pub(crate) async fn stream_cold(
     }
     let goal_already_reported = super::zcode_goal_already_reported_in_current_turn(&prompt.input);
     content.push_str(super::ZCODE_REPLY_BUDGET_NOTE);
-    let objective = crate::zcode_warm_goal::mirrored_goal_objective(&prompt.tools, &prompt.input);
     let (tx, rx_event) = mpsc::channel(/*buffer*/ 64);
     tokio::spawn(async move {
         let prepared = tokio::select! {
             _ = tx.closed() => None,
             prepared = async {
             let session_id = bridge.prepare_session(&workspace, WarmMode::Build).await?;
-            match objective {
-                Some(objective) => {
-                    crate::zcode_warm_goal::turn_mirrored(&bridge, &session_id, &objective).await
-                }
-                None => bridge.turn(&session_id, &content, TurnInputChannel::LegacySend),
-            }
+            // A fresh cold session has no server-side history for goal mirroring.
+            bridge.turn(&session_id, &content, TurnInputChannel::LegacySend)
             } => Some(prepared),
         };
         let mut goal_status = None;

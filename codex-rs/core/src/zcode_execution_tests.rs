@@ -95,7 +95,7 @@ async fn dropping_warm_slot_holds_checkout_until_child_is_reaped() {
 }
 
 #[tokio::test]
-async fn cold_first_goal_turn_translates_completion_after_retirement() {
+async fn cold_goal_continuation_preserves_history_and_steering_before_reporting_completion() {
     use codex_api::ResponseEvent;
     use codex_protocol::models::ResponseItem;
     use codex_tools::JsonSchema;
@@ -110,11 +110,47 @@ async fn cold_first_goal_turn_translates_completion_after_retirement() {
         &fixture,
         source.replace(
             "function runTurn(sessionId, content) {",
-            r#"function runTurn(sessionId, content) { content = "done\n[GOAL:COMPLETE]";"#,
+            r#"function runTurn(sessionId, content) {
+                fs.writeFileSync(process.argv[1] + ".received", JSON.stringify(content));
+                content = "done\n[GOAL:COMPLETE]";"#,
         ),
     )
     .unwrap();
+    let user_message = |text: &str| ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![codex_protocol::models::ContentItem::InputText {
+            text: text.to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let continuation = "New steering: do not repeat the migration; verify the receipt only.\n<objective>Finish the migration safely</objective>";
     let prompt = crate::Prompt {
+        input: vec![
+            user_message("Migrate the records once."),
+            ResponseItem::FunctionCall {
+                id: None,
+                name: "exec_command".to_string(),
+                namespace: None,
+                arguments: r#"{"cmd":"migrate-once"}"#.to_string(),
+                encrypted_function_args: None,
+                call_id: "migration-effect".to_string(),
+                internal_chat_message_metadata_passthrough: None,
+            },
+            ResponseItem::FunctionCallOutput {
+                id: None,
+                call_id: Some("migration-effect".to_string()),
+                name: None,
+                namespace: None,
+                output: codex_protocol::models::FunctionCallOutputPayload::from_text(
+                    "Migration committed; receipt 731.".to_string(),
+                ),
+                internal_chat_message_metadata_passthrough: None,
+            },
+            crate::zcode_warm::assistant_message("Migration already committed.".to_string()),
+            user_message(continuation),
+        ],
         tools: vec![ToolSpec::Function(ResponsesApiTool {
             name: "update_goal".to_string(),
             description: String::new(),
@@ -165,7 +201,29 @@ async fn cold_first_goal_turn_translates_completion_after_retirement() {
         (name.as_str(), arguments.as_str()),
         ("update_goal", r#"{"status":"complete"}"#)
     );
+    let received_path = std::path::PathBuf::from(format!("{}.received", fixture.display()));
+    let received: String =
+        serde_json::from_str(&std::fs::read_to_string(&received_path).unwrap()).unwrap();
+    std::fs::remove_file(received_path).unwrap();
+    let expected_history = format!(
+        "user: Migrate the records once.\n[tool call exec_command] {{\"cmd\":\"migrate-once\"}}\n[tool result for migration-effect] Migration committed; receipt 731.\nassistant: Migration already committed.\nuser: {continuation}\n"
+    );
+    assert_eq!(
+        received,
+        format!(
+            "{expected_history}\n{}{}",
+            super::super::zcode_goal_status_protocol(&prompt.tools).unwrap(),
+            super::super::ZCODE_REPLY_BUDGET_NOTE,
+        ),
+    );
     let stats = std::fs::read_to_string(crate::zcode_warm::tests::stats_path(&fixture)).unwrap();
+    assert_eq!(
+        stats
+            .lines()
+            .filter(|line| line.starts_with("send:"))
+            .count(),
+        1
+    );
     assert_eq!(stats.lines().last(), Some("close"));
 }
 
