@@ -41,8 +41,8 @@ pub struct Prompt {
 
     pub(crate) cyber_access_program: Option<codex_protocol::turn_input::CyberAccessProgram>,
 
-    /// Permission mode for the ZCode cold spawn (`--mode`). Ignored on other wires.
-    pub(crate) zcode_inner_mode: ZcodeInnerMode,
+    /// Captured execution contract for ZCode's host-local inner executor.
+    pub(crate) zcode_execution: crate::client::zcode_execution::ZcodeExecutionPolicy,
 }
 
 impl Default for Prompt {
@@ -55,7 +55,7 @@ impl Default for Prompt {
             output_schema: None,
             output_schema_strict: true,
             cyber_access_program: None,
-            zcode_inner_mode: ZcodeInnerMode::default(),
+            zcode_execution: Default::default(),
         }
     }
 }

@@ -25,6 +25,9 @@
 //! WebSocket prewarm is treated as the first websocket connection attempt for a turn. If it
 //! fails, normal stream retry/fallback logic handles recovery on the same turn.
 
+#[path = "zcode_execution.rs"]
+pub(crate) mod zcode_execution;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -3025,6 +3028,23 @@ impl ModelClientSession {
             }
             WireApi::Zcode => {
                 let inference_trace_attempt = inference_trace.start_attempt();
+                if !zcode_only_goal_bookkeeping(&prompt.input)
+                    && zcode_process::side_request_reply(&zcode_flatten_transcript(&prompt.input))
+                        .is_none()
+                    && let Err(error) = prompt.zcode_execution.admitted_workspace()
+                {
+                    let previous = self
+                        .client
+                        .state
+                        .zcode_warm
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take();
+                    if let Some(ZcodeWarmSlot::Ready(entry)) = previous {
+                        let _ = entry.bridge.retire().await;
+                    }
+                    return Err(CodexErr::InvalidRequest(error));
+                }
                 let runtime = ZcodeRuntime::from_env(&model_info.slug);
                 // Goal bookkeeping turns exist purely to record a status
                 // change; the legacy path already ends them without
@@ -3208,8 +3228,12 @@ impl ModelClientSession {
             match zcode_warm::ZcodeWarmBridge::spawn(
                 runtime,
                 &workspace_path,
-                zcode_warm::warm_mode_from_env(prompt.zcode_inner_mode),
-                zcode_warm_permissions::WarmPermissionPolicy::from_env(),
+                zcode_warm::warm_mode_from_env(
+                    crate::client_common::ZcodeInnerMode::from_approval_policy(
+                        prompt.zcode_execution.approval_policy,
+                    ),
+                ),
+                zcode_warm_permissions::WarmPermissionPolicy::for_unrestricted_execution(),
                 resume_seed,
             ) {
                 Ok(bridge) => {
@@ -3233,7 +3257,11 @@ impl ModelClientSession {
             let session_id = bridge
                 .prepare_session(
                     &workspace_path,
-                    zcode_warm::warm_mode_from_env(prompt.zcode_inner_mode),
+                    zcode_warm::warm_mode_from_env(
+                        crate::client_common::ZcodeInnerMode::from_approval_policy(
+                            prompt.zcode_execution.approval_policy,
+                        ),
+                    ),
                 )
                 .await?;
             let content = zcode_warm_turn_content(&prompt.input);
@@ -3297,7 +3325,7 @@ impl ModelClientSession {
                 // stays cached so its replacement still resumes the session
                 // (issue #42). If another call already replaced this entry,
                 // its checkout belongs to the replacement and stays alone.
-                bridge.kill("turn failed; falling back to spawn-per-turn");
+                let _ = bridge.retire().await;
                 let mut slot = state
                     .zcode_warm
                     .lock()
@@ -3416,9 +3444,17 @@ impl ModelClientSession {
         // A cold fallback must retain any stricter warm-mode override,
         // including after the warm failure latch has disabled new spawns.
         let inner_mode = if zcode_warm::warm_bridge_enabled() {
-            zcode_warm::warm_mode_from_env(prompt.zcode_inner_mode).wire_session_mode()
+            zcode_warm::warm_mode_from_env(
+                crate::client_common::ZcodeInnerMode::from_approval_policy(
+                    prompt.zcode_execution.approval_policy,
+                ),
+            )
+            .wire_session_mode()
         } else {
-            prompt.zcode_inner_mode.as_cli_arg()
+            crate::client_common::ZcodeInnerMode::from_approval_policy(
+                prompt.zcode_execution.approval_policy,
+            )
+            .as_cli_arg()
         };
 
         // A goal-status marker is translated by the previous invocation into

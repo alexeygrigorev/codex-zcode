@@ -124,3 +124,15 @@ fn request_log_stays_bounded_by_its_cap() {
     }
     assert_eq!(log.seen.len(), super::PERMISSION_REQUEST_LOG_CAP);
 }
+
+#[test]
+fn admitted_unrestricted_client_can_answer_high_risk_permission_requests() {
+    let answer = WarmPermissionPolicy::AllowUnrestricted.resolve(&request(RiskTier::High));
+    assert_eq!(
+        (answer.decision, answer.reason.as_str()),
+        (
+            "allow",
+            "Allowed by the captured unrestricted Codex execution policy"
+        ),
+    );
+}

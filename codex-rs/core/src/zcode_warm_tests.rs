@@ -231,6 +231,9 @@ function handle(msg) {
         respond({ sessionId: msg.params.sessionId, session: { sessionId: msg.params.sessionId }, messages: [], settings: {} });
       }
       break;
+    case "session/close":
+      respond({ closed: true });
+      break;
     case "session/setMode":
       stats("enforced-mode:" + msg.params.mode);
       if (FAIL_SET_MODE) {
@@ -1671,4 +1674,28 @@ async fn warm_rejected_mode_does_not_prepare_a_turn() {
         vec!["enforced-mode:build"]
     );
     bridge.kill("test end");
+}
+
+#[tokio::test]
+async fn warm_retirement_closes_session_and_reaps_process() {
+    let fixture = write_fake_server();
+    let bridge = ZcodeWarmBridge::spawn(
+        &test_runtime(&fixture),
+        "/tmp",
+        WarmMode::Build,
+        WarmPermissionPolicy::DenyAll,
+        SessionSeed::Fresh,
+    )
+    .expect("spawn fake app-server");
+    bridge
+        .prepare_session("/tmp", WarmMode::Build)
+        .await
+        .expect("prepare session");
+    bridge.retire().await.expect("natural retirement");
+    assert_eq!(
+        (bridge.is_dead(), bridge.child.lock().unwrap().is_none()),
+        (true, true),
+    );
+    let stats = std::fs::read_to_string(stats_path(&fixture)).expect("read protocol log");
+    assert_eq!(stats.lines().last(), Some("close"));
 }

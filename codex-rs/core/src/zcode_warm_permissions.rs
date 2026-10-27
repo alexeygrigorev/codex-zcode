@@ -81,6 +81,9 @@ pub(crate) enum WarmPermissionPolicy {
     /// high/critical (and anything with an unreadable tier) with a reason
     /// naming the policy.
     AllowSafe,
+    /// The captured outer contract explicitly permits unrestricted execution.
+    /// Only the admitted Never/Disabled path may select this policy.
+    AllowUnrestricted,
 }
 
 impl WarmPermissionPolicy {
@@ -98,11 +101,25 @@ impl WarmPermissionPolicy {
         Self::from_value(std::env::var(WARM_PERMISSIONS_ENV_VAR).ok().as_deref())
     }
 
+    /// Preserve an explicit restriction even when the outer execution contract
+    /// is unrestricted. Unknown explicit values remain fail-closed.
+    pub(crate) fn for_unrestricted_execution() -> Self {
+        if std::env::var_os(WARM_PERMISSIONS_ENV_VAR).is_some() {
+            Self::from_env()
+        } else {
+            Self::AllowUnrestricted
+        }
+    }
+
     /// Decides a permission request. The returned `decision` is the wire
     /// value ("allow" or "deny"); `reason` rides along on both — required on
     /// denials, informative on approvals.
     pub(crate) fn resolve(self, request: &PermissionRequest<'_>) -> PermissionAnswer {
         match self {
+            WarmPermissionPolicy::AllowUnrestricted => PermissionAnswer {
+                decision: "allow",
+                reason: "Allowed by the captured unrestricted Codex execution policy".to_string(),
+            },
             WarmPermissionPolicy::DenyAll => PermissionAnswer {
                 decision: "deny",
                 reason: DENY_ALL_REASON.to_string(),

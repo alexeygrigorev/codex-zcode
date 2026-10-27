@@ -219,11 +219,9 @@ async fn zcode_cold_wire_follows_codex_approval_policy() {
     }
 
     let probe = run_inner_mode_probe(AskForApproval::OnRequest).await;
-    assert!(
-        probe.argv_log.contains("\"--mode\",\"build\""),
-        "non-YOLO Codex approval must spawn `--mode build`\n\
-         stub spawn argv log:\n{}",
-        probe.argv_log
+    assert_eq!(
+        probe.argv_log, "",
+        "unsupported approval must fail before spawning"
     );
     assert_eq!(
         probe.probe_lines, 0,
@@ -322,12 +320,7 @@ async fn zcode_warm_wire_enforces_approval_policy_before_send() {
         return;
     }
     assert_eq!(
-        run_warm_mode_probe(
-            ModeAcknowledgement::Accept,
-            AskForApproval::OnRequest,
-            "yolo"
-        )
-        .await,
+        run_warm_mode_probe(ModeAcknowledgement::Accept, AskForApproval::Never, "build").await,
         vec!["create:build", "setMode:build", "send"]
     );
 }
@@ -338,12 +331,7 @@ async fn zcode_warm_wire_rejected_mode_falls_back_without_sending() {
         return;
     }
     assert_eq!(
-        run_warm_mode_probe(
-            ModeAcknowledgement::Reject,
-            AskForApproval::OnRequest,
-            "yolo"
-        )
-        .await,
+        run_warm_mode_probe(ModeAcknowledgement::Reject, AskForApproval::Never, "build").await,
         vec!["create:build", "setMode:build", "cold:build"]
     );
 }

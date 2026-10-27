@@ -233,8 +233,8 @@ pub(crate) struct ZcodeWarmBridge {
     /// Frames for the child's stdin. A dedicated writer task owns the pipe
     /// and is the only place that awaits on writes, so no mutex guard is
     /// ever held across an await point (workspace clippy denies that).
-    stdin: mpsc::UnboundedSender<String>,
-    child: StdMutex<Child>,
+    stdin: mpsc::UnboundedSender<Option<String>>,
+    child: StdMutex<Option<Child>>,
     /// Saved at spawn: the child leads its own process group, so this id
     /// stays valid for group kills even after the direct child exits.
     process_group_pid: u32,
@@ -338,12 +338,12 @@ impl ZcodeWarmBridge {
 
         let (events, _) = broadcast::channel(4096);
         let dead = Arc::new(AtomicBool::new(false));
-        let (stdin_tx, mut stdin_rx) = mpsc::unbounded_channel::<String>();
+        let (stdin_tx, mut stdin_rx) = mpsc::unbounded_channel::<Option<String>>();
         // The writer task owns the child's stdin for its whole lifetime;
         // losing the pipe only surfaces to senders on the next frame.
         tokio::spawn(async move {
             let mut stdin = stdin;
-            while let Some(line) = stdin_rx.recv().await {
+            while let Some(Some(line)) = stdin_rx.recv().await {
                 let write_error = match stdin.write_all(line.as_bytes()).await {
                     Err(e) => Some(e),
                     Ok(()) => stdin.flush().await.err(),
@@ -357,7 +357,7 @@ impl ZcodeWarmBridge {
         let bridge = Arc::new(Self {
             state: StdMutex::new(WarmState::default()),
             stdin: stdin_tx,
-            child: StdMutex::new(child),
+            child: StdMutex::new(Some(child)),
             process_group_pid,
             stderr_tail,
             events,
@@ -473,11 +473,61 @@ impl ZcodeWarmBridge {
         warn!("ZCode warm app-server killed: {reason}");
         self.fail_pending(reason);
         self.fail_collectors(reason);
-        if let Ok(mut child) = self.child.lock() {
+        if let Ok(mut child) = self.child.lock()
+            && let Some(child) = child.as_mut()
+        {
             let _ = child.start_kill();
         }
         codex_utils_pty::process_group::kill_process_group_by_pid(self.process_group_pid)
             .unwrap_or_else(|e| warn!("ZCode warm process group kill failed: {e}"));
+    }
+
+    /// Closes this session and reaps the process before its checkout is released.
+    /// A forced teardown is cleanup, never a successful natural retirement.
+    pub(crate) async fn retire(&self) -> Result<(), String> {
+        let grace = self.request_timeout;
+        let close = if let Some(session_id) = self.session_id.get() {
+            tokio::time::timeout(
+                grace,
+                self.request(
+                    "session/close",
+                    serde_json::json!({ "sessionId": session_id }),
+                ),
+            )
+            .await
+            .map_err(|_| "session close timed out".to_string())
+            .and_then(|result| result.map_err(|error| error.to_string()))
+            .and_then(|result| {
+                if result.get("closed").and_then(serde_json::Value::as_bool) != Some(true) {
+                    Err("session close was refused".to_string())
+                } else {
+                    Ok(())
+                }
+            })
+        } else {
+            Ok(())
+        };
+        let _ = self.stdin.send(None);
+        let child = self
+            .child
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let Some(mut child) = child else {
+            return close;
+        };
+        let exit = match tokio::time::timeout(grace, child.wait()).await {
+            Ok(Ok(status)) if status.success() => Ok(()),
+            Ok(Ok(status)) => Err(format!("ZCode process exited with {status}")),
+            Ok(Err(error)) => Err(format!("could not reap ZCode process: {error}")),
+            Err(_) => {
+                let _ = zcode_process::dispose_and_wait_once(&mut child).await;
+                Err("ZCode process required forced retirement".to_string())
+            }
+        };
+        self.dead.store(true, Ordering::Relaxed);
+        let _ = codex_utils_pty::process_group::kill_process_group_by_pid(self.process_group_pid);
+        close.and(exit)
     }
 
     fn fail_pending(&self, reason: &str) {
@@ -686,7 +736,7 @@ impl ZcodeWarmBridge {
             line.push('\n');
         }
         self.stdin
-            .send(line)
+            .send(Some(line))
             .map_err(|_| io::Error::other("ZCode warm app-server stdin is closed"))
     }
 
@@ -856,33 +906,39 @@ impl ZcodeWarmBridge {
             let mut started_output = false;
             let mut tool_names = HashMap::new();
             loop {
-                let notification =
-                    match tokio::time::timeout(collector_timeout, events.recv()).await {
-                        Ok(Ok(params)) => params,
-                        Ok(Err(broadcast::error::RecvError::Lagged(_skipped))) => continue,
-                        Ok(Err(broadcast::error::RecvError::Closed)) => {
-                            let _ = tx
-                                .send(Err(ApiError::Stream(
-                                    "ZCode warm app-server event stream closed".to_string(),
-                                )))
-                                .await;
-                            return;
+                let received = tokio::select! {
+                    _ = tx.closed() => {
+                        stop_turn(&collector_bridge, &collector_session).await;
+                        return;
+                    }
+                    received = tokio::time::timeout(collector_timeout, events.recv()) => received,
+                };
+                let notification = match received {
+                    Ok(Ok(params)) => params,
+                    Ok(Err(broadcast::error::RecvError::Lagged(_skipped))) => continue,
+                    Ok(Err(broadcast::error::RecvError::Closed)) => {
+                        let _ = tx
+                            .send(Err(ApiError::Stream(
+                                "ZCode warm app-server event stream closed".to_string(),
+                            )))
+                            .await;
+                        return;
+                    }
+                    Err(_elapsed) => {
+                        if let Some(bridge) = collector_bridge.upgrade() {
+                            bridge.register_failure();
+                            bridge.kill("turn events stalled");
                         }
-                        Err(_elapsed) => {
-                            if let Some(bridge) = collector_bridge.upgrade() {
-                                bridge.register_failure();
-                                bridge.kill("turn events stalled");
-                            }
-                            let _ = tx
-                                .send(Err(ApiError::Stream(
-                                    "ZCode warm turn stalled: no session events before the idle \
+                        let _ = tx
+                            .send(Err(ApiError::Stream(
+                                "ZCode warm turn stalled: no session events before the idle \
                                  window elapsed"
-                                        .to_string(),
-                                )))
-                                .await;
-                            return;
-                        }
-                    };
+                                    .to_string(),
+                            )))
+                            .await;
+                        return;
+                    }
+                };
                 if notification
                     .get("sessionId")
                     .and_then(serde_json::Value::as_str)
@@ -1021,7 +1077,9 @@ impl Drop for ZcodeWarmBridge {
         if self.dead.swap(true, Ordering::Relaxed) {
             return;
         }
-        if let Ok(mut child) = self.child.lock() {
+        if let Ok(mut child) = self.child.lock()
+            && let Some(child) = child.as_mut()
+        {
             let _ = child.start_kill();
         }
         codex_utils_pty::process_group::kill_process_group_by_pid(self.process_group_pid)
