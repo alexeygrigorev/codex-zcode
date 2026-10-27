@@ -1019,7 +1019,7 @@ struct ModelClientState {
 enum ZcodeWarmSlot {
     /// Another call is acquiring the checkout and spawning a child; other
     /// callers wait for this state to resolve instead of racing it.
-    Claiming,
+    Claiming(Arc<AtomicBool>),
     /// A child is cached on the thread. It owns the checkout session
     /// permit, so the checkout is reserved for as long as it lives.
     Ready(ZcodeWarmSlotEntry),
@@ -1064,7 +1064,7 @@ impl Drop for ZcodeWarmSlotEntry {
 impl std::fmt::Debug for ZcodeWarmSlot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ZcodeWarmSlot::Claiming => f.write_str("ZcodeWarmSlot::Claiming"),
+            ZcodeWarmSlot::Claiming(_) => f.write_str("ZcodeWarmSlot::Claiming"),
             ZcodeWarmSlot::Ready(entry) => {
                 f.debug_tuple("ZcodeWarmSlot::Ready").field(entry).finish()
             }
@@ -3068,7 +3068,9 @@ impl ModelClientSession {
                             let _ = entry.bridge.retire().await;
                             drop(entry.checkout.take());
                         }
-                        Some(ZcodeWarmSlot::Claiming) => {}
+                        Some(ZcodeWarmSlot::Claiming(cancelled)) => {
+                            cancelled.store(true, Ordering::Relaxed);
+                        }
                         None => {}
                     }
                     return Err(CodexErr::InvalidRequest(error));
@@ -3107,12 +3109,11 @@ impl ModelClientSession {
         }
     }
 
-    /// Streams the turn through the warm app-server child, falling back to
-    /// the spawn-per-turn bridge on any startup or protocol failure.
+    /// Streams the turn through the warm permission client. Failures are
+    /// returned without starting a second executor or replaying the turn.
     ///
     /// The child holds its checkout's session permit for its whole life
-    /// (the checkout cannot outlive it: replacement and fallback both kill
-    /// the child before touching the checkout again), so the warm path can
+    /// (replacement and shutdown reap the child before releasing it), so the warm path can
     /// never run a second ZCode process in the same tree.
     async fn stream_zcode_warm(
         state: &ModelClientState,
@@ -3146,9 +3147,8 @@ impl ModelClientSession {
                     }
                     // Another call is acquiring the checkout and spawning
                     // the child; wait for the claim to settle instead of
-                    // racing it to the checkout (its cold fallback would
-                    // block behind the fresh bridge's lifetime permit).
-                    Some(ZcodeWarmSlot::Claiming) => Decision::Wait,
+                    // racing it for the same checkout reservation.
+                    Some(ZcodeWarmSlot::Claiming(_)) => Decision::Wait,
                     _ => Decision::Claim,
                 }
             };
@@ -3169,7 +3169,7 @@ impl ModelClientSession {
             // — a fresh process after a zcodex restart — the persisted
             // per-thread record, if any, is adopted through `session/list`
             // + `session/resume`.
-            let (dead_predecessor, evicted) = {
+            let (dead_predecessor, mut evicted, cancelled) = {
                 let mut slot = state
                     .zcode_warm
                     .lock()
@@ -3181,7 +3181,7 @@ impl ModelClientSession {
                 // kill the first one's freshly spawned healthy child or
                 // queue behind its lifetime checkout permit.
                 match slot.as_ref() {
-                    Some(ZcodeWarmSlot::Claiming) => continue 'claim,
+                    Some(ZcodeWarmSlot::Claiming(_)) => continue 'claim,
                     Some(ZcodeWarmSlot::Ready(entry))
                         if !entry.bridge.is_dead()
                             && entry.workspace == workspace
@@ -3201,22 +3201,16 @@ impl ModelClientSession {
                     }
                     _ => None,
                 };
-                // Kill an abandoned child before claiming the checkout
-                // again: this entry's permit must drop before the new
-                // acquisition waits, or the replacement would queue behind
-                // its own predecessor forever.
-                if let Some(ZcodeWarmSlot::Ready(entry)) = slot.as_ref()
-                    && !entry.bridge.is_dead()
-                {
-                    entry.bridge.kill("replacing the warm app-server");
-                }
                 let evicted = slot.take();
-                *slot = Some(ZcodeWarmSlot::Claiming);
-                (dead_predecessor, evicted)
+                let cancelled = Arc::new(AtomicBool::new(/*v*/ false));
+                *slot = Some(ZcodeWarmSlot::Claiming(Arc::clone(&cancelled)));
+                (dead_predecessor, evicted, cancelled)
             };
-            // Dropping the evicted entry tears down its child and only then
-            // releases the checkout. Guards are not held across the wait
-            // below; the Claiming state keeps concurrent callers away.
+            // Keep the previous checkout reserved until its child has been reaped.
+            if let Some(ZcodeWarmSlot::Ready(entry)) = evicted.as_mut() {
+                let _ = entry.bridge.retire().await;
+                drop(entry.checkout.take());
+            }
             drop(evicted);
             let checkout = match zcode_process::acquire_zcode_session(
                 &workspace_path,
@@ -3226,10 +3220,14 @@ impl ModelClientSession {
             {
                 Ok(checkout) => checkout,
                 Err(e) => {
-                    *state
+                    let mut slot = state
                         .zcode_warm
                         .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if matches!(slot.as_ref(), Some(ZcodeWarmSlot::Claiming(owner)) if Arc::ptr_eq(owner, &cancelled))
+                    {
+                        *slot = None;
+                    }
                     state
                         .zcode_warm_spawn_failures
                         .fetch_add(1, Ordering::Relaxed);
@@ -3250,6 +3248,11 @@ impl ModelClientSession {
                 .zcode_warm
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if cancelled.load(Ordering::Relaxed)
+                || !matches!(slot.as_ref(), Some(ZcodeWarmSlot::Claiming(owner)) if Arc::ptr_eq(owner, &cancelled))
+            {
+                return Err("warm execution claim was cancelled".to_string());
+            }
             match zcode_warm::ZcodeWarmBridge::spawn(
                 runtime,
                 &workspace_path,
@@ -3284,8 +3287,7 @@ impl ModelClientSession {
             let channel = crate::zcode_warm_v4_send::channel_from_env();
             // A goal-active prompt can hand its turn to the core's own goal
             // loop (`session/goal` + the core's completion verifier, issue
-            // #40); anything the mirror cannot set up falls back to the plain
-            // warm prompt.
+            // #40). A failure must not submit a second ordinary turn.
             let stream =
                 match crate::zcode_warm_goal::mirrored_goal_objective(&prompt.tools, &prompt.input)
                 {
@@ -3321,9 +3323,8 @@ impl ModelClientSession {
             }
             Err(e) => {
                 bridge.register_failure();
-                // The dispatch falls back to the spawn-per-turn bridge for
-                // this turn, so the warm child must not keep the checkout:
-                // kill it and release the slot's permit. The dead bridge
+                // The failed request must not be replayed. Retire the inner
+                // executor before releasing its checkout. The dead bridge
                 // stays cached so its replacement still resumes the session
                 // (issue #42). If another call already replaced this entry,
                 // its checkout belongs to the replacement and stays alone.
@@ -3347,7 +3348,8 @@ impl ModelClientSession {
         }
     }
 
-    /// Streams model inference through ZCode's headless CLI.
+    /// Retained legacy adapter, admitted only for local bookkeeping replies.
+    /// Its subprocess implementation is unreachable behind the entry guard.
     ///
     /// Spawns `node zcode.cjs --prompt ... --output-format stream-json` and
     /// maps NDJSON streaming events to Codex response events.
@@ -3450,8 +3452,8 @@ impl ModelClientSession {
         // Captured before the prompt text moves into the spawn task; feeds
         // the token-usage fallback estimate for the Completed event.
         let prompt_bytes = user_text.len();
-        // A cold fallback must retain any stricter warm-mode override,
-        // including after the warm failure latch has disabled new spawns.
+        // Retained legacy bookkeeping code preserves its stricter mode.
+        // The entry guard above rejects all CLI execution requests.
         let inner_mode = if zcode_warm::warm_bridge_enabled() {
             zcode_warm::warm_mode_from_env(
                 crate::client_common::ZcodeInnerMode::from_approval_policy(
