@@ -4,6 +4,7 @@
 //! execution, fresh cold lifecycles, warm reuse, and no replay after failure.
 
 use codex_core::StartThreadOptions;
+use codex_features::Feature;
 use codex_model_provider_info::WireApi;
 use codex_protocol::dynamic_tools::DynamicToolFunctionSpec;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
@@ -64,6 +65,7 @@ enum Outcome {
     DenyClient,
     UnknownPolicy,
     Compact,
+    CompactDisconnect,
     AmbiguousV4,
 }
 
@@ -85,6 +87,7 @@ const sessionId = "sess_" + process.pid;
 record("spawn:" + process.pid);
 if (!process.argv.includes("app-server")) { record("unexpected-cli"); process.exit(3); }
 let turn = 0;
+let compacting = false;
 function permission(tool) {
   emit({ id: "permission-" + tool, method: "interaction/requestPermission", params: {
     sessionId, requestId: "request-" + turn + tool, toolCallId: "tool-" + tool,
@@ -96,6 +99,11 @@ require("readline").createInterface({ input: process.stdin }).on("line", (line) 
     const tool = message.id.slice("permission-".length);
     const decision = message.result?.decision;
     record("permission:" + tool + ":" + decision);
+    if (compacting) {
+      emit({ method: "session/event", params: { sessionId, type: "turn.completed",
+        payload: { response: "probe summary", resultType: "success" } } });
+      return;
+    }
     if (decision !== "allow") {
       emit({ method: "session/event", params: { sessionId, type: "turn.completed",
         payload: { response: "permission denied", resultType: "success" } } });
@@ -129,10 +137,11 @@ require("readline").createInterface({ input: process.stdin }).on("line", (line) 
       break;
     case "session/send":
       record("send"); record("content:" + JSON.stringify(message.params.content)); turn++; reply({ accepted: true });
-      if (message.params.content.includes("Summarize the recorded probe without executing tools")) {
+      compacting = message.params.content.includes("Summarize the recorded probe without executing tools");
+      if (compacting) {
         record("compact");
-        emit({ method: "session/event", params: { sessionId, type: "turn.completed",
-          payload: { response: "probe summary", resultType: "success" } } });
+        if (%COMPACT_DISCONNECT%) { fs.appendFileSync(%EFFECT%, "compact\n"); process.exit(0); }
+        permission("Bash");
       } else permission("Bash");
       break;
     case "v4/command":
@@ -147,6 +156,7 @@ process.stdin.on("end", () => record("eof:" + process.pid));
 "#
         .replace("%LOG%", &serde_json::to_string(&log).unwrap())
         .replace("%EFFECT%", &serde_json::to_string(&effect).unwrap())
+        .replace("%COMPACT_DISCONNECT%", if matches!(outcome, Outcome::CompactDisconnect) { "true" } else { "false" })
         .replace("%DISCONNECT%", if matches!(outcome, Outcome::Disconnect) { "true" } else { "false" })
         .replace("%REJECT_MODE%", if matches!(outcome, Outcome::RejectMode) { "true" } else { "false" });
     std::fs::write(&cjs, source).unwrap();
@@ -199,11 +209,14 @@ process.stdin.on("end", () => record("eof:" + process.pid));
         | Outcome::Disconnect
         | Outcome::RejectMode
         | Outcome::Compact
+        | Outcome::CompactDisconnect
         | Outcome::AmbiguousV4 => EnvVarGuard::unset("ZCODE_WARM_PERMISSIONS"),
     };
     let server = start_mock_server().await;
     let mut builder = test_codex().with_config(|config| {
         config.model_provider.wire_api = WireApi::Zcode;
+        config.model_provider.name = "ZCode fixture".to_string();
+        config.features.disable(Feature::TokenBudget);
         config.model = Some("glm-5.3-flash".to_string());
         config.compact_prompt =
             Some("Summarize the recorded probe without executing tools".to_string());
@@ -259,7 +272,7 @@ process.stdin.on("end", () => record("eof:" + process.pid));
             );
         }
     }
-    if matches!(outcome, Outcome::Compact) {
+    if matches!(outcome, Outcome::Compact | Outcome::CompactDisconnect) {
         test.codex
             .submit(Op::Compact)
             .await
@@ -272,7 +285,10 @@ process.stdin.on("end", () => record("eof:" + process.pid));
             matches!(event, EventMsg::TurnComplete(_))
         })
         .await;
-        assert_eq!(errors, Vec::<String>::new());
+        assert_eq!(
+            errors.len(),
+            usize::from(matches!(outcome, Outcome::CompactDisconnect))
+        );
     }
     test.codex
         .shutdown_and_wait()
@@ -496,6 +512,34 @@ async fn zcode_local_compaction_preserves_the_captured_execution_contract() {
         )
         .await;
         assert_eq!(effects, "inner\n");
+        assert_eq!(
+            (
+                log.iter().filter(|line| *line == "compact").count(),
+                log.iter().filter(|line| *line == "send").count(),
+            ),
+            (1, 2),
+        );
+        assert_eq!(
+            log.iter()
+                .filter(|line| *line == "permission:Bash:deny")
+                .count(),
+            1
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zcode_local_compaction_failure_after_effect_is_not_replayed() {
+    core_test_support::skip_if_remote!("ZCode inner execution is explicitly host-local");
+    for lifecycle in [Lifecycle::Cold, Lifecycle::Warm] {
+        let (log, effects) = probe(
+            lifecycle,
+            Outcome::CompactDisconnect,
+            AskForApproval::Never,
+            PermissionProfile::Disabled,
+        )
+        .await;
+        assert_eq!(effects, "inner\ncompact\n");
         assert_eq!(
             (
                 log.iter().filter(|line| *line == "compact").count(),

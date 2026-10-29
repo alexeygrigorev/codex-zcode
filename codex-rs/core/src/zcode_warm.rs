@@ -936,6 +936,10 @@ impl ZcodeWarmBridge {
             )
             .await;
             if let Err(message) = sent {
+                // A missing or malformed acknowledgement may follow real
+                // execution. Stop our executor before reporting the failure.
+                send_bridge.kill("turn input outcome is uncertain");
+                let _ = send_bridge.retire().await;
                 let _ = tx.send(Err(ApiError::Stream(message))).await;
                 return;
             }

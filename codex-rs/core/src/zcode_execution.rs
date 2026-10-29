@@ -52,6 +52,15 @@ impl ZcodeExecutionPolicy {
     }
 }
 
+/// Tool-free requests, including compaction, never grant inner tool execution.
+pub(super) fn permission_policy(prompt: &crate::Prompt) -> WarmPermissionPolicy {
+    if prompt.tools.is_empty() {
+        WarmPermissionPolicy::DenyAll
+    } else {
+        WarmPermissionPolicy::for_unrestricted_execution()
+    }
+}
+
 /// Clears only this in-flight claim if cancellation drops its owning future.
 pub(super) struct WarmClaim<'a> {
     pub(super) slot: &'a Mutex<Option<super::ZcodeWarmSlot>>,
@@ -129,7 +138,7 @@ pub(crate) async fn stream_cold(
     let permit = zcode_process::acquire_zcode_session(&workspace, thread_id)
         .await
         .map_err(|error| error.to_string())?;
-    let permission_policy = WarmPermissionPolicy::for_unrestricted_execution();
+    let permission_policy = permission_policy(prompt);
     let bridge = ZcodeWarmBridge::spawn(
         &runtime,
         &workspace,

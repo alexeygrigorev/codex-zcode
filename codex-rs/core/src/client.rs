@@ -3122,8 +3122,7 @@ impl ModelClientSession {
     ) -> std::result::Result<codex_api::ResponseStream, String> {
         let workspace = prompt.zcode_execution.admitted_workspace()?.clone();
         let workspace_path = workspace.to_string_lossy().into_owned();
-        let permission_policy =
-            zcode_warm_permissions::WarmPermissionPolicy::for_unrestricted_execution();
+        let permission_policy = zcode_execution::permission_policy(prompt);
         let bridge = 'claim: loop {
             enum Decision {
                 Reuse(Arc<crate::zcode_warm::ZcodeWarmBridge>),

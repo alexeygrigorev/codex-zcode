@@ -1550,7 +1550,7 @@ async fn v4_ambiguous_ack_after_execution_does_not_resubmit_input() {
             )
             .replace(
                 "function runTurn(sessionId, content) {",
-                r#"function runTurn(sessionId, content) { stats("effect");"#,
+                r#"function runTurn(sessionId, content) { stats("effect"); setTimeout(() => stats("late-effect"), 500);"#,
             ),
     )
     .expect("replace v4 acknowledgement");
@@ -1578,7 +1578,14 @@ async fn v4_ambiguous_ack_after_execution_does_not_resubmit_input() {
         error.to_string().contains("unknown-after-execution"),
         "{error}"
     );
-    bridge.retire().await.expect("retire fixture");
+    assert_eq!(
+        (
+            bridge.is_dead(),
+            bridge.take_child_for_retirement().is_none()
+        ),
+        (true, true),
+    );
+    tokio::time::sleep(Duration::from_millis(/*millis*/ 750)).await;
     let stats = std::fs::read_to_string(stats_path(&fixture)).expect("stats written");
     assert_eq!(
         (
@@ -1591,8 +1598,9 @@ async fn v4_ambiguous_ack_after_execution_does_not_resubmit_input() {
                 .filter(|line| line.starts_with("send:"))
                 .count(),
             stats.lines().filter(|line| *line == "effect").count(),
+            stats.lines().filter(|line| *line == "late-effect").count(),
         ),
-        (1, 0, 1),
+        (1, 0, 1, 0),
         "{stats}",
     );
 }
