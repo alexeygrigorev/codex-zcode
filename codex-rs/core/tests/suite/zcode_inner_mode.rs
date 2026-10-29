@@ -9,8 +9,11 @@ use codex_protocol::dynamic_tools::DynamicToolFunctionSpec;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::Op;
 use core_test_support::responses::start_mock_server;
 use core_test_support::test_codex::test_codex;
+use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
 use std::ffi::OsStr;
 use std::ffi::OsString;
@@ -60,6 +63,8 @@ enum Outcome {
     RejectMode,
     DenyClient,
     UnknownPolicy,
+    Compact,
+    AmbiguousV4,
 }
 
 async fn probe(
@@ -122,7 +127,17 @@ require("readline").createInterface({ input: process.stdin }).on("line", (line) 
       if (%REJECT_MODE%) emit({ id: message.id, error: { code: -32000, message: "mode rejected" } });
       else reply({});
       break;
-    case "session/send": record("send"); record("content:" + JSON.stringify(message.params.content)); turn++; reply({ accepted: true }); permission("Bash"); break;
+    case "session/send":
+      record("send"); record("content:" + JSON.stringify(message.params.content)); turn++; reply({ accepted: true });
+      if (message.params.content.includes("Summarize the recorded probe without executing tools")) {
+        record("compact");
+        emit({ method: "session/event", params: { sessionId, type: "turn.completed",
+          payload: { response: "probe summary", resultType: "success" } } });
+      } else permission("Bash");
+      break;
+    case "v4/command":
+      record("v4-send"); fs.appendFileSync(%EFFECT%, "inner\n");
+      reply({ status: "unknown-after-execution" }); break;
     case "session/close": record("close:" + process.pid); reply({ closed: true }); break;
     case "session/stop": reply({}); break;
     default: emit({ id: message.id, error: { code: -32601, message: "unsupported " + message.method } });
@@ -169,6 +184,11 @@ process.stdin.on("end", () => record("eof:" + process.pid));
         ),
         EnvVarGuard::set("USERPROFILE", fake_home.path().as_os_str()),
     );
+    let _v4_guard = if matches!(outcome, Outcome::AmbiguousV4) {
+        EnvVarGuard::set("ZCODE_WARM_V4_SEND", OsStr::new("1"))
+    } else {
+        EnvVarGuard::unset("ZCODE_WARM_V4_SEND")
+    };
     let _permission_guard = match outcome {
         Outcome::DenyClient => EnvVarGuard::set("ZCODE_WARM_PERMISSIONS", OsStr::new("deny")),
         Outcome::UnknownPolicy => {
@@ -177,12 +197,16 @@ process.stdin.on("end", () => record("eof:" + process.pid));
         Outcome::Complete
         | Outcome::GoalContinuation
         | Outcome::Disconnect
-        | Outcome::RejectMode => EnvVarGuard::unset("ZCODE_WARM_PERMISSIONS"),
+        | Outcome::RejectMode
+        | Outcome::Compact
+        | Outcome::AmbiguousV4 => EnvVarGuard::unset("ZCODE_WARM_PERMISSIONS"),
     };
     let server = start_mock_server().await;
     let mut builder = test_codex().with_config(|config| {
         config.model_provider.wire_api = WireApi::Zcode;
         config.model = Some("glm-5.3-flash".to_string());
+        config.compact_prompt =
+            Some("Summarize the recorded probe without executing tools".to_string());
     });
     let mut test = builder
         .build_with_auto_env(&server)
@@ -234,6 +258,21 @@ process.stdin.on("end", () => record("eof:" + process.pid));
                 "cold completion must await retirement: {lines}"
             );
         }
+    }
+    if matches!(outcome, Outcome::Compact) {
+        test.codex
+            .submit(Op::Compact)
+            .await
+            .expect("submit compaction");
+        let mut errors = Vec::new();
+        wait_for_event(&test.codex, |event| {
+            if let EventMsg::Error(error) = event {
+                errors.push(error.message.clone());
+            }
+            matches!(event, EventMsg::TurnComplete(_))
+        })
+        .await;
+        assert_eq!(errors, Vec::<String>::new());
     }
     test.codex
         .shutdown_and_wait()
@@ -443,4 +482,46 @@ async fn zcode_cold_goal_continuation_sends_history_and_new_steering() {
         );
     }
     assert_eq!(effects, "inner\ninner\n");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zcode_local_compaction_preserves_the_captured_execution_contract() {
+    core_test_support::skip_if_remote!("ZCode inner execution is explicitly host-local");
+    for lifecycle in [Lifecycle::Cold, Lifecycle::Warm] {
+        let (log, effects) = probe(
+            lifecycle,
+            Outcome::Compact,
+            AskForApproval::Never,
+            PermissionProfile::Disabled,
+        )
+        .await;
+        assert_eq!(effects, "inner\n");
+        assert_eq!(
+            (
+                log.iter().filter(|line| *line == "compact").count(),
+                log.iter().filter(|line| *line == "send").count(),
+            ),
+            (1, 2),
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zcode_warm_ambiguous_v4_acknowledgement_does_not_repeat_the_effect() {
+    core_test_support::skip_if_remote!("ZCode inner execution is explicitly host-local");
+    let (log, effects) = probe(
+        Lifecycle::Warm,
+        Outcome::AmbiguousV4,
+        AskForApproval::Never,
+        PermissionProfile::Disabled,
+    )
+    .await;
+    assert_eq!(effects, "inner\n");
+    assert_eq!(
+        (
+            log.iter().filter(|line| *line == "v4-send").count(),
+            log.iter().filter(|line| *line == "send").count(),
+        ),
+        (1, 0),
+    );
 }

@@ -9,6 +9,9 @@ use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AskForApproval;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
 use tokio::sync::mpsc;
 
 use super::ZcodeRuntime;
@@ -49,6 +52,25 @@ impl ZcodeExecutionPolicy {
     }
 }
 
+/// Clears only this in-flight claim if cancellation drops its owning future.
+pub(super) struct WarmClaim<'a> {
+    pub(super) slot: &'a Mutex<Option<super::ZcodeWarmSlot>>,
+    pub(super) owner: Arc<AtomicBool>,
+}
+
+impl Drop for WarmClaim<'_> {
+    fn drop(&mut self) {
+        let mut slot = self
+            .slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if matches!(slot.as_ref(), Some(super::ZcodeWarmSlot::Claiming(owner)) if Arc::ptr_eq(owner, &self.owner))
+        {
+            *slot = None;
+        }
+    }
+}
+
 /// Prevent the outer sampling retry ladder from replaying an inner agent turn.
 pub(crate) fn no_replay(stream: ResponseStream) -> ResponseStream {
     let upstream_request_id = stream.upstream_request_id;
@@ -63,8 +85,18 @@ pub(crate) fn no_replay(stream: ResponseStream) -> ResponseStream {
             let Some(event) = event else {
                 break;
             };
-            let event = event.map_err(|error| ApiError::InvalidRequest {
-                message: format!("ZCode execution failed; the turn will not be replayed: {error}"),
+            let event = event.map_err(|error| match error {
+                ApiError::ContextWindowExceeded => ApiError::ContextWindowExceeded,
+                ApiError::Stream(ref message)
+                    if message.contains(super::ZCODE_OUTPUT_LIMIT_CODE) =>
+                {
+                    ApiError::ContextWindowExceeded
+                }
+                error => ApiError::InvalidRequest {
+                    message: format!(
+                        "ZCode execution failed; the turn will not be replayed: {error}"
+                    ),
+                },
             });
             let terminal = matches!(&event, Err(_) | Ok(ResponseEvent::Completed { .. }));
             if tx.send(event).await.is_err() || terminal {
@@ -120,6 +152,7 @@ pub(crate) async fn stream_cold(
     }
     let goal_already_reported = super::zcode_goal_already_reported_in_current_turn(&prompt.input);
     content.push_str(super::ZCODE_REPLY_BUDGET_NOTE);
+    let prompt_bytes = content.len();
     let (tx, rx_event) = mpsc::channel(/*buffer*/ 64);
     tokio::spawn(async move {
         let prepared = tokio::select! {
@@ -131,6 +164,7 @@ pub(crate) async fn stream_cold(
             } => Some(prepared),
         };
         let mut goal_status = None;
+        let mut reply_bytes = 0;
         let terminal = match prepared {
             None => None,
             Some(Err(error)) => Some(Err(ApiError::InvalidRequest { message: error })),
@@ -140,10 +174,45 @@ pub(crate) async fn stream_cold(
                     event = stream.rx_event.recv() => event,
                 };
                 match event {
-                    Some(event @ (Err(_) | Ok(ResponseEvent::Completed { .. }))) => {
+                    Some(Ok(ResponseEvent::Completed {
+                        response_id,
+                        token_usage,
+                        usage_metadata,
+                        end_turn,
+                    })) => {
+                        let mut usage = token_usage.unwrap_or_default();
+                        if usage.total_tokens <= 0 {
+                            let fallback =
+                                super::zcode_token_usage(None, prompt_bytes, reply_bytes);
+                            if usage.input_tokens <= 0 {
+                                usage.input_tokens = fallback.input_tokens;
+                            }
+                            if usage.output_tokens <= 0 {
+                                usage.output_tokens = fallback.output_tokens;
+                            }
+                            usage.total_tokens =
+                                usage.input_tokens.saturating_add(usage.output_tokens);
+                        }
+                        break Some(Ok(ResponseEvent::Completed {
+                            response_id,
+                            token_usage: Some(usage),
+                            usage_metadata,
+                            end_turn,
+                        }));
+                    }
+                    Some(event @ Err(_)) => {
                         break Some(event);
                     }
                     Some(Ok(ResponseEvent::OutputItemDone(mut item))) => {
+                        if let ResponseItem::Message { content, .. } = &item {
+                            reply_bytes += content
+                                .iter()
+                                .filter_map(|chunk| match chunk {
+                                    ContentItem::OutputText { text } => Some(text.len()),
+                                    _ => None,
+                                })
+                                .sum::<usize>();
+                        }
                         if goal_protocol.is_some()
                             && let ResponseItem::Message { content, .. } = &mut item
                         {

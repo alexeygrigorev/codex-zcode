@@ -95,6 +95,75 @@ async fn dropping_warm_slot_holds_checkout_until_child_is_reaped() {
 }
 
 #[tokio::test]
+async fn cancelled_warm_claim_clears_only_its_own_slot() {
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
+
+    let owner = Arc::new(AtomicBool::new(/*v*/ false));
+    let slot = Arc::new(Mutex::new(Some(super::super::ZcodeWarmSlot::Claiming(
+        Arc::clone(&owner),
+    ))));
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let task = tokio::spawn({
+        let slot = Arc::clone(&slot);
+        let entered = Arc::clone(&entered);
+        let owner = Arc::clone(&owner);
+        async move {
+            let _claim = super::WarmClaim { slot: &slot, owner };
+            entered.notify_one();
+            std::future::pending::<()>().await;
+        }
+    });
+    entered.notified().await;
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert!(slot.lock().unwrap().is_none());
+
+    let replacement = Arc::new(AtomicBool::new(/*v*/ false));
+    *slot.lock().unwrap() = Some(super::super::ZcodeWarmSlot::Claiming(Arc::clone(
+        &replacement,
+    )));
+    drop(super::WarmClaim { slot: &slot, owner });
+    assert!(matches!(
+        slot.lock().unwrap().as_ref(),
+        Some(super::super::ZcodeWarmSlot::Claiming(current)) if Arc::ptr_eq(current, &replacement)
+    ));
+}
+
+#[tokio::test]
+async fn no_replay_preserves_context_exhaustion_and_stops_on_other_failures() {
+    use codex_api::ApiError;
+    use codex_api::ResponseStream;
+    use tokio::sync::mpsc;
+
+    for message in [
+        "model_output_limit_exceeded",
+        "disconnected after execution",
+    ] {
+        let (tx, rx_event) = mpsc::channel(/*buffer*/ 1);
+        tx.send(Err(ApiError::Stream(message.to_string())))
+            .await
+            .unwrap();
+        drop(tx);
+        let mut stream = super::no_replay(ResponseStream {
+            rx_event,
+            upstream_request_id: None,
+        });
+        let error = stream.rx_event.recv().await.unwrap().unwrap_err();
+        match error {
+            ApiError::ContextWindowExceeded => assert_eq!(message, "model_output_limit_exceeded"),
+            ApiError::InvalidRequest { message: detail } => {
+                assert_eq!(message, "disconnected after execution");
+                assert!(detail.contains(message), "{detail}");
+            }
+            other => panic!("unexpected failure category: {other}"),
+        }
+        assert!(stream.rx_event.recv().await.is_none());
+    }
+}
+
+#[tokio::test]
 async fn cold_goal_continuation_preserves_history_and_steering_before_reporting_completion() {
     use codex_api::ResponseEvent;
     use codex_protocol::models::ResponseItem;
@@ -113,6 +182,9 @@ async fn cold_goal_continuation_preserves_history_and_steering_before_reporting_
             r#"function runTurn(sessionId, content) {
                 fs.writeFileSync(process.argv[1] + ".received", JSON.stringify(content));
                 content = "done\n[GOAL:COMPLETE]";"#,
+        ).replace(
+            "usage: { inputTokens: 10, outputTokens: 2, totalTokens: 12, cacheReadTokens: 5, reasoningTokens: 1 },",
+            "usage: {},",
         ),
     )
     .unwrap();
@@ -179,10 +251,14 @@ async fn cold_goal_continuation_preserves_history_and_steering_before_reporting_
     .await
     .unwrap();
     let mut outputs = Vec::new();
+    let mut completed_usage = None;
     while let Some(event) = stream.rx_event.recv().await {
         match event.unwrap() {
             ResponseEvent::OutputItemDone(item) => outputs.push(item),
-            ResponseEvent::Completed { .. } => break,
+            ResponseEvent::Completed { token_usage, .. } => {
+                completed_usage = token_usage;
+                break;
+            }
             _ => {}
         }
     }
@@ -205,6 +281,14 @@ async fn cold_goal_continuation_preserves_history_and_steering_before_reporting_
     let received: String =
         serde_json::from_str(&std::fs::read_to_string(&received_path).unwrap()).unwrap();
     std::fs::remove_file(received_path).unwrap();
+    assert_eq!(
+        completed_usage,
+        Some(super::super::zcode_token_usage(
+            /*context_used*/ None,
+            received.len(),
+            "done\n[GOAL:COMPLETE]".len(),
+        )),
+    );
     let expected_history = format!(
         "user: Migrate the records once.\n[tool call exec_command] {{\"cmd\":\"migrate-once\"}}\n[tool result for migration-effect] Migration committed; receipt 731.\nassistant: Migration already committed.\nuser: {continuation}\n"
     );

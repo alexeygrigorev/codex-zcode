@@ -3206,6 +3206,10 @@ impl ModelClientSession {
                 *slot = Some(ZcodeWarmSlot::Claiming(Arc::clone(&cancelled)));
                 (dead_predecessor, evicted, cancelled)
             };
+            let _claim = zcode_execution::WarmClaim {
+                slot: &state.zcode_warm,
+                owner: Arc::clone(&cancelled),
+            };
             // Keep the previous checkout reserved until its child has been reaped.
             if let Some(ZcodeWarmSlot::Ready(entry)) = evicted.as_mut() {
                 let _ = entry.bridge.retire().await;
@@ -3220,14 +3224,6 @@ impl ModelClientSession {
             {
                 Ok(checkout) => checkout,
                 Err(e) => {
-                    let mut slot = state
-                        .zcode_warm
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if matches!(slot.as_ref(), Some(ZcodeWarmSlot::Claiming(owner)) if Arc::ptr_eq(owner, &cancelled))
-                    {
-                        *slot = None;
-                    }
                     state
                         .zcode_warm_spawn_failures
                         .fetch_add(1, Ordering::Relaxed);

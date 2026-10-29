@@ -1538,15 +1538,26 @@ async fn v4_send_channel_sends_text_through_v4_command() {
 }
 
 #[tokio::test]
-async fn v4_send_failure_falls_back_to_legacy_send() {
-    let fixture = write_fake_server_with(FakeServerOptions {
-        fails_v4_command: true,
-        ..FakeServerOptions::default()
-    });
+async fn v4_ambiguous_ack_after_execution_does_not_resubmit_input() {
+    let fixture = write_fake_server();
+    let source = std::fs::read_to_string(&fixture).expect("read fixture");
+    std::fs::write(
+        &fixture,
+        source
+            .replace(
+                r#"status: "accepted","#,
+                r#"status: "unknown-after-execution","#,
+            )
+            .replace(
+                "function runTurn(sessionId, content) {",
+                r#"function runTurn(sessionId, content) { stats("effect");"#,
+            ),
+    )
+    .expect("replace v4 acknowledgement");
     let bridge = ZcodeWarmBridge::spawn(
         &test_runtime(&fixture),
         "/tmp",
-        WarmMode::Yolo,
+        WarmMode::Build,
         WarmPermissionPolicy::DenyAll,
         SessionSeed::Fresh,
     )
@@ -1555,35 +1566,35 @@ async fn v4_send_failure_falls_back_to_legacy_send() {
         .ensure_session("/tmp")
         .await
         .expect("session created");
-    let stream = bridge
-        .turn(&session_id, "fallback", TurnInputChannel::V4Command)
+    let mut stream = bridge
+        .turn(&session_id, "execute once", TurnInputChannel::V4Command)
         .expect("turn starts");
-    let mut rx = stream.rx_event;
-
-    loop {
-        match next_event(&mut rx).await {
-            ResponseEvent::Completed { end_turn, .. } => {
-                assert_eq!(end_turn, Some(true));
-                break;
-            }
-            ResponseEvent::OutputItemAdded(_)
-            | ResponseEvent::OutputTextDelta(_)
-            | ResponseEvent::OutputItemDone(_) => continue,
-            other => panic!("expected Completed, got {other:?}"),
-        }
-    }
-
-    let stats_text = std::fs::read_to_string(stats_path(&fixture)).expect("stats written");
-    let lines: Vec<&str> = stats_text.lines().collect();
+    let error = tokio::time::timeout(Duration::from_secs(/*secs*/ 5), stream.rx_event.recv())
+        .await
+        .expect("submission must finish")
+        .expect("submission outcome")
+        .expect_err("ambiguous acknowledgement must fail");
     assert!(
-        lines.contains(&"v4/command"),
-        "the v4 attempt must have been made: {stats_text}"
+        error.to_string().contains("unknown-after-execution"),
+        "{error}"
     );
-    assert!(
-        lines.iter().any(|line| line.starts_with("send:fallback")),
-        "the rejected v4 command must fall back to session/send: {stats_text}"
+    bridge.retire().await.expect("retire fixture");
+    let stats = std::fs::read_to_string(stats_path(&fixture)).expect("stats written");
+    assert_eq!(
+        (
+            stats
+                .lines()
+                .filter(|line| line.starts_with("v4command:"))
+                .count(),
+            stats
+                .lines()
+                .filter(|line| line.starts_with("send:"))
+                .count(),
+            stats.lines().filter(|line| *line == "effect").count(),
+        ),
+        (1, 0, 1),
+        "{stats}",
     );
-    bridge.kill("test end");
 }
 
 #[test]

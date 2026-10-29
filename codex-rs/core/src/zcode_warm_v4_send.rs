@@ -9,12 +9,9 @@
 //! `v4/command sendText` so the removal of `session/send` is a flag flip,
 //! not a scramble.
 //!
-//! The v4 path is soft: any pre-turn failure (older cores without a v4
-//! gateway answer method-not-found, schema drift, rejection) falls back to
-//! `session/send`. This is deliberately wider than the desktop host, which
-//! treats a busy foreground turn as `startNow`-preemptible: the bridge runs
-//! one turn at a time and mirrors the legacy rejection semantics through
-//! the stream-retry ladder instead.
+//! Submission failures are terminal. An unrecognized acknowledgement or a
+//! lost response can follow real execution, so another input surface must
+//! never resubmit the same turn.
 
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
@@ -28,7 +25,7 @@ use crate::zcode_warm::ZcodeWarmBridge;
 pub(crate) enum TurnInputChannel {
     /// Legacy `session/send` — today's default.
     LegacySend,
-    /// `v4/command sendText` prototype, falling back to legacy on failure.
+    /// `v4/command sendText` prototype; failures do not resubmit input.
     V4Command,
 }
 
@@ -58,13 +55,7 @@ pub(crate) async fn send_turn_input(
 ) -> Result<(), String> {
     match channel {
         TurnInputChannel::LegacySend => legacy_send(bridge, session_id, content).await,
-        TurnInputChannel::V4Command => match v4_command_send(bridge, session_id, content).await {
-            Ok(()) => Ok(()),
-            Err(message) => {
-                warn!("v4/command sendText failed ({message}); falling back to session/send");
-                legacy_send(bridge, session_id, content).await
-            }
-        },
+        TurnInputChannel::V4Command => v4_command_send(bridge, session_id, content).await,
     }
 }
 

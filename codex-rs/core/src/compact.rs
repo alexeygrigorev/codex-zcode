@@ -274,6 +274,25 @@ async fn run_compact_task_inner_impl(
     let responses_metadata = sess
         .compaction_responses_metadata(turn_context.as_ref(), compaction_metadata)
         .await;
+    let zcode_execution = match &initial_context_injection {
+        InitialContextInjection::BeforeLastUserMessage { step_context, .. } => {
+            crate::client::zcode_execution::ZcodeExecutionPolicy {
+                approval_policy: step_context.settings.approval_policy(),
+                permission_profile: turn_context
+                    .permission_profile_for_environments(&step_context.environments),
+                workspace: step_context.environments.single_local_environment_cwd(),
+            }
+        }
+        InitialContextInjection::DoNotInject => {
+            crate::client::zcode_execution::ZcodeExecutionPolicy {
+                approval_policy: turn_context.approval_policy(),
+                permission_profile: turn_context.permission_profile(),
+                workspace: turn_context
+                    .initial_environments
+                    .single_local_environment_cwd(),
+            }
+        }
+    };
 
     let compaction_response = loop {
         // Clone is required because of the loop
@@ -287,6 +306,7 @@ async fn run_compact_task_inner_impl(
         let prompt = Prompt {
             input: turn_input,
             base_instructions: sess.get_prompt_base_instructions().await,
+            zcode_execution: zcode_execution.clone(),
             ..Default::default()
         };
         let attempt_result = drain_to_completed(
