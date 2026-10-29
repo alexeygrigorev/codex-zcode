@@ -132,6 +132,92 @@ async fn cancelled_warm_claim_clears_only_its_own_slot() {
 }
 
 #[tokio::test]
+async fn tool_free_create_and_resume_pin_an_empty_allowlist() {
+    use crate::zcode_warm::SessionSeed;
+    use crate::zcode_warm::WarmMode;
+    use crate::zcode_warm::ZcodeWarmBridge;
+    use crate::zcode_warm_permissions::WarmPermissionPolicy;
+
+    for (seed, method) in [
+        (SessionSeed::Fresh, "session/create"),
+        (
+            SessionSeed::Predecessor {
+                session_id: "sess_previous".to_string(),
+                last_event_seq: 0,
+            },
+            "session/resume",
+        ),
+    ] {
+        let fixture = crate::zcode_warm::tests::write_fake_server();
+        let source = std::fs::read_to_string(&fixture).unwrap();
+        std::fs::write(&fixture, source.replace(
+            "function handle(msg) {",
+            r#"function handle(msg) {
+              if (msg.method === "session/create" || msg.method === "session/resume") {
+                stats("tools:" + JSON.stringify({ method: msg.method, allowlist: msg.params.toolAllowlist }));
+              }"#,
+        )).unwrap();
+        let bridge = ZcodeWarmBridge::spawn(
+            &crate::zcode_warm::tests::test_runtime(&fixture),
+            "/tmp",
+            WarmMode::Build,
+            WarmPermissionPolicy::NoTools,
+            seed,
+        )
+        .unwrap();
+        bridge.ensure_session("/tmp").await.unwrap();
+        bridge.retire().await.unwrap();
+        let stats =
+            std::fs::read_to_string(crate::zcode_warm::tests::stats_path(&fixture)).unwrap();
+        let frames = stats
+            .lines()
+            .filter_map(|line| line.strip_prefix("tools:"))
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            frames,
+            vec![serde_json::json!({ "method": method, "allowlist": [] })]
+        );
+    }
+}
+
+#[tokio::test]
+async fn tool_free_handshake_rejects_schema_drift_without_stripping_constraints() {
+    use crate::zcode_warm::SessionSeed;
+    use crate::zcode_warm::WarmMode;
+    use crate::zcode_warm::ZcodeWarmBridge;
+    use crate::zcode_warm_permissions::WarmPermissionPolicy;
+
+    let fixture = crate::zcode_warm::tests::write_fake_server_with(
+        crate::zcode_warm::tests::FakeServerOptions {
+            rejects_unknown_create_keys: true,
+            ..Default::default()
+        },
+    );
+    let bridge = ZcodeWarmBridge::spawn(
+        &crate::zcode_warm::tests::test_runtime(&fixture),
+        "/tmp",
+        WarmMode::Build,
+        WarmPermissionPolicy::NoTools,
+        SessionSeed::Fresh,
+    )
+    .unwrap();
+    bridge
+        .ensure_session("/tmp")
+        .await
+        .expect_err("cannot relax tool constraints");
+    bridge.retire().await.unwrap();
+    let stats = std::fs::read_to_string(crate::zcode_warm::tests::stats_path(&fixture)).unwrap();
+    assert_eq!(
+        (
+            stats.lines().filter(|line| *line == "drift-reject").count(),
+            stats.lines().filter(|line| *line == "create").count(),
+        ),
+        (1, 0),
+    );
+}
+
+#[tokio::test]
 async fn no_replay_preserves_context_exhaustion_and_stops_on_other_failures() {
     use codex_api::ApiError;
     use codex_api::ResponseStream;

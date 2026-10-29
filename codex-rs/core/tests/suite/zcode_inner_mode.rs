@@ -88,6 +88,7 @@ record("spawn:" + process.pid);
 if (!process.argv.includes("app-server")) { record("unexpected-cli"); process.exit(3); }
 let turn = 0;
 let compacting = false;
+let noTools = false;
 function permission(tool) {
   emit({ id: "permission-" + tool, method: "interaction/requestPermission", params: {
     sessionId, requestId: "request-" + turn + tool, toolCallId: "tool-" + tool,
@@ -128,7 +129,11 @@ require("readline").createInterface({ input: process.stdin }).on("line", (line) 
   const reply = (result) => emit({ id: message.id, result });
   if (message.method === "session/goal") record("goal");
   switch (message.method) {
-    case "session/create": record("create:" + message.params.mode); reply({ session: { sessionId }, protocol: { version: 1 } }); break;
+    case "session/create":
+      record("create:" + message.params.mode);
+      record("toolAllowlist:" + JSON.stringify(message.params.toolAllowlist ?? null));
+      noTools = Array.isArray(message.params.toolAllowlist) && message.params.toolAllowlist.length === 0;
+      reply({ session: { sessionId }, protocol: { version: 1 } }); break;
     case "session/subscribe": reply({ eventSeq: 0, events: [] }); break;
     case "session/setMode":
       record("mode:" + message.params.mode);
@@ -141,7 +146,10 @@ require("readline").createInterface({ input: process.stdin }).on("line", (line) 
       if (compacting) {
         record("compact");
         if (%COMPACT_DISCONNECT%) { fs.appendFileSync(%EFFECT%, "compact\n"); process.exit(0); }
-        permission("Bash");
+        if (noTools) {
+          emit({ method: "session/event", params: { sessionId, type: "turn.completed",
+            payload: { response: "probe summary", resultType: "success" } } });
+        } else permission("Bash");
       } else permission("Bash");
       break;
     case "v4/command":
@@ -521,7 +529,7 @@ async fn zcode_local_compaction_preserves_the_captured_execution_contract() {
         );
         assert_eq!(
             log.iter()
-                .filter(|line| *line == "permission:Bash:deny")
+                .filter(|line| *line == "toolAllowlist:[]")
                 .count(),
             1
         );

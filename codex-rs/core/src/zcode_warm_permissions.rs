@@ -68,15 +68,16 @@ impl RiskTier {
     }
 }
 
-/// How `interaction/requestPermission` callbacks are answered in `build`
-/// mode. `yolo` sessions never see these callbacks, so the policy is moot
-/// there.
+/// Session tool constraints and permission callbacks in build mode.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum WarmPermissionPolicy {
     /// Deny every request with a reason; the gated core measures what a real
     /// approval bridge would need.
     #[default]
     DenyAll,
+    /// Register no built-in or MCP tools and deny any unexpected callback.
+    /// Unlike callback denial alone, this prevents preapproved inner tools.
+    NoTools,
     /// Auto-approve low/medium risk with allow-once semantics; deny
     /// high/critical (and anything with an unreadable tier) with a reason
     /// naming the policy.
@@ -120,7 +121,7 @@ impl WarmPermissionPolicy {
                 decision: "allow",
                 reason: "Allowed by the captured unrestricted Codex execution policy".to_string(),
             },
-            WarmPermissionPolicy::DenyAll => PermissionAnswer {
+            WarmPermissionPolicy::DenyAll | WarmPermissionPolicy::NoTools => PermissionAnswer {
                 decision: "deny",
                 reason: DENY_ALL_REASON.to_string(),
             },

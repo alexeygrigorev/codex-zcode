@@ -55,7 +55,7 @@ impl ZcodeExecutionPolicy {
 /// Tool-free requests, including compaction, never grant inner tool execution.
 pub(super) fn permission_policy(prompt: &crate::Prompt) -> WarmPermissionPolicy {
     if prompt.tools.is_empty() {
-        WarmPermissionPolicy::DenyAll
+        WarmPermissionPolicy::NoTools
     } else {
         WarmPermissionPolicy::for_unrestricted_execution()
     }

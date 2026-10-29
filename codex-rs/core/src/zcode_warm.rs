@@ -829,6 +829,23 @@ impl ZcodeWarmBridge {
         }
     }
 
+    /// Pins hard tool constraints during creation and cold resume. These
+    /// requests never strip constraints after a schema rejection.
+    pub(crate) async fn request_session(
+        &self,
+        method: &str,
+        mut params: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        if self.permission_policy == WarmPermissionPolicy::NoTools {
+            params["toolAllowlist"] = serde_json::json!([]);
+            self.request(method, params)
+                .await
+                .map_err(|error| error.to_string())
+        } else {
+            self.request_with_compat_retry(method, params).await
+        }
+    }
+
     /// Sends a request, retrying once without unrecognized keys when the
     /// core's zod schema rejects our params.
     ///
