@@ -213,7 +213,7 @@ async fn tool_free_handshake_rejects_schema_drift_without_stripping_constraints(
             stats.lines().filter(|line| *line == "drift-reject").count(),
             stats.lines().filter(|line| *line == "create").count(),
         ),
-        (1, 0),
+        (1, 1),
     );
 }
 

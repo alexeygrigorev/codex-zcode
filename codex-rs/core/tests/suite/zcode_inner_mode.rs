@@ -65,6 +65,7 @@ enum Outcome {
     DenyClient,
     UnknownPolicy,
     Compact,
+    CompactThenTurn,
     CompactDisconnect,
     AmbiguousV4,
 }
@@ -83,7 +84,7 @@ async fn probe(
 const fs = require("fs");
 const record = (value) => fs.appendFileSync(%LOG%, value + "\n");
 const emit = (value) => process.stdout.write(JSON.stringify(value) + "\n");
-const sessionId = "sess_" + process.pid;
+let sessionId = "sess_" + process.pid;
 record("spawn:" + process.pid);
 if (!process.argv.includes("app-server")) { record("unexpected-cli"); process.exit(3); }
 let turn = 0;
@@ -134,6 +135,13 @@ require("readline").createInterface({ input: process.stdin }).on("line", (line) 
       record("toolAllowlist:" + JSON.stringify(message.params.toolAllowlist ?? null));
       noTools = Array.isArray(message.params.toolAllowlist) && message.params.toolAllowlist.length === 0;
       reply({ session: { sessionId }, protocol: { version: 1 } }); break;
+    case "session/list":
+      reply({ sessions: message.params.sessionIds.map(sessionId => ({ sessionId })) }); break;
+    case "session/resume":
+      record("resume"); sessionId = message.params.sessionId;
+      record("toolAllowlist:" + JSON.stringify(message.params.toolAllowlist ?? null));
+      noTools = Array.isArray(message.params.toolAllowlist) && message.params.toolAllowlist.length === 0;
+      reply({ protocol: { version: 1 } }); break;
     case "session/subscribe": reply({ eventSeq: 0, events: [] }); break;
     case "session/setMode":
       record("mode:" + message.params.mode);
@@ -217,6 +225,7 @@ process.stdin.on("end", () => record("eof:" + process.pid));
         | Outcome::Disconnect
         | Outcome::RejectMode
         | Outcome::Compact
+        | Outcome::CompactThenTurn
         | Outcome::CompactDisconnect
         | Outcome::AmbiguousV4 => EnvVarGuard::unset("ZCODE_WARM_PERMISSIONS"),
     };
@@ -280,7 +289,10 @@ process.stdin.on("end", () => record("eof:" + process.pid));
             );
         }
     }
-    if matches!(outcome, Outcome::Compact | Outcome::CompactDisconnect) {
+    if matches!(
+        outcome,
+        Outcome::Compact | Outcome::CompactThenTurn | Outcome::CompactDisconnect
+    ) {
         test.codex
             .submit(Op::Compact)
             .await
@@ -297,6 +309,15 @@ process.stdin.on("end", () => record("eof:" + process.pid));
             errors.len(),
             usize::from(matches!(outcome, Outcome::CompactDisconnect))
         );
+    }
+    if matches!(outcome, Outcome::CompactThenTurn) {
+        test.submit_turn_with_approval_and_permission_profile(
+            "Execute the next ordinary turn after compaction",
+            approval,
+            profile.clone(),
+        )
+        .await
+        .expect("ordinary turn after compaction");
     }
     test.codex
         .shutdown_and_wait()
@@ -556,6 +577,34 @@ async fn zcode_local_compaction_failure_after_effect_is_not_replayed() {
             (1, 2),
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zcode_warm_tools_recover_after_compaction_resume() {
+    core_test_support::skip_if_remote!("ZCode inner execution is explicitly host-local");
+    let (log, effects) = probe(
+        Lifecycle::Warm,
+        Outcome::CompactThenTurn,
+        AskForApproval::Never,
+        PermissionProfile::Disabled,
+    )
+    .await;
+    assert_eq!(effects, "inner\ninner\n");
+    assert_eq!(
+        log.iter()
+            .filter_map(|line| line.strip_prefix("toolAllowlist:"))
+            .collect::<Vec<_>>(),
+        vec!["null", "[]", "null"],
+    );
+    assert_eq!(
+        (
+            log.iter().filter(|line| *line == "resume").count(),
+            log.iter()
+                .filter(|line| *line == "permission:Write:allow")
+                .count(),
+        ),
+        (2, 2),
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
