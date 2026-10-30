@@ -807,15 +807,36 @@ fn expand_unreadable_globs_with_ripgrep(
     cwd: &Path,
     max_depth: Option<usize>,
 ) -> Result<Vec<AbsolutePathBuf>> {
-    if patterns.is_empty() || max_depth == Some(0) {
-        return Ok(Vec::new());
+    // Record both the logical match and any canonical symlink target. The bwrap
+    // overlay needs the resolved target to prevent a readable symlink path from
+    // bypassing an unreadable glob match.
+    let mut expanded_paths = BTreeSet::new();
+
+    // A pattern without glob metacharacters matches exactly one path, so it
+    // needs no scan and is honored regardless of the configured scan depth.
+    let mut glob_patterns = Vec::new();
+    for pattern in patterns {
+        let literal = AbsolutePathBuf::resolve_path_against_base(pattern, cwd);
+        if literal.to_string_lossy().contains(['*', '?', '[', ']']) {
+            glob_patterns.push(pattern);
+            continue;
+        }
+        if literal.as_path().symlink_metadata().is_ok() {
+            if let Some(target) = canonical_target_if_symlinked_path(literal.as_path()) {
+                expanded_paths.insert(AbsolutePathBuf::from_absolute_path_checked(target)?);
+            }
+            expanded_paths.insert(literal);
+        }
+    }
+    if glob_patterns.is_empty() || max_depth == Some(0) {
+        return Ok(expanded_paths.into_iter().collect());
     }
 
     // Group each pattern by the static path prefix before its first glob
     // metacharacter. That keeps scans narrow, avoids searching from `/`, and
     // lets one `rg --files` call handle all patterns under the same root.
     let mut patterns_by_search_root: BTreeMap<AbsolutePathBuf, Vec<String>> = BTreeMap::new();
-    for pattern in patterns {
+    for pattern in glob_patterns {
         let Some((search_root, glob)) = split_pattern_for_ripgrep(pattern, cwd) else {
             return Err(CodexErr::Fatal(format!(
                 "unreadable glob `{pattern}` cannot be safely expanded; use a pattern with a non-root directory prefix"
@@ -829,10 +850,6 @@ fn expand_unreadable_globs_with_ripgrep(
         }
     }
 
-    // Record both the logical match and any canonical symlink target. The bwrap
-    // overlay needs the resolved target to prevent a readable symlink path from
-    // bypassing an unreadable glob match.
-    let mut expanded_paths = BTreeSet::new();
     for (search_root, globs) in patterns_by_search_root {
         for path in ripgrep_files(search_root.as_path(), &globs, max_depth)? {
             if let Some(target) = canonical_target_if_symlinked_path(path.as_path()) {
@@ -2820,6 +2837,35 @@ mod tests {
         .expect("filesystem args");
 
         assert_file_masked(&args.args, &real_secret);
+    }
+
+    #[test]
+    fn literal_unreadable_globs_mask_existing_paths_without_scanning() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let secret = temp_dir.path().join("secret.env");
+        let missing = temp_dir.path().join("missing-private");
+        std::fs::write(&secret, "secret").expect("write secret");
+        let mut policy = default_policy_with_unreadable_glob(secret.display().to_string());
+        policy
+            .entries
+            .push(unreadable_glob_entry(missing.display().to_string()));
+
+        let args = create_filesystem_args(
+            &policy,
+            temp_dir.path(),
+            BwrapOptions {
+                glob_scan_max_depth: Some(0),
+                ..Default::default()
+            },
+        )
+        .expect("literal deny patterns should not reject sandbox construction");
+
+        assert_file_masked(&args.args, &secret);
+        assert!(
+            !args.args.iter().any(|arg| arg == &path_to_string(&missing)),
+            "missing literal deny pattern should not add a mount: {:#?}",
+            args.args
+        );
     }
 
     #[test]
