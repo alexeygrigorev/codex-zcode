@@ -4,6 +4,24 @@ use codex_protocol::protocol::AskForApproval;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use pretty_assertions::assert_eq;
 
+fn goal_tools() -> std::sync::Arc<[codex_tools::ToolSpec]> {
+    vec![codex_tools::ToolSpec::Function(
+        codex_tools::ResponsesApiTool {
+            name: "update_goal".to_string(),
+            description: String::new(),
+            strict: false,
+            parameters: codex_tools::JsonSchema::object(
+                std::collections::BTreeMap::new(),
+                /*required*/ Some(Vec::new()),
+                /*additional_properties*/ Some(false.into()),
+            ),
+            output_schema: None,
+            defer_loading: None,
+        },
+    )]
+    .into()
+}
+
 #[test]
 fn admission_requires_the_captured_unrestricted_local_contract() {
     let workspace = AbsolutePathBuf::try_from(std::env::current_dir().unwrap()).unwrap();
@@ -253,10 +271,6 @@ async fn no_replay_preserves_context_exhaustion_and_stops_on_other_failures() {
 async fn cold_goal_continuation_preserves_history_and_steering_before_reporting_completion() {
     use codex_api::ResponseEvent;
     use codex_protocol::models::ResponseItem;
-    use codex_tools::JsonSchema;
-    use codex_tools::ResponsesApiTool;
-    use codex_tools::ToolSpec;
-    use std::collections::BTreeMap;
 
     let work = tempfile::TempDir::new().unwrap();
     let fixture = crate::zcode_warm::tests::write_fake_server();
@@ -309,19 +323,7 @@ async fn cold_goal_continuation_preserves_history_and_steering_before_reporting_
             crate::zcode_warm::assistant_message("Migration already committed.".to_string()),
             user_message(continuation),
         ],
-        tools: vec![ToolSpec::Function(ResponsesApiTool {
-            name: "update_goal".to_string(),
-            description: String::new(),
-            strict: false,
-            parameters: JsonSchema::object(
-                BTreeMap::new(),
-                /*required*/ Some(Vec::new()),
-                /*additional_properties*/ Some(false.into()),
-            ),
-            output_schema: None,
-            defer_loading: None,
-        })]
-        .into(),
+        tools: goal_tools(),
         zcode_execution: ZcodeExecutionPolicy {
             approval_policy: AskForApproval::Never,
             permission_profile: PermissionProfile::Disabled,
@@ -440,4 +442,71 @@ async fn aborted_cold_consumer_retires_before_releasing_checkout() {
     .unwrap();
     let stats = std::fs::read_to_string(crate::zcode_warm::tests::stats_path(&fixture)).unwrap();
     assert!(stats.lines().any(|line| line == "close"), "{stats}");
+}
+
+#[tokio::test]
+async fn cold_goal_ignores_completion_markers_in_intermediate_messages() {
+    use codex_api::ResponseEvent;
+    use codex_protocol::models::ContentItem;
+    use codex_protocol::models::MessagePhase;
+    use codex_protocol::models::ResponseItem;
+
+    for final_text in ["Validation failed; more work remains", ""] {
+        let work = tempfile::TempDir::new().unwrap();
+        let fixture = crate::zcode_warm::tests::write_fake_server();
+        let source = std::fs::read_to_string(&fixture).unwrap();
+        std::fs::write(
+            &fixture,
+            source.replace(
+                "function runTurn(sessionId, content) {",
+                &format!(
+                    r#"function runTurn(sessionId, content) {{
+                    emit({{ sessionId, type: "model.streaming", payload: {{ kind: "text_delta", delta: "provisional\n[GOAL:COMPLETE]" }} }});
+                    emit({{ sessionId, type: "model.streaming", payload: {{ kind: "tool_input_start" }} }});
+                    emit({{ sessionId, type: "model.streaming", payload: {{ kind: "text_delta", delta: {} }} }});
+                    emit({{ sessionId, type: "turn.completed", payload: {{ response: "provisional\n[GOAL:COMPLETE]", resultType: "success" }} }});
+                    return;"#,
+                    serde_json::to_string(final_text).unwrap(),
+                ),
+            ),
+        )
+        .unwrap();
+        let prompt = crate::Prompt {
+            tools: goal_tools(),
+            zcode_execution: ZcodeExecutionPolicy {
+                approval_policy: AskForApproval::Never,
+                permission_profile: PermissionProfile::Disabled,
+                workspace: Some(AbsolutePathBuf::try_from(work.path().to_path_buf()).unwrap()),
+            },
+            ..Default::default()
+        };
+        let mut stream = super::stream_cold(
+            crate::zcode_warm::tests::test_runtime(&fixture),
+            &prompt,
+            "intermediate-marker",
+        )
+        .await
+        .unwrap();
+        let mut outputs = Vec::new();
+        loop {
+            match stream.rx_event.recv().await.unwrap().unwrap() {
+                ResponseEvent::OutputItemDone(item) => outputs.push(item),
+                ResponseEvent::Completed { .. } => break,
+                _ => {}
+            }
+        }
+        let mut expected = vec![ResponseItem::Message {
+            id: None,
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: "provisional".to_string(),
+            }],
+            phase: Some(MessagePhase::Commentary),
+            internal_chat_message_metadata_passthrough: None,
+        }];
+        if !final_text.is_empty() {
+            expected.push(crate::zcode_warm::assistant_message(final_text.to_string()));
+        }
+        assert_eq!(outputs, expected);
+    }
 }

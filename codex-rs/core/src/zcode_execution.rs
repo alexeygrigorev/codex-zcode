@@ -5,6 +5,7 @@ use codex_api::ApiError;
 use codex_api::ResponseEvent;
 use codex_api::ResponseStream;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::MessagePhase;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AskForApproval;
@@ -223,13 +224,15 @@ pub(crate) async fn stream_cold(
                                 .sum::<usize>();
                         }
                         if goal_protocol.is_some()
-                            && let ResponseItem::Message { content, .. } = &mut item
+                            && let ResponseItem::Message { content, phase, .. } = &mut item
                         {
                             for chunk in content {
                                 if let ContentItem::OutputText { text } = chunk
                                     && let Some(status) = super::zcode_goal_status_from_reply(text)
                                 {
-                                    if !goal_already_reported {
+                                    if !goal_already_reported
+                                        && *phase != Some(MessagePhase::Commentary)
+                                    {
                                         goal_status = Some(status);
                                     }
                                     *text = super::zcode_strip_goal_status_marker(text);

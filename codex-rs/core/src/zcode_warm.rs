@@ -1045,10 +1045,17 @@ impl ZcodeWarmBridge {
                 // Preserve the cold adapter's message boundaries. Combining
                 // all inner model steps would create an oversized history item.
                 if tool_boundary && started_output {
+                    let item = ResponseItem::Message {
+                        id: None,
+                        role: "assistant".to_string(),
+                        content: vec![codex_protocol::models::ContentItem::OutputText {
+                            text: std::mem::take(&mut reply),
+                        }],
+                        phase: Some(codex_protocol::models::MessagePhase::Commentary),
+                        internal_chat_message_metadata_passthrough: None,
+                    };
                     if tx
-                        .send(Ok(ResponseEvent::OutputItemDone(assistant_message(
-                            std::mem::take(&mut reply),
-                        ))))
+                        .send(Ok(ResponseEvent::OutputItemDone(item)))
                         .await
                         .is_err()
                     {
