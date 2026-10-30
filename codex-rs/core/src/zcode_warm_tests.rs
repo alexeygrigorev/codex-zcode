@@ -34,6 +34,14 @@ fn assistant_message(text: &str) -> ResponseItem {
     }
 }
 
+fn final_assistant_message(text: &str) -> ResponseItem {
+    let mut item = assistant_message(text);
+    if let ResponseItem::Message { phase, .. } = &mut item {
+        *phase = Some(codex_protocol::models::MessagePhase::FinalAnswer);
+    }
+    item
+}
+
 /// Writes the fake app-server fixture and returns its path; the fake appends
 /// one line per handled request to `<fixture>.stats` so tests can assert how
 /// many sessions were created.
@@ -621,7 +629,7 @@ async fn warm_turn_streams_deltas_and_completes_with_usage() {
         other => panic!("expected OutputTextDelta, got {other:?}"),
     }
     match next_event(&mut rx).await {
-        ResponseEvent::OutputItemDone(item) => assert_eq!(item, assistant_message("first")),
+        ResponseEvent::OutputItemDone(item) => assert_eq!(item, final_assistant_message("first")),
         other => panic!("expected OutputItemDone, got {other:?}"),
     }
     match next_event(&mut rx).await {
@@ -720,7 +728,7 @@ async fn warm_turn_maps_tool_call_events_to_bridge_activity() {
         match next_event(&mut rx).await {
             ResponseEvent::OutputTextDelta(_) => continue,
             ResponseEvent::OutputItemDone(item) => {
-                assert_eq!(item, assistant_message("toolturn"));
+                assert_eq!(item, final_assistant_message("toolturn"));
                 break;
             }
             other => panic!("expected streamed output, got {other:?}"),
@@ -867,7 +875,7 @@ async fn warm_turn_reports_budget_exhaustion_instead_of_success() {
     let err = loop {
         match tokio::time::timeout(Duration::from_secs(30), rx.recv()).await {
             Ok(Some(Ok(ResponseEvent::OutputItemDone(item)))) => {
-                assert_eq!(item, assistant_message("nodelta!"));
+                assert_eq!(item, final_assistant_message("nodelta!"));
                 saw_partial_reply = true;
             }
             Ok(Some(Ok(_))) => continue,

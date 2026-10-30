@@ -231,7 +231,7 @@ pub(crate) async fn stream_cold(
                                     && let Some(status) = super::zcode_goal_status_from_reply(text)
                                 {
                                     if !goal_already_reported
-                                        && *phase != Some(MessagePhase::Commentary)
+                                        && *phase == Some(MessagePhase::FinalAnswer)
                                     {
                                         goal_status = Some(status);
                                     }

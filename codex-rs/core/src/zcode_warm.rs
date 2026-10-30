@@ -1051,7 +1051,9 @@ impl ZcodeWarmBridge {
                         content: vec![codex_protocol::models::ContentItem::OutputText {
                             text: std::mem::take(&mut reply),
                         }],
-                        phase: Some(codex_protocol::models::MessagePhase::Commentary),
+                        // Commentary would let mailbox input preempt a still
+                        // executing inner turn and start another executor.
+                        phase: None,
                         internal_chat_message_metadata_passthrough: None,
                     };
                     if tx
@@ -1141,15 +1143,20 @@ impl ZcodeWarmBridge {
                         } else {
                             std::mem::take(&mut reply)
                         };
-                        if !response.is_empty()
-                            && tx
-                                .send(Ok(codex_api::ResponseEvent::OutputItemDone(
-                                    assistant_message(response),
-                                )))
+                        if !response.is_empty() {
+                            let mut item = assistant_message(response);
+                            if let ResponseItem::Message { phase, .. } = &mut item {
+                                // Cold goal markers are eligible only here,
+                                // after the inner turn has completed.
+                                *phase = Some(codex_protocol::models::MessagePhase::FinalAnswer);
+                            }
+                            if tx
+                                .send(Ok(codex_api::ResponseEvent::OutputItemDone(item)))
                                 .await
                                 .is_err()
-                        {
-                            return;
+                            {
+                                return;
+                            }
                         }
                         match zcode_completed_turn_error(result_type) {
                             Some(err) => {

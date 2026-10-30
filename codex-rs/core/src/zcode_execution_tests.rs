@@ -22,6 +22,14 @@ fn goal_tools() -> std::sync::Arc<[codex_tools::ToolSpec]> {
     .into()
 }
 
+fn final_message(text: &str) -> codex_protocol::models::ResponseItem {
+    let mut item = crate::zcode_warm::assistant_message(text.to_string());
+    if let codex_protocol::models::ResponseItem::Message { phase, .. } = &mut item {
+        *phase = Some(codex_protocol::models::MessagePhase::FinalAnswer);
+    }
+    item
+}
+
 #[test]
 fn admission_requires_the_captured_unrestricted_local_contract() {
     let workspace = AbsolutePathBuf::try_from(std::env::current_dir().unwrap()).unwrap();
@@ -351,10 +359,7 @@ async fn cold_goal_continuation_preserves_history_and_steering_before_reporting_
         }
     }
     assert_eq!(outputs.len(), 2);
-    assert_eq!(
-        outputs.remove(0),
-        crate::zcode_warm::assistant_message("done".to_string())
-    );
+    assert_eq!(outputs.remove(0), final_message("done"));
     let ResponseItem::FunctionCall {
         name, arguments, ..
     } = outputs.remove(0)
@@ -448,7 +453,6 @@ async fn aborted_cold_consumer_retires_before_releasing_checkout() {
 async fn cold_goal_ignores_completion_markers_in_intermediate_messages() {
     use codex_api::ResponseEvent;
     use codex_protocol::models::ContentItem;
-    use codex_protocol::models::MessagePhase;
     use codex_protocol::models::ResponseItem;
 
     for final_text in ["Validation failed; more work remains", ""] {
@@ -501,11 +505,11 @@ async fn cold_goal_ignores_completion_markers_in_intermediate_messages() {
             content: vec![ContentItem::OutputText {
                 text: "provisional".to_string(),
             }],
-            phase: Some(MessagePhase::Commentary),
+            phase: None,
             internal_chat_message_metadata_passthrough: None,
         }];
         if !final_text.is_empty() {
-            expected.push(crate::zcode_warm::assistant_message(final_text.to_string()));
+            expected.push(final_message(final_text));
         }
         assert_eq!(outputs, expected);
     }
