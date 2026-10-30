@@ -66,7 +66,7 @@ use crate::zcode_warm_resume;
 #[path = "zcode_warm_model.rs"]
 mod model;
 #[path = "zcode_warm_output.rs"]
-mod output;
+pub(super) mod output;
 
 /// Env var enabling the warm bridge (`ZCODE_WARM=1`).
 const WARM_BRIDGE_ENV_VAR: &str = "ZCODE_WARM";
@@ -1011,7 +1011,7 @@ impl ZcodeWarmBridge {
 
             let mut reply = String::new();
             let mut started_output = false;
-            let mut saw_text = false;
+            let mut last_flushed_reply = String::new();
             let mut tool_names = HashMap::new();
             loop {
                 let received = tokio::select! {
@@ -1057,6 +1057,11 @@ impl ZcodeWarmBridge {
                 let notification_type =
                     notification.get("type").and_then(serde_json::Value::as_str);
                 let tool_boundary = notification_type == Some("tool_call_scheduled")
+                    || (notification_type == Some("tool.updated")
+                        && notification
+                            .pointer("/payload/kind")
+                            .and_then(serde_json::Value::as_str)
+                            == Some("scheduled"))
                     || (notification_type == Some("model.streaming")
                         && matches!(
                             notification
@@ -1067,6 +1072,7 @@ impl ZcodeWarmBridge {
                 // Preserve the cold adapter's message boundaries. Combining
                 // all inner model steps would create an oversized history item.
                 if tool_boundary && started_output {
+                    last_flushed_reply.clone_from(&reply);
                     let item = ResponseItem::Message {
                         id: None,
                         role: "assistant".to_string(),
@@ -1107,7 +1113,6 @@ impl ZcodeWarmBridge {
                                 let _ = tx.send(Err(error)).await;
                                 return;
                             }
-                            saw_text = true;
                             if !started_output {
                                 started_output = true;
                                 let item = assistant_message(String::new());
@@ -1133,7 +1138,12 @@ impl ZcodeWarmBridge {
                             }
                         }
                     }
-                    Some("tool_call_scheduled" | "tool_call_result" | "tool_call_error") => {
+                    Some(
+                        "tool.updated"
+                        | "tool_call_scheduled"
+                        | "tool_call_result"
+                        | "tool_call_error",
+                    ) => {
                         // Display-only tool activity from the core's own
                         // agent loop (issue #38): surfaced as an event, never
                         // as a ResponseItem the ToolCallRuntime would run.
@@ -1163,12 +1173,16 @@ impl ZcodeWarmBridge {
                             .unwrap_or("success");
                         // Prefer the streamed text; fall back to the final
                         // response for turns whose deltas never arrived.
-                        let response = if !saw_text {
-                            payload
+                        let response = if reply.is_empty() {
+                            let fallback = payload
                                 .get("response")
                                 .and_then(serde_json::Value::as_str)
-                                .unwrap_or_default()
-                                .to_string()
+                                .unwrap_or_default();
+                            if fallback == last_flushed_reply {
+                                String::new()
+                            } else {
+                                fallback.to_string()
+                            }
                         } else {
                             std::mem::take(&mut reply)
                         };

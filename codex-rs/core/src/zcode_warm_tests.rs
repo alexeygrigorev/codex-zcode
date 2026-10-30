@@ -110,6 +110,10 @@ pub(crate) enum GoalLoopMode {
     Paused,
     /// Emit fourteen bare continuation turns and never settle.
     Capped,
+    /// Exceed the history limit using streamed deltas.
+    OversizedStream,
+    /// Exceed the history limit using only the completed response.
+    OversizedFallback,
 }
 
 impl Default for FakeServerOptions {
@@ -324,6 +328,16 @@ function handle(msg) {
       }
       const target = { targetId: "tgt_1", objective: msg.params.objective, status: "active" };
       emit({ sessionId: msg.params.sessionId, type: "session.updated", payload: { action: "set", source: "command", target } });
+      if (GOAL_LOOP === "oversized-stream" || GOAL_LOOP === "oversized-fallback") {
+        const response = "x".repeat(8001);
+        if (GOAL_LOOP === "oversized-stream") {
+          emit({ sessionId: msg.params.sessionId, type: "model.streaming", payload: { kind: "text_delta", delta: "ok" } });
+          emit({ sessionId: msg.params.sessionId, type: "model.streaming", payload: { kind: "text_delta", delta: response.slice(0, 7999) } });
+        }
+        emit({ sessionId: msg.params.sessionId, type: "turn.completed", payload: { response, resultType: "success" } });
+        respond({ response: "Goal active", snapshot: {}, startedTurn: true });
+        break;
+      }
       if (GOAL_LOOP === "capped") {
         for (let i = 0; i < 14; i++) {
           emit({ sessionId: msg.params.sessionId, type: "turn.completed", payload: { response: "step " + i, resultType: "success" } });
@@ -331,6 +345,7 @@ function handle(msg) {
         respond({ response: "Goal active", snapshot: {}, startedTurn: true });
         break;
       }
+      if (TOOL_EVENTS) emit({ sessionId: msg.params.sessionId, type: "tool.updated", payload: { kind: "scheduled", toolCallId: "goal_read", toolName: "Read", input: { file: "/x" } } });
       emit({ sessionId: msg.params.sessionId, type: "model.streaming", payload: { kind: "text_delta", delta: "go" } });
       emit({ sessionId: msg.params.sessionId, type: "model.streaming", payload: { kind: "text_delta", delta: "al" } });
       emit({ sessionId: msg.params.sessionId, type: "turn.completed", payload: { response: "goal work done", usage: { inputTokens: 7, outputTokens: 3, totalTokens: 10 }, resultType: "success" } });
@@ -347,11 +362,18 @@ function handle(msg) {
 // Both input surfaces feed the same turn: tool activity, deltas, terminal
 // event — only the request/ACK envelope differs.
 function runTurn(sessionId, content) {
+  if (content.startsWith("boundary-fallback:")) {
+    emit({ sessionId, type: "model.streaming", payload: { kind: "text_delta", delta: "checking" } });
+    emit({ sessionId, type: "model.streaming", payload: { kind: "tool_input_start" } });
+    emit({ sessionId, type: "turn.completed", payload: { response: content.slice("boundary-fallback:".length), resultType: "success" } });
+    return;
+  }
   if (TOOL_EVENTS) {
-    emit({ sessionId: sessionId, type: "tool_call_scheduled", payload: { toolCallId: "tc_1", toolName: "Bash", input: { command: "ls /tmp" } } });
-    emit({ sessionId: sessionId, type: "tool_call_scheduled", payload: { toolCallId: "tc_2", toolName: "Read", input: { file: "/x" } } });
-    emit({ sessionId: sessionId, type: "tool_call_result", payload: { toolCallId: "tc_1", result: { success: true, content: "out" }, duration: 3 } });
-    emit({ sessionId: sessionId, type: "tool_call_error", payload: { toolCallId: "tc_2", error: { type: "ToolError", message: "boom" } } });
+    emit({ sessionId: sessionId, type: "tool.updated", payload: { kind: "scheduled", toolCallId: "tc_1", toolName: "Bash", input: { command: "ls /tmp" } } });
+    emit({ sessionId: sessionId, type: "tool.updated", payload: { kind: "started", toolCallId: "tc_1", toolName: "Bash", startedAt: 1 } });
+    emit({ sessionId: sessionId, type: "tool.updated", payload: { kind: "scheduled", toolCallId: "tc_2", toolName: "Read", input: { file: "/x" } } });
+    emit({ sessionId: sessionId, type: "tool.updated", payload: { kind: "result", toolCallId: "tc_1", result: { success: true, content: "out" }, duration: 3 } });
+    emit({ sessionId: sessionId, type: "tool.updated", payload: { kind: "error", toolCallId: "tc_2", error: { type: "ToolError", message: "boom" } } });
   }
   if (!content.includes("nodelta")) {
     emit({ sessionId: sessionId, type: "model.streaming", payload: { kind: "text_delta", delta: content.slice(0, 2) } });
@@ -567,6 +589,8 @@ process.stdin.on("data", (chunk) => {
                 GoalLoopMode::Complete => "\"complete\"",
                 GoalLoopMode::Paused => "\"paused\"",
                 GoalLoopMode::Capped => "\"capped\"",
+                GoalLoopMode::OversizedStream => "\"oversized-stream\"",
+                GoalLoopMode::OversizedFallback => "\"oversized-fallback\"",
             },
         )
         .replace("%RESULT_TYPE%", options.turn_result_type);
@@ -1745,6 +1769,58 @@ async fn warm_retirement_runs_once_for_concurrent_and_repeated_callers() {
         ),
         (Some("close"), 1),
     );
+}
+
+#[tokio::test]
+async fn final_fallback_after_tool_boundary_preserves_only_distinct_text() {
+    for (fallback, expected) in [
+        ("final answer", vec!["checking", "final answer"]),
+        ("checking", vec!["checking"]),
+    ] {
+        let fixture = write_fake_server();
+        let bridge = ZcodeWarmBridge::spawn(
+            &test_runtime(&fixture),
+            "/tmp",
+            WarmMode::Build,
+            WarmPermissionPolicy::DenyAll,
+            SessionSeed::Fresh,
+        )
+        .expect("spawn fake app-server");
+        let session_id = bridge
+            .prepare_session("/tmp", WarmMode::Build)
+            .await
+            .expect("prepare session");
+        let mut stream = bridge
+            .turn(
+                &session_id,
+                &format!("boundary-fallback:{fallback}"),
+                TurnInputChannel::LegacySend,
+            )
+            .expect("start turn");
+        let mut items = Vec::new();
+        loop {
+            match next_event(&mut stream.rx_event).await {
+                ResponseEvent::OutputItemDone(item) => items.push(item),
+                ResponseEvent::Completed { .. } => break,
+                _ => {}
+            }
+        }
+        let expected = expected
+            .into_iter()
+            .enumerate()
+            .map(|(index, text)| {
+                let mut item = assistant_message(text);
+                if index > 0
+                    && let ResponseItem::Message { phase, .. } = &mut item
+                {
+                    *phase = Some(codex_protocol::models::MessagePhase::FinalAnswer);
+                }
+                item
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(items, expected);
+        bridge.retire().await.expect("retire fake app-server");
+    }
 }
 
 #[tokio::test]

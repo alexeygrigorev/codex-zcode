@@ -18,7 +18,7 @@ const DETAIL_PREVIEW_CAP: usize = 200;
 /// Extracts the bridge tool activity carried by one `session/event`
 /// notification, or `None` when it is not a mapped tool-call event.
 ///
-/// Only `tool_call_scheduled` reliably names the tool, so [`HashMap`]
+/// Only scheduled events reliably name the tool, so [`HashMap`]
 /// `tool_names` remembers each call's name for the later result/error
 /// events, which may omit `toolName`.
 pub(crate) fn bridge_tool_activity_from_notification(
@@ -29,6 +29,18 @@ pub(crate) fn bridge_tool_activity_from_notification(
         .get("type")
         .and_then(serde_json::Value::as_str)?;
     let payload = notification.get("payload")?;
+    // Native app-server events wrap the original tool payload with a kind.
+    // Keep accepting the older envelopes used by earlier native runtimes.
+    let event_type = if event_type == "tool.updated" {
+        match payload.get("kind").and_then(serde_json::Value::as_str)? {
+            "scheduled" => "tool_call_scheduled",
+            "result" => "tool_call_result",
+            "error" => "tool_call_error",
+            _ => return None,
+        }
+    } else {
+        event_type
+    };
     let call_id = payload
         .get("toolCallId")
         .and_then(serde_json::Value::as_str)?
