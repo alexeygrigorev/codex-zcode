@@ -1749,7 +1749,10 @@ async fn warm_retirement_runs_once_for_concurrent_and_repeated_callers() {
 
 #[tokio::test]
 async fn oversized_assistant_items_fail_without_completing_or_resubmitting() {
-    for content in ["x".repeat(8_001), format!("nodelta{}", "x".repeat(8_001))] {
+    for content in [
+        "x".repeat(/*n*/ 8_001),
+        format!("nodelta{}", "x".repeat(/*n*/ 8_001)),
+    ] {
         let fixture = write_fake_server();
         let bridge = ZcodeWarmBridge::spawn(
             &test_runtime(&fixture),
