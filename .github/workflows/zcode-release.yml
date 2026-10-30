@@ -5,6 +5,11 @@ on:
     tags:
       - "zcode-*-codex-*"
   workflow_dispatch:
+    inputs:
+      validate_runtime:
+        description: Run targeted/full runtime tests and lint instead of building release artifacts
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -18,6 +23,7 @@ env:
 
 jobs:
   build:
+    if: github.event_name != 'workflow_dispatch' || !inputs.validate_runtime
     name: Build ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 240
@@ -88,6 +94,102 @@ jobs:
         with:
           name: ${{ matrix.asset_name }}-symbols
           path: ${{ matrix.asset_name }}.debug
+          if-no-files-found: error
+
+  validate-runtime:
+    name: Validate runtime
+    if: github.event_name == 'workflow_dispatch' && inputs.validate_runtime
+    runs-on: ubuntu-26.04
+    timeout-minutes: 240
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_BUILD_JOBS: "2"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Recover space on this disposable runner
+        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+
+      - uses: ./.github/actions/setup-ci
+
+      - name: Install Linux workspace build dependencies
+        run: |
+          sudo apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential pkg-config libcap-dev libasound2-dev bubblewrap \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
+          pkg-config --atleast-version=1.28 gstreamer-1.0 gstreamer-app-1.0 gstreamer-audio-1.0
+
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          components: clippy, rustfmt
+
+      - uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
+        with:
+          tool: cargo-nextest@0.9.143
+
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.11.3"
+
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: 22
+
+      - name: Record source, tools and available resources
+        run: |
+          mkdir -p ci-evidence
+          git rev-parse HEAD 'HEAD^{tree}' > ci-evidence/source.txt
+          cargo -vV > ci-evidence/rust.txt
+          cargo nextest --version > ci-evidence/nextest.txt
+          df -h
+          free -m
+
+      - name: Build workspace executables required by integration tests
+        working-directory: codex-rs
+        run: |
+          set -o pipefail
+          cargo build --locked --workspace --bins --profile dev-small --jobs 2 2>&1 | tee ../ci-evidence/test-binaries.log
+          # Upstream test fixtures still resolve the CLI by its upstream name.
+          ln -s zcodex "$CARGO_TARGET_DIR/dev-small/codex"
+          echo "CARGO_BIN_EXE_codex=$CARGO_TARGET_DIR/dev-small/zcodex" >> "$GITHUB_ENV"
+
+      - name: Test changed runtime project
+        run: |
+          set -o pipefail
+          just test -p codex-core --cargo-profile dev-small --build-jobs 2 --test-threads 2 2>&1 | tee ci-evidence/core-tests.log
+          cp "$CARGO_TARGET_DIR/nextest/local/junit.xml" ci-evidence/core-junit.xml
+
+      - name: Test full runtime workspace
+        run: |
+          set -o pipefail
+          just test --workspace --cargo-profile dev-small --build-jobs 2 --test-threads 2 2>&1 | tee ci-evidence/workspace-tests.log
+          cp "$CARGO_TARGET_DIR/nextest/local/junit.xml" ci-evidence/workspace-junit.xml
+
+      - name: Apply required scoped lint fixes
+        run: just fix -p codex-core --profile dev-small --jobs 2
+
+      - name: Apply final formatting and require an unchanged source tree
+        run: |
+          just fmt
+          git diff --exit-code
+
+      - name: Retain actual validation evidence and any suggested fixes
+        if: always()
+        run: |
+          mkdir -p ci-evidence
+          git diff --binary > ci-evidence/suggested-fixes.patch
+          if [[ -f "$CARGO_TARGET_DIR/nextest/local/junit.xml" ]]; then
+            cp "$CARGO_TARGET_DIR/nextest/local/junit.xml" ci-evidence/latest-junit.xml
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: runtime-validation-evidence
+          path: ci-evidence
           if-no-files-found: error
 
   release:
