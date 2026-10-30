@@ -1079,7 +1079,7 @@ impl ZcodeWarmBridge {
                         internal_chat_message_metadata_passthrough: None,
                     };
                     if tx
-                        .send(Ok(ResponseEvent::OutputItemDone(item)))
+                        .send(Ok(codex_api::ResponseEvent::OutputItemDone(item)))
                         .await
                         .is_err()
                     {
