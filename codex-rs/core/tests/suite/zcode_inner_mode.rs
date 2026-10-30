@@ -4,6 +4,7 @@
 //! execution, fresh cold lifecycles, warm reuse, and no replay after failure.
 
 use codex_core::StartThreadOptions;
+use codex_core::TurnInputRequest;
 use codex_features::Feature;
 use codex_model_provider_info::WireApi;
 use codex_protocol::dynamic_tools::DynamicToolFunctionSpec;
@@ -12,8 +13,11 @@ use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
+use codex_protocol::protocol::ThreadSettingsOverrides;
+use codex_protocol::user_input::UserInput;
 use core_test_support::responses::start_mock_server;
 use core_test_support::test_codex::test_codex;
+use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
 use std::ffi::OsStr;
@@ -62,6 +66,10 @@ enum Outcome {
     GoalContinuation,
     Disconnect,
     RejectMode,
+    WrongModel,
+    LostOutput,
+    InterruptSend,
+    InterruptGoal,
     DenyClient,
     UnknownPolicy,
     GatedMode,
@@ -82,6 +90,18 @@ async fn probe(
     let cjs = work.path().join("stub.cjs");
     let log = work.path().join("protocol.log");
     let effect = work.path().join("effects");
+    let output_peer = if matches!(
+        outcome,
+        Outcome::LostOutput | Outcome::InterruptSend | Outcome::InterruptGoal
+    ) {
+        Some(
+            tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap(),
+        )
+    } else {
+        None
+    };
     let source = r#"
 const fs = require("fs");
 const record = (value) => fs.appendFileSync(%LOG%, value + "\n");
@@ -92,10 +112,21 @@ if (!process.argv.includes("app-server")) { record("unexpected-cli"); process.ex
 let turn = 0;
 let compacting = false;
 let noTools = false;
+let holdInput = false;
+const modelSettings = { model: { current: { providerId: "zai", modelId: "fixture-before" },
+  available: [{ ref: { providerId: "zai", modelId: "fixture-before" }, reasoning: { levels: [{ value: "unused" }], defaultLevel: "unused" } },
+  { ref: { providerId: "zai", modelId: "glm-5.3-flash" },
+  reasoning: { levels: [{ label: "Fixture", value: "fixture-default" }], defaultLevel: "fixture-default" } }] } };
 function permission(tool) {
   emit({ id: "permission-" + tool, method: "interaction/requestPermission", params: {
     sessionId, requestId: "request-" + turn + tool, toolCallId: "tool-" + tool,
     toolName: tool, riskLevel: "high", input: {}, reason: "test execution" } });
+}
+function holdExecutor() {
+  const socket = require("net").connect(%OUTPUT_PORT%, "127.0.0.1", () => socket.write("R"));
+  socket.on("error", () => process.exit(0));
+  socket.on("end", () => process.exit(0));
+  setTimeout(() => process.exit(0), 30000).unref();
 }
 require("readline").createInterface({ input: process.stdin }).on("line", (line) => {
   const message = JSON.parse(line);
@@ -115,6 +146,16 @@ require("readline").createInterface({ input: process.stdin }).on("line", (line) 
     }
     if (tool === "Bash") {
       fs.appendFileSync(%EFFECT%, "inner\n");
+      if (holdInput) { holdExecutor(); return; }
+      if (%LOST_OUTPUT%) {
+        const socket = require("net").connect(%OUTPUT_PORT%, "127.0.0.1", () => {
+          socket.write("R"); fs.closeSync(1);
+        });
+        socket.on("error", () => process.exit(0));
+        socket.on("end", () => process.exit(0));
+        setTimeout(() => process.exit(0), 30000).unref();
+        return;
+      }
       if (%DISCONNECT%) process.exit(0);
       if (%TEXT_SEGMENTS%) emit({ method: "session/event", params: { sessionId,
         type: "model.streaming", payload: { kind: "tool_input_start" } } });
@@ -140,21 +181,29 @@ require("readline").createInterface({ input: process.stdin }).on("line", (line) 
       record("create:" + message.params.mode);
       record("toolAllowlist:" + JSON.stringify(message.params.toolAllowlist ?? null));
       noTools = Array.isArray(message.params.toolAllowlist) && message.params.toolAllowlist.length === 0;
-      reply({ session: { sessionId }, protocol: { version: 1 } }); break;
+      reply({ session: { sessionId }, settings: modelSettings, protocol: { version: 1 } }); break;
     case "session/list":
       reply({ sessions: message.params.sessionIds.map(sessionId => ({ sessionId })) }); break;
     case "session/resume":
       record("resume"); sessionId = message.params.sessionId;
       record("toolAllowlist:" + JSON.stringify(message.params.toolAllowlist ?? null));
       noTools = Array.isArray(message.params.toolAllowlist) && message.params.toolAllowlist.length === 0;
-      reply({ protocol: { version: 1 } }); break;
+      reply({ settings: modelSettings, protocol: { version: 1 } }); break;
     case "session/subscribe": reply({ eventSeq: 0, events: [] }); break;
+    case "session/setModel":
+      record("model:" + message.params.model.providerId + "/" + message.params.model.modelId + ":" + message.params.model.options?.reasoningLevel);
+      if (message.params.model.options?.reasoningLevel !== "fixture-default") {
+        emit({ id: message.id, error: { code: -32602, message: "reasoning level missing or invalid" } }); break;
+      }
+      reply({ session: { sessionId }, settings: { model: { current: %WRONG_MODEL%
+        ? { providerId: "other-provider", modelId: "other-model" } : message.params.model } } }); break;
     case "session/setMode":
       record("mode:" + message.params.mode);
       if (%REJECT_MODE%) emit({ id: message.id, error: { code: -32000, message: "mode rejected" } });
       else reply({});
       break;
     case "session/send":
+      holdInput = %INTERRUPT_SEND% && message.params.content.includes("hold-for-interrupt");
       record("send"); record("content:" + JSON.stringify(message.params.content)); turn++; reply({ accepted: true });
       if (%TEXT_SEGMENTS%) emit({ method: "session/event", params: { sessionId,
         type: "model.streaming", payload: { kind: "text_delta", delta: "Let me check." } } });
@@ -172,6 +221,11 @@ require("readline").createInterface({ input: process.stdin }).on("line", (line) 
       record("v4-send"); fs.appendFileSync(%EFFECT%, "inner\n");
       reply({ status: "unknown-after-execution" }); break;
     case "session/close": record("close:" + process.pid); reply({ closed: true }); break;
+    case "session/goal":
+      if (%INTERRUPT_GOAL%) {
+        fs.appendFileSync(%EFFECT%, "inner\n"); holdExecutor();
+      } else reply({ startedTurn: false });
+      break;
     case "session/stop": reply({}); break;
     default: emit({ id: message.id, error: { code: -32601, message: "unsupported " + message.method } });
   }
@@ -184,6 +238,47 @@ process.stdin.on("end", () => record("eof:" + process.pid));
         .replace("%COMPACT_DISCONNECT%", if matches!(outcome, Outcome::CompactDisconnect) { "true" } else { "false" })
         .replace("%DISCONNECT%", if matches!(outcome, Outcome::Disconnect) { "true" } else { "false" })
         .replace("%REJECT_MODE%", if matches!(outcome, Outcome::RejectMode) { "true" } else { "false" });
+    let source = source.replace(
+        "%WRONG_MODEL%",
+        if matches!(outcome, Outcome::WrongModel) {
+            "true"
+        } else {
+            "false"
+        },
+    );
+    let source = source
+        .replace(
+            "%INTERRUPT_SEND%",
+            if matches!(outcome, Outcome::InterruptSend) {
+                "true"
+            } else {
+                "false"
+            },
+        )
+        .replace(
+            "%INTERRUPT_GOAL%",
+            if matches!(outcome, Outcome::InterruptGoal) {
+                "true"
+            } else {
+                "false"
+            },
+        )
+        .replace(
+            "%LOST_OUTPUT%",
+            if matches!(outcome, Outcome::LostOutput) {
+                "true"
+            } else {
+                "false"
+            },
+        )
+        .replace(
+            "%OUTPUT_PORT%",
+            &output_peer
+                .as_ref()
+                .map(|peer| peer.local_addr().unwrap().port())
+                .unwrap_or_default()
+                .to_string(),
+        );
     std::fs::write(&cjs, source).unwrap();
     let fake_home = TempDir::new().unwrap();
     let other_home = TempDir::new().unwrap();
@@ -240,6 +335,10 @@ process.stdin.on("end", () => record("eof:" + process.pid));
         | Outcome::GoalContinuation
         | Outcome::Disconnect
         | Outcome::RejectMode
+        | Outcome::WrongModel
+        | Outcome::LostOutput
+        | Outcome::InterruptSend
+        | Outcome::InterruptGoal
         | Outcome::GatedMode
         | Outcome::TextSegments
         | Outcome::Compact
@@ -260,7 +359,7 @@ process.stdin.on("end", () => record("eof:" + process.pid));
         .build_with_auto_env(&server)
         .await
         .expect("build test Codex");
-    if matches!(outcome, Outcome::GoalContinuation) {
+    if matches!(outcome, Outcome::GoalContinuation | Outcome::InterruptGoal) {
         let started = test
             .thread_manager
             .start_thread(StartThreadOptions {
@@ -276,6 +375,55 @@ process.stdin.on("end", () => record("eof:" + process.pid));
             .expect("start thread with active goal tool");
         test.codex = started.thread;
     }
+    let mut interrupted_socket =
+        if matches!(outcome, Outcome::InterruptSend | Outcome::InterruptGoal) {
+            use tokio::io::AsyncReadExt;
+            let (sandbox_policy, permission_profile) =
+                turn_permission_fields(profile.clone(), test.config.cwd.as_path());
+            test.codex
+                .start_or_steer_turn(
+                    TurnInputRequest::user_input(vec![UserInput::Text {
+                        text: if matches!(outcome, Outcome::InterruptGoal) {
+                            "<objective>hold-for-interrupt</objective>".to_string()
+                        } else {
+                            "hold-for-interrupt".to_string()
+                        },
+                        text_elements: Vec::new(),
+                    }])
+                    .with_thread_settings(ThreadSettingsOverrides {
+                        approval_policy: Some(approval),
+                        sandbox_policy: Some(sandbox_policy),
+                        permission_profile,
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap();
+            let (mut socket, _) = tokio::time::timeout(
+                std::time::Duration::from_secs(/*secs*/ 5),
+                output_peer.as_ref().unwrap().accept(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let mut ready = [0];
+            tokio::time::timeout(
+                std::time::Duration::from_secs(/*secs*/ 5),
+                socket.read_exact(&mut ready),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(ready, [b'R']);
+            test.codex.submit(Op::Interrupt).await.unwrap();
+            wait_for_event(&test.codex, |event| {
+                matches!(event, EventMsg::TurnAborted(_))
+            })
+            .await;
+            Some(socket)
+        } else {
+            None
+        };
     for turn in 0..if matches!(
         outcome,
         Outcome::Complete | Outcome::GoalContinuation | Outcome::TextSegments
@@ -294,6 +442,23 @@ process.stdin.on("end", () => record("eof:" + process.pid));
         test.submit_turn_with_approval_and_permission_profile(message, approval, profile.clone())
             .await
             .expect("outer turn completes");
+        if matches!(outcome, Outcome::LostOutput)
+            && let Some(peer) = &output_peer
+        {
+            use tokio::io::AsyncReadExt;
+            let observed =
+                tokio::time::timeout(std::time::Duration::from_secs(/*secs*/ 5), async {
+                    let (mut socket, _) = peer.accept().await.unwrap();
+                    let mut bytes = Vec::new();
+                    if let Err(error) = socket.read_to_end(&mut bytes).await {
+                        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+                    }
+                    bytes
+                })
+                .await
+                .expect("failed turn must retire executor before thread shutdown");
+            assert_eq!(observed, vec![b'R']);
+        }
         if matches!(
             (lifecycle, outcome),
             (
@@ -309,6 +474,24 @@ process.stdin.on("end", () => record("eof:" + process.pid));
                 "cold completion must await retirement: {lines}"
             );
         }
+    }
+    if let Some(socket) = interrupted_socket.as_mut() {
+        use tokio::io::AsyncReadExt;
+        let mut bytes = Vec::new();
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(/*secs*/ 5),
+            socket.read_to_end(&mut bytes),
+        )
+        .await
+        .unwrap();
+        if let Err(error) = read {
+            assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+        }
+        assert_eq!(bytes, vec![b'R']);
+        assert_eq!(
+            std::fs::read_to_string(effect.with_extension("written")).unwrap(),
+            "written by inner Write"
+        );
     }
     if matches!(
         outcome,
@@ -435,6 +618,48 @@ async fn zcode_warm_client_reuses_process_with_real_callbacks() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zcode_client_binds_requested_model_before_every_cold_or_warm_input() {
+    core_test_support::skip_if_remote!("ZCode inner execution is explicitly host-local");
+    for lifecycle in [Lifecycle::Cold, Lifecycle::Warm] {
+        let (log, effects) = probe(
+            lifecycle,
+            Outcome::Complete,
+            AskForApproval::Never,
+            PermissionProfile::Disabled,
+        )
+        .await;
+        assert_eq!(effects, "inner\ninner\n");
+        assert_eq!(
+            log.iter()
+                .filter(|line| line.starts_with("model:") || *line == "send")
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec![
+                "model:zai/glm-5.3-flash:fixture-default",
+                "send",
+                "model:zai/glm-5.3-flash:fixture-default",
+                "send",
+            ],
+        );
+        let (log, effects) = probe(
+            lifecycle,
+            Outcome::WrongModel,
+            AskForApproval::Never,
+            PermissionProfile::Disabled,
+        )
+        .await;
+        assert_eq!(effects, "");
+        assert_eq!(
+            log.iter()
+                .filter(|line| line.starts_with("model:") || *line == "send")
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["model:zai/glm-5.3-flash:fixture-default"],
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn zcode_client_rejects_restricted_contract_before_spawn() {
     core_test_support::skip_if_remote!("ZCode inner execution is explicitly host-local");
     for (approval, profile) in [
@@ -463,6 +688,49 @@ async fn zcode_client_disconnect_after_effect_is_not_replayed() {
             1
         );
         assert_eq!(log.iter().filter(|line| *line == "send").count(), 1);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zcode_client_retires_executor_that_closes_stdout_after_an_effect() {
+    core_test_support::skip_if_remote!("ZCode inner execution is explicitly host-local");
+    for lifecycle in [Lifecycle::Cold, Lifecycle::Warm] {
+        let (log, effects) = probe(
+            lifecycle,
+            Outcome::LostOutput,
+            AskForApproval::Never,
+            PermissionProfile::Disabled,
+        )
+        .await;
+        assert_eq!(effects, "inner\n");
+        assert_eq!(log.iter().filter(|line| *line == "send").count(), 1);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zcode_warm_interrupt_then_turn_waits_for_old_executor_retirement() {
+    core_test_support::skip_if_remote!("ZCode inner execution is explicitly host-local");
+    for outcome in [Outcome::InterruptSend, Outcome::InterruptGoal] {
+        let (log, effects) = probe(
+            Lifecycle::Warm,
+            outcome,
+            AskForApproval::Never,
+            PermissionProfile::Disabled,
+        )
+        .await;
+        assert_eq!(effects, "inner\ninner\n");
+        let spawns = log
+            .iter()
+            .filter(|line| line.starts_with("spawn:"))
+            .collect::<Vec<_>>();
+        assert_eq!(spawns.len(), 2);
+        assert_ne!(spawns[0], spawns[1]);
+        assert_eq!(
+            log.iter()
+                .filter(|line| *line == "permission:Write:allow")
+                .count(),
+            1
+        );
     }
 }
 
