@@ -80,7 +80,7 @@ async fn dropping_warm_slot_holds_checkout_until_child_is_reaped() {
     });
     let _next_checkout = tokio::time::timeout(
         Duration::from_secs(/*secs*/ 5),
-        crate::zcode_process::acquire_zcode_session(&workspace_path, "next-test"),
+        crate::zcode_process::acquire_zcode_session(&workspace_path, "drop-test"),
     )
     .await
     .unwrap()
@@ -433,7 +433,7 @@ async fn aborted_cold_consumer_retires_before_releasing_checkout() {
     drop(stream);
     let _next_checkout = tokio::time::timeout(
         Duration::from_secs(/*secs*/ 5),
-        crate::zcode_process::acquire_zcode_session(&workspace.to_string_lossy(), "after-abort"),
+        crate::zcode_process::acquire_zcode_session(&workspace.to_string_lossy(), "abort-test"),
     )
     .await
     .unwrap()

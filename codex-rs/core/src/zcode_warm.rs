@@ -237,7 +237,10 @@ pub(crate) struct ZcodeWarmBridge {
     child: StdMutex<Option<Child>>,
     /// Saved at spawn: the child leads its own process group, so this id
     /// stays valid for group kills even after the direct child exits.
+    #[cfg(unix)]
     process_group_pid: u32,
+    #[cfg(windows)]
+    job: codex_utils_pty::JobObject,
     stderr_tail: Arc<StdMutex<Vec<u8>>>,
     /// Fan-out of `session/event` notification params to turn collectors.
     events: broadcast::Sender<serde_json::Value>,
@@ -297,8 +300,14 @@ impl ZcodeWarmBridge {
         // Own process group so teardown reaches shells the core spawned.
         #[cfg(unix)]
         command.process_group(0);
+        #[cfg(windows)]
+        let job = codex_utils_pty::JobObject::create_without_breakaway()?;
+        #[cfg(windows)]
+        let mut child = job.spawn_contained(&mut command)?;
+        #[cfg(not(windows))]
         let mut child = command.spawn()?;
 
+        #[cfg(unix)]
         let process_group_pid = child.id().ok_or_else(|| {
             io::Error::other("warm ZCode app-server has no process id after spawn")
         })?;
@@ -358,7 +367,10 @@ impl ZcodeWarmBridge {
             state: StdMutex::new(WarmState::default()),
             stdin: stdin_tx,
             child: StdMutex::new(Some(child)),
+            #[cfg(unix)]
             process_group_pid,
+            #[cfg(windows)]
+            job,
             stderr_tail,
             events,
             session_id: tokio::sync::OnceCell::new(),
@@ -486,8 +498,13 @@ impl ZcodeWarmBridge {
             None => false,
         };
         if owns_child {
-            codex_utils_pty::process_group::kill_process_group_by_pid(self.process_group_pid)
+            #[cfg(unix)]
+            codex_utils_pty::process_group::kill_process_group(self.process_group_pid)
                 .unwrap_or_else(|error| warn!("ZCode process group kill failed: {error}"));
+            #[cfg(windows)]
+            self.job
+                .terminate()
+                .unwrap_or_else(|error| warn!("ZCode process job termination failed: {error}"));
         }
     }
 
@@ -556,8 +573,17 @@ impl ZcodeWarmBridge {
             tokio::time::sleep(Duration::from_millis(/*millis*/ 10)).await;
         };
         self.dead.store(true, Ordering::Relaxed);
-        let _ = codex_utils_pty::process_group::kill_process_group_by_pid(self.process_group_pid);
-        close.and(exit)
+        // The leader has been reaped, so resolving its group from its PID
+        // would miss surviving shells. The saved group/job still owns them.
+        #[cfg(unix)]
+        let cleanup = codex_utils_pty::process_group::kill_process_group(self.process_group_pid);
+        #[cfg(windows)]
+        let cleanup = self.job.terminate();
+        #[cfg(not(any(unix, windows)))]
+        let cleanup = Ok::<(), io::Error>(());
+        close
+            .and(exit)
+            .and(cleanup.map_err(|error| format!("could not retire ZCode descendants: {error}")))
     }
 
     /// Transfers child ownership to an awaited or blocking retirement path.
@@ -963,6 +989,7 @@ impl ZcodeWarmBridge {
 
             let mut reply = String::new();
             let mut started_output = false;
+            let mut saw_text = false;
             let mut tool_names = HashMap::new();
             loop {
                 let received = tokio::select! {
@@ -1005,7 +1032,32 @@ impl ZcodeWarmBridge {
                 {
                     continue;
                 }
-                match notification.get("type").and_then(serde_json::Value::as_str) {
+                let notification_type =
+                    notification.get("type").and_then(serde_json::Value::as_str);
+                let tool_boundary = notification_type == Some("tool_call_scheduled")
+                    || (notification_type == Some("model.streaming")
+                        && matches!(
+                            notification
+                                .pointer("/payload/kind")
+                                .and_then(serde_json::Value::as_str),
+                            Some("tool_input_start" | "tool_call")
+                        ));
+                // Preserve the cold adapter's message boundaries. Combining
+                // all inner model steps would create an oversized history item.
+                if tool_boundary && started_output {
+                    if tx
+                        .send(Ok(ResponseEvent::OutputItemDone(assistant_message(
+                            std::mem::take(&mut reply),
+                        ))))
+                        .await
+                        .is_err()
+                    {
+                        stop_turn(&collector_bridge, &collector_session).await;
+                        return;
+                    }
+                    started_output = false;
+                }
+                match notification_type {
                     Some("model.streaming") => {
                         let payload = notification.get("payload");
                         let kind = payload
@@ -1017,6 +1069,7 @@ impl ZcodeWarmBridge {
                             .and_then(serde_json::Value::as_str)
                             .unwrap_or_default();
                         if kind == "text_delta" && !delta.is_empty() {
+                            saw_text = true;
                             if !started_output {
                                 started_output = true;
                                 let item = assistant_message(String::new());
@@ -1072,7 +1125,7 @@ impl ZcodeWarmBridge {
                             .unwrap_or("success");
                         // Prefer the streamed text; fall back to the final
                         // response for turns whose deltas never arrived.
-                        let response = if reply.is_empty() {
+                        let response = if !saw_text {
                             payload
                                 .get("response")
                                 .and_then(serde_json::Value::as_str)

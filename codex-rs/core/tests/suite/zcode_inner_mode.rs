@@ -64,6 +64,8 @@ enum Outcome {
     RejectMode,
     DenyClient,
     UnknownPolicy,
+    GatedMode,
+    TextSegments,
     Compact,
     CompactThenTurn,
     CompactDisconnect,
@@ -114,6 +116,8 @@ require("readline").createInterface({ input: process.stdin }).on("line", (line) 
     if (tool === "Bash") {
       fs.appendFileSync(%EFFECT%, "inner\n");
       if (%DISCONNECT%) process.exit(0);
+      if (%TEXT_SEGMENTS%) emit({ method: "session/event", params: { sessionId,
+        type: "model.streaming", payload: { kind: "tool_input_start" } } });
       permission("Write");
     } else {
       fs.writeFileSync(%EFFECT% + ".written", "written by inner Write");
@@ -122,6 +126,8 @@ require("readline").createInterface({ input: process.stdin }).on("line", (line) 
           payload: { toolCallId: "tool-" + toolName, toolName,
             input: { command: "echo outer >> " + %EFFECT%, file_path: %EFFECT%, content: "outer" } } } });
       }
+      if (%TEXT_SEGMENTS%) emit({ method: "session/event", params: { sessionId,
+        type: "model.streaming", payload: { kind: "text_delta", delta: "Done checking." } } });
       emit({ method: "session/event", params: { sessionId, type: "turn.completed",
         payload: { response: "actual client allowed Bash and Write", resultType: "success" } } });
     }
@@ -150,6 +156,8 @@ require("readline").createInterface({ input: process.stdin }).on("line", (line) 
       break;
     case "session/send":
       record("send"); record("content:" + JSON.stringify(message.params.content)); turn++; reply({ accepted: true });
+      if (%TEXT_SEGMENTS%) emit({ method: "session/event", params: { sessionId,
+        type: "model.streaming", payload: { kind: "text_delta", delta: "Let me check." } } });
       compacting = message.params.content.includes("Summarize the recorded probe without executing tools");
       if (compacting) {
         record("compact");
@@ -172,6 +180,7 @@ process.stdin.on("end", () => record("eof:" + process.pid));
 "#
         .replace("%LOG%", &serde_json::to_string(&log).unwrap())
         .replace("%EFFECT%", &serde_json::to_string(&effect).unwrap())
+        .replace("%TEXT_SEGMENTS%", if matches!(outcome, Outcome::TextSegments) { "true" } else { "false" })
         .replace("%COMPACT_DISCONNECT%", if matches!(outcome, Outcome::CompactDisconnect) { "true" } else { "false" })
         .replace("%DISCONNECT%", if matches!(outcome, Outcome::Disconnect) { "true" } else { "false" })
         .replace("%REJECT_MODE%", if matches!(outcome, Outcome::RejectMode) { "true" } else { "false" });
@@ -197,7 +206,14 @@ process.stdin.on("end", () => record("eof:" + process.pid));
                 Lifecycle::Warm => "1",
             }),
         ),
-        EnvVarGuard::set("ZCODE_WARM_MODE", OsStr::new("yolo")),
+        EnvVarGuard::set(
+            "ZCODE_WARM_MODE",
+            OsStr::new(if matches!(outcome, Outcome::GatedMode) {
+                "build"
+            } else {
+                "yolo"
+            }),
+        ),
         EnvVarGuard::set("ZCODE_WARM_GOAL", OsStr::new("1")),
         EnvVarGuard::set(
             "HOME",
@@ -224,6 +240,8 @@ process.stdin.on("end", () => record("eof:" + process.pid));
         | Outcome::GoalContinuation
         | Outcome::Disconnect
         | Outcome::RejectMode
+        | Outcome::GatedMode
+        | Outcome::TextSegments
         | Outcome::Compact
         | Outcome::CompactThenTurn
         | Outcome::CompactDisconnect
@@ -258,7 +276,10 @@ process.stdin.on("end", () => record("eof:" + process.pid));
             .expect("start thread with active goal tool");
         test.codex = started.thread;
     }
-    for turn in 0..if matches!(outcome, Outcome::Complete | Outcome::GoalContinuation) {
+    for turn in 0..if matches!(
+        outcome,
+        Outcome::Complete | Outcome::GoalContinuation | Outcome::TextSegments
+    ) {
         2
     } else {
         1
@@ -488,6 +509,55 @@ async fn zcode_client_preserves_explicit_permission_denials() {
             );
         }
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zcode_warm_explicit_build_mode_retains_default_callback_denial() {
+    core_test_support::skip_if_remote!("ZCode inner execution is explicitly host-local");
+    let (log, effects) = probe(
+        Lifecycle::Warm,
+        Outcome::GatedMode,
+        AskForApproval::Never,
+        PermissionProfile::Disabled,
+    )
+    .await;
+    assert_eq!(effects, "");
+    assert_eq!(
+        log.iter()
+            .filter(|line| line.starts_with("permission:"))
+            .cloned()
+            .collect::<Vec<_>>(),
+        vec!["permission:Bash:deny"]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zcode_cold_preserves_assistant_messages_around_inner_tools() {
+    core_test_support::skip_if_remote!("ZCode inner execution is explicitly host-local");
+    let (log, effects) = probe(
+        Lifecycle::Cold,
+        Outcome::TextSegments,
+        AskForApproval::Never,
+        PermissionProfile::Disabled,
+    )
+    .await;
+    assert_eq!(effects, "inner\ninner\n");
+    let second_input: String = serde_json::from_str(
+        log.iter()
+            .filter_map(|line| line.strip_prefix("content:"))
+            .nth(1)
+            .expect("second cold prompt"),
+    )
+    .unwrap();
+    let assistant_messages = second_input
+        .lines()
+        .filter(|line| line.starts_with("assistant: "))
+        .collect::<Vec<_>>()
+        .join("\n");
+    insta::assert_snapshot!(assistant_messages, @"
+    assistant: Let me check.
+    assistant: Done checking.
+    ");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

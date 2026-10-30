@@ -1718,3 +1718,94 @@ async fn warm_retirement_closes_session_and_reaps_process() {
     let stats = std::fs::read_to_string(stats_path(&fixture)).expect("read protocol log");
     assert_eq!(stats.lines().last(), Some("close"));
 }
+
+#[tokio::test]
+async fn retirement_stops_descendants_after_natural_exit_and_forced_kill() {
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
+
+    enum Retirement {
+        Natural,
+        Forced,
+    }
+
+    for retirement in [Retirement::Natural, Retirement::Forced] {
+        // A descendant holds this connection independently of the leader's
+        // stdio. Closing the test socket also makes it exit on any failure;
+        // the timer bounds its lifetime if the entire test process crashes.
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let descendant = format!(
+            r#"const socket = require("net").connect({port}, "127.0.0.1", () => socket.write("R"));
+            socket.on("error", () => process.exit(0));
+            socket.on("end", () => process.exit(0));
+            setTimeout(() => process.exit(0), 30000).unref();"#,
+        );
+        let fixture = write_fake_server();
+        let source = std::fs::read_to_string(&fixture).unwrap();
+        std::fs::write(
+            &fixture,
+            source.replace(
+                "function runTurn(sessionId, content) {",
+                &format!(
+                    r#"function runTurn(sessionId, content) {{
+                    require("child_process").spawn(process.execPath, ["-e", {}], {{ stdio: "ignore" }}).unref();"#,
+                    serde_json::to_string(&descendant).unwrap(),
+                ),
+            ),
+        )
+        .unwrap();
+        let bridge = ZcodeWarmBridge::spawn(
+            &test_runtime(&fixture),
+            "/tmp",
+            WarmMode::Build,
+            WarmPermissionPolicy::DenyAll,
+            SessionSeed::Fresh,
+        )
+        .unwrap();
+        let session_id = bridge
+            .prepare_session("/tmp", WarmMode::Build)
+            .await
+            .unwrap();
+        let mut stream = bridge
+            .turn(&session_id, "descendant", TurnInputChannel::LegacySend)
+            .unwrap();
+        let (mut socket, _) =
+            tokio::time::timeout(Duration::from_secs(/*secs*/ 5), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+        let mut ready = [0];
+        tokio::time::timeout(
+            Duration::from_secs(/*secs*/ 5),
+            socket.read_exact(&mut ready),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(ready, [b'R']);
+        while let Some(event) = stream.rx_event.recv().await {
+            if matches!(event.unwrap(), ResponseEvent::Completed { .. }) {
+                break;
+            }
+        }
+        if matches!(retirement, Retirement::Forced) {
+            bridge.kill("exercise forced descendant retirement");
+        }
+        let retired = bridge.retire().await;
+        assert_eq!(retired.is_ok(), matches!(retirement, Retirement::Natural));
+        let mut remaining = Vec::new();
+        let closed = tokio::time::timeout(
+            Duration::from_secs(/*secs*/ 5),
+            socket.read_to_end(&mut remaining),
+        )
+        .await
+        .expect("retirement must close the descendant's connection");
+        if let Err(error) = closed {
+            assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+        }
+        assert_eq!(remaining, Vec::<u8>::new());
+    }
+}

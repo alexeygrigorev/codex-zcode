@@ -3123,6 +3123,20 @@ impl ModelClientSession {
         let workspace = prompt.zcode_execution.admitted_workspace()?.clone();
         let workspace_path = workspace.to_string_lossy().into_owned();
         let permission_policy = zcode_execution::permission_policy(prompt);
+        // An explicit build override strengthens the otherwise unrestricted
+        // turn: its unset callback policy must retain the historical denial.
+        let permission_policy = if permission_policy
+            == zcode_warm_permissions::WarmPermissionPolicy::AllowUnrestricted
+            && zcode_warm::warm_mode_from_env(
+                crate::client_common::ZcodeInnerMode::from_approval_policy(
+                    prompt.zcode_execution.approval_policy,
+                ),
+            ) == zcode_warm::WarmMode::Build
+        {
+            zcode_warm_permissions::WarmPermissionPolicy::DenyAll
+        } else {
+            permission_policy
+        };
         let bridge = 'claim: loop {
             enum Decision {
                 Reuse(Arc<crate::zcode_warm::ZcodeWarmBridge>),
