@@ -16,6 +16,7 @@ use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
 use core_test_support::responses::start_mock_server;
+use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
 use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::wait_for_event;
@@ -78,6 +79,31 @@ enum Outcome {
     CompactThenTurn,
     CompactDisconnect,
     AmbiguousV4,
+}
+
+async fn start_probe_turn(
+    test: &TestCodex,
+    message: &str,
+    approval: AskForApproval,
+    profile: PermissionProfile,
+) {
+    let (sandbox_policy, permission_profile) =
+        turn_permission_fields(profile, test.config.cwd.as_path());
+    test.codex
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
+                text: message.to_string(),
+                text_elements: Vec::new(),
+            }])
+            .with_thread_settings(ThreadSettingsOverrides {
+                approval_policy: Some(approval),
+                sandbox_policy: Some(sandbox_policy),
+                permission_profile,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
 }
 
 async fn probe(
@@ -378,27 +404,17 @@ process.stdin.on("end", () => record("eof:" + process.pid));
     let mut interrupted_socket =
         if matches!(outcome, Outcome::InterruptSend | Outcome::InterruptGoal) {
             use tokio::io::AsyncReadExt;
-            let (sandbox_policy, permission_profile) =
-                turn_permission_fields(profile.clone(), test.config.cwd.as_path());
-            test.codex
-                .start_or_steer_turn(
-                    TurnInputRequest::user_input(vec![UserInput::Text {
-                        text: if matches!(outcome, Outcome::InterruptGoal) {
-                            "<objective>hold-for-interrupt</objective>".to_string()
-                        } else {
-                            "hold-for-interrupt".to_string()
-                        },
-                        text_elements: Vec::new(),
-                    }])
-                    .with_thread_settings(ThreadSettingsOverrides {
-                        approval_policy: Some(approval),
-                        sandbox_policy: Some(sandbox_policy),
-                        permission_profile,
-                        ..Default::default()
-                    }),
-                )
-                .await
-                .unwrap();
+            start_probe_turn(
+                &test,
+                if matches!(outcome, Outcome::InterruptGoal) {
+                    "<objective>hold-for-interrupt</objective>"
+                } else {
+                    "hold-for-interrupt"
+                },
+                approval,
+                profile.clone(),
+            )
+            .await;
             let (mut socket, _) = tokio::time::timeout(
                 std::time::Duration::from_secs(/*secs*/ 5),
                 output_peer.as_ref().unwrap().accept(),
@@ -439,9 +455,35 @@ process.stdin.on("end", () => record("eof:" + process.pid));
             }
             _ => "execute the probe",
         };
-        test.submit_turn_with_approval_and_permission_profile(message, approval, profile.clone())
+        if matches!(outcome, Outcome::InterruptSend | Outcome::InterruptGoal) {
+            start_probe_turn(&test, message, approval, profile.clone()).await;
+            let mut errors = Vec::new();
+            let mut replies = Vec::new();
+            wait_for_event(&test.codex, |event| {
+                match event {
+                    EventMsg::Error(error) => errors.push(error.message.clone()),
+                    EventMsg::AgentMessage(message) => replies.push(message.message.clone()),
+                    _ => {}
+                }
+                matches!(event, EventMsg::TurnComplete(_))
+            })
+            .await;
+            assert_eq!(
+                (errors, replies),
+                (
+                    Vec::<String>::new(),
+                    vec!["actual client allowed Bash and Write".to_string()]
+                )
+            );
+        } else {
+            test.submit_turn_with_approval_and_permission_profile(
+                message,
+                approval,
+                profile.clone(),
+            )
             .await
             .expect("outer turn completes");
+        }
         if matches!(outcome, Outcome::LostOutput)
             && let Some(peer) = &output_peer
         {
@@ -487,7 +529,7 @@ process.stdin.on("end", () => record("eof:" + process.pid));
         if let Err(error) = read {
             assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
         }
-        assert_eq!(bytes, vec![b'R']);
+        assert_eq!(bytes, Vec::<u8>::new());
         assert_eq!(
             std::fs::read_to_string(effect.with_extension("written")).unwrap(),
             "written by inner Write"
