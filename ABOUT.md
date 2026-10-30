@@ -97,6 +97,13 @@ the remote process. Direct local/CI builds are explicit independent workflows:
 SSHFS metadata round trips can slow compilation and outages can interrupt writes;
 timings below describe local builds, not a remote performance guarantee. Existing
 worktrees, target caches and installed `~/.local/lib/zcodex` runtimes are preserved.
+The Storage Box SFTP server allows about 1020 open file handles per connection;
+past that every open fails with `Operation not permitted` (sshfs maps SFTP
+failure to EPERM), which surfaces in cargo as `.rcgu.o`/`.d` write errors, short
+source reads and `E0786` invalid metadata. A mount with `max_conns=1` hits this
+under parallel cargo. Build through a mount with `max_conns=4`
+(`storagebox-build-sshfs.service`, mounted at `~/storagebox-build`, same remote
+tree): `ZCODE_STORAGEBOX_ROOT=~/storagebox-build scripts/storagebox-dev.sh run ...`.
 Keep the local installed launcher and ordinary Git remote backup for recovery.
 Cargo registry caches stay local. Mount capacity does not lift build holds or
 resource gates: retain 20 GiB projected free root disk (30 GiB warning) and an
