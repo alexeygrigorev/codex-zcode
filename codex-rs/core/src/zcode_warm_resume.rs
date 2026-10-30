@@ -130,6 +130,7 @@ async fn resume_session(
         )
         .await?;
     observe_protocol_version(bridge, &resumed);
+    bridge.record_model_catalog(&resumed);
     subscribe(bridge, session_id).await?;
     catch_up_missed_events(bridge, session_id, catch_up_from).await;
     Ok(())
@@ -155,6 +156,7 @@ async fn create_session(
         )
         .await?;
     observe_protocol_version(bridge, &created);
+    bridge.record_model_catalog(&created);
     let session_id = created
         .pointer("/session/sessionId")
         .and_then(serde_json::Value::as_str)

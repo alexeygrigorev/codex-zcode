@@ -3085,15 +3085,21 @@ impl ModelClientSession {
                     .await?
                 } else if zcode_warm::warm_bridge_enabled() {
                     zcode_execution::no_replay(
-                        Self::stream_zcode_warm(&self.client.state, &runtime, prompt)
-                            .await
-                            .map_err(CodexErr::InvalidRequest)?,
+                        Self::stream_zcode_warm(
+                            &self.client.state,
+                            &runtime,
+                            prompt,
+                            &model_info.slug,
+                        )
+                        .await
+                        .map_err(CodexErr::InvalidRequest)?,
                     )
                 } else {
                     zcode_execution::stream_cold(
                         runtime,
                         prompt,
                         &self.client.state.thread_id.to_string(),
+                        &model_info.slug,
                     )
                     .await
                     .map_err(CodexErr::InvalidRequest)?
@@ -3116,9 +3122,10 @@ impl ModelClientSession {
     /// (replacement and shutdown reap the child before releasing it), so the warm path can
     /// never run a second ZCode process in the same tree.
     async fn stream_zcode_warm(
-        state: &ModelClientState,
+        state: &Arc<ModelClientState>,
         runtime: &ZcodeRuntime,
         prompt: &Prompt,
+        model_slug: &str,
     ) -> std::result::Result<codex_api::ResponseStream, String> {
         let workspace = prompt.zcode_execution.admitted_workspace()?.clone();
         let workspace_path = workspace.to_string_lossy().into_owned();
@@ -3137,7 +3144,7 @@ impl ModelClientSession {
         } else {
             permission_policy
         };
-        let bridge = 'claim: loop {
+        let (bridge, turn_guard) = 'claim: loop {
             enum Decision {
                 Reuse(Arc<crate::zcode_warm::ZcodeWarmBridge>),
                 Wait,
@@ -3166,7 +3173,18 @@ impl ModelClientSession {
                 }
             };
             match decision {
-                Decision::Reuse(bridge) => break bridge,
+                Decision::Reuse(bridge) => {
+                    let guard = Arc::clone(&bridge.turn_lock).lock_owned().await;
+                    if bridge.is_dead()
+                        || !matches!(
+                            state.zcode_warm.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref(),
+                            Some(ZcodeWarmSlot::Ready(entry)) if Arc::ptr_eq(&entry.bridge, &bridge)
+                        )
+                    {
+                        continue 'claim;
+                    }
+                    break (bridge, guard);
+                }
                 Decision::Wait => {
                     tokio::time::sleep(Duration::from_millis(20)).await;
                     continue 'claim;
@@ -3202,7 +3220,7 @@ impl ModelClientSession {
                             && entry.bridge.consecutive_failures()
                                 < zcode_warm::ZCODE_WARM_MAX_CONSECUTIVE_FAILURES =>
                     {
-                        break 'claim Arc::clone(&entry.bridge);
+                        continue 'claim;
                     }
                     _ => {}
                 }
@@ -3276,7 +3294,7 @@ impl ModelClientSession {
                         bridge: Arc::clone(&bridge),
                         checkout: Some(checkout),
                     }));
-                    break bridge;
+                    continue 'claim;
                 }
                 // `checkout` drops here, releasing the claim's reservation.
                 Err(e) => {
@@ -3288,9 +3306,17 @@ impl ModelClientSession {
                 }
             }
         };
+        let turn_lease = zcode_execution::WarmTurnLease {
+            state: Arc::clone(state),
+            bridge: Arc::clone(&bridge),
+            turn_guard: Some(turn_guard),
+        };
         let turned = async {
             let session_id = bridge
                 .prepare_session(&workspace_path, zcode_warm::WarmMode::Build)
+                .await?;
+            bridge
+                .select_model(&session_id, ZCODE_PROVIDER_ID, model_slug)
                 .await?;
             let content = zcode_warm_turn_content(&prompt.input);
             let channel = crate::zcode_warm_v4_send::channel_from_env();
@@ -3328,7 +3354,12 @@ impl ModelClientSession {
                         },
                     },
                 );
-                Ok(stream)
+                Ok(zcode_execution::guard_warm_stream(
+                    Arc::clone(state),
+                    Arc::clone(&bridge),
+                    stream,
+                    turn_lease,
+                ))
             }
             Err(e) => {
                 bridge.register_failure();
@@ -3348,6 +3379,7 @@ impl ModelClientSession {
                     entry.checkout = None;
                 }
                 let stderr = bridge.stderr_text();
+                turn_lease.release();
                 Err(if stderr.is_empty() {
                     e
                 } else {

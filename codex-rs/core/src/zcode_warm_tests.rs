@@ -155,6 +155,8 @@ let pendingMcpAuth = null;
 // Event envelopes carry a monotonic seq; the subscribe result pins the
 // stream head it starts from.
 let seqCounter = 7;
+const modelSettings = { model: { available: [{ ref: { providerId: "zai", modelId: "glm-5.3-flash" },
+  reasoning: { levels: [{ label: "Fixture", value: "fixture-default" }], defaultLevel: "fixture-default" } }] } };
 function write(obj) { process.stdout.write(JSON.stringify(obj) + "\n"); }
 function emit(params) { params.seq = ++seqCounter; write({ method: "session/event", params }); }
 function sendProbe(kind, original) {
@@ -236,11 +238,19 @@ function handle(msg) {
       if (FAIL_RESUME) {
         write({ id: msg.id, error: { code: -32000, message: "session not found: " + msg.params.sessionId } });
       } else {
-        respond({ sessionId: msg.params.sessionId, session: { sessionId: msg.params.sessionId }, messages: [], settings: {} });
+        respond({ sessionId: msg.params.sessionId, session: { sessionId: msg.params.sessionId }, messages: [], settings: modelSettings });
       }
       break;
     case "session/close":
       respond({ closed: true });
+      break;
+    case "session/setModel":
+      stats("model:" + JSON.stringify(msg.params.model));
+      if (msg.params.model.options?.reasoningLevel !== "fixture-default") {
+        write({ id: msg.id, error: { code: -32602, message: "reasoning level missing or invalid" } });
+        break;
+      }
+      respond({ session: { sessionId: msg.params.sessionId }, settings: { model: { current: msg.params.model } } });
       break;
     case "session/setMode":
       stats("enforced-mode:" + msg.params.mode);
@@ -251,7 +261,7 @@ function handle(msg) {
       }
       break;
     case "session/create":
-      respond({ session: { sessionId: "sess_fake" }, protocol: { name: "ZCode Protocol", version: 1 } });
+      respond({ session: { sessionId: "sess_fake" }, settings: modelSettings, protocol: { name: "ZCode Protocol", version: 1 } });
       break;
     case "session/subscribe":
       respond({ sessionId: msg.params.sessionId, eventSeq: 7, events: [] });
@@ -1704,7 +1714,7 @@ async fn warm_rejected_mode_does_not_prepare_a_turn() {
 }
 
 #[tokio::test]
-async fn warm_retirement_closes_session_and_reaps_process() {
+async fn warm_retirement_runs_once_for_concurrent_and_repeated_callers() {
     let fixture = write_fake_server();
     let bridge = ZcodeWarmBridge::spawn(
         &test_runtime(&fixture),
@@ -1718,13 +1728,77 @@ async fn warm_retirement_closes_session_and_reaps_process() {
         .prepare_session("/tmp", WarmMode::Build)
         .await
         .expect("prepare session");
-    bridge.retire().await.expect("natural retirement");
+    assert_eq!(
+        tokio::join!(bridge.retire(), bridge.retire()),
+        (Ok(()), Ok(())),
+    );
+    bridge.retire().await.expect("cached natural retirement");
     assert_eq!(
         (bridge.is_dead(), bridge.child.lock().unwrap().is_none()),
         (true, true),
     );
     let stats = std::fs::read_to_string(stats_path(&fixture)).expect("read protocol log");
-    assert_eq!(stats.lines().last(), Some("close"));
+    assert_eq!(
+        (
+            stats.lines().last(),
+            stats.lines().filter(|line| *line == "close").count(),
+        ),
+        (Some("close"), 1),
+    );
+}
+
+#[tokio::test]
+async fn oversized_assistant_items_fail_without_completing_or_resubmitting() {
+    for content in ["x".repeat(8_001), format!("nodelta{}", "x".repeat(8_001))] {
+        let fixture = write_fake_server();
+        let bridge = ZcodeWarmBridge::spawn(
+            &test_runtime(&fixture),
+            "/tmp",
+            WarmMode::Build,
+            WarmPermissionPolicy::DenyAll,
+            SessionSeed::Fresh,
+        )
+        .expect("spawn fake app-server");
+        let session_id = bridge
+            .prepare_session("/tmp", WarmMode::Build)
+            .await
+            .expect("prepare session");
+        let mut stream = bridge
+            .turn(&session_id, &content, TurnInputChannel::LegacySend)
+            .expect("start turn");
+        let mut terminal_items = Vec::new();
+        let mut forwarded = String::new();
+        let error = loop {
+            match stream.rx_event.recv().await.expect("terminal event") {
+                Ok(ResponseEvent::OutputItemDone(item)) => terminal_items.push(item),
+                Ok(ResponseEvent::OutputTextDelta(delta)) => forwarded.push_str(&delta),
+                Ok(ResponseEvent::Completed { .. }) => panic!("oversized reply completed"),
+                Ok(_) => {}
+                Err(error) => break error,
+            }
+        };
+        assert_eq!(
+            (terminal_items, forwarded),
+            (
+                Vec::<ResponseItem>::new(),
+                if content.starts_with("nodelta") {
+                    String::new()
+                } else {
+                    "xx".to_string()
+                }
+            ),
+        );
+        assert!(matches!(error, codex_api::ApiError::InvalidRequest { .. }));
+        let _ = bridge.retire().await;
+        let stats = std::fs::read_to_string(stats_path(&fixture)).expect("read protocol log");
+        assert_eq!(
+            stats
+                .lines()
+                .filter(|line| line.starts_with("send:"))
+                .count(),
+            1,
+        );
+    }
 }
 
 #[tokio::test]
@@ -1804,6 +1878,7 @@ async fn retirement_stops_descendants_after_natural_exit_and_forced_kill() {
         }
         let retired = bridge.retire().await;
         assert_eq!(retired.is_ok(), matches!(retirement, Retirement::Natural));
+        assert_eq!(bridge.retire().await, retired);
         let mut remaining = Vec::new();
         let closed = tokio::time::timeout(
             Duration::from_secs(/*secs*/ 5),

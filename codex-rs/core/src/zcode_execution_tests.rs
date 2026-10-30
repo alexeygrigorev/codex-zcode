@@ -343,6 +343,7 @@ async fn cold_goal_continuation_preserves_history_and_steering_before_reporting_
         crate::zcode_warm::tests::test_runtime(&fixture),
         &prompt,
         "goal-test",
+        "glm-5.3-flash",
     )
     .await
     .unwrap();
@@ -407,15 +408,26 @@ async fn cold_goal_continuation_preserves_history_and_steering_before_reporting_
 #[tokio::test]
 async fn aborted_cold_consumer_retires_before_releasing_checkout() {
     use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let port = listener.local_addr().unwrap().port();
     let work = tempfile::TempDir::new().unwrap();
     let workspace = AbsolutePathBuf::try_from(work.path().to_path_buf()).unwrap();
     let fixture = crate::zcode_warm::tests::write_fake_server();
     let source = std::fs::read_to_string(&fixture).unwrap();
     std::fs::write(&fixture, source.replace(
         "function runTurn(sessionId, content) {",
-        r#"function runTurn(sessionId, content) {
-          emit({ sessionId, type: "model.streaming", payload: { kind: "text_delta", delta: "started" } });
-          return;"#,
+        &format!(r#"function runTurn(sessionId, content) {{
+          const socket = require("net").connect({port}, "127.0.0.1", () => {{
+            socket.write("R");
+            emit({{ sessionId, type: "model.streaming", payload: {{ kind: "text_delta", delta: "started" }} }});
+          }});
+          socket.on("error", () => process.exit(0));
+          socket.on("end", () => process.exit(0));
+          setTimeout(() => process.exit(0), 30000).unref();
+          return;"#),
     )).unwrap();
     let prompt = crate::Prompt {
         zcode_execution: ZcodeExecutionPolicy {
@@ -429,6 +441,7 @@ async fn aborted_cold_consumer_retires_before_releasing_checkout() {
         crate::zcode_warm::tests::test_runtime(&fixture),
         &prompt,
         "abort-test",
+        "glm-5.3-flash",
     )
     .await
     .unwrap();
@@ -445,8 +458,17 @@ async fn aborted_cold_consumer_retires_before_releasing_checkout() {
     .await
     .unwrap()
     .unwrap();
-    let stats = std::fs::read_to_string(crate::zcode_warm::tests::stats_path(&fixture)).unwrap();
-    assert!(stats.lines().any(|line| line == "close"), "{stats}");
+    let bytes = tokio::time::timeout(Duration::from_secs(/*secs*/ 5), async {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut bytes = Vec::new();
+        if let Err(error) = socket.read_to_end(&mut bytes).await {
+            assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+        }
+        bytes
+    })
+    .await
+    .expect("checkout release must follow executor retirement");
+    assert_eq!(bytes, vec![b'R']);
 }
 
 #[tokio::test]
@@ -488,6 +510,7 @@ async fn cold_goal_ignores_completion_markers_in_intermediate_messages() {
             crate::zcode_warm::tests::test_runtime(&fixture),
             &prompt,
             "intermediate-marker",
+            "glm-5.3-flash",
         )
         .await
         .unwrap();

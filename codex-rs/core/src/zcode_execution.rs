@@ -81,6 +81,47 @@ impl Drop for WarmClaim<'_> {
     }
 }
 
+/// Owns a turn from preparation through stream retirement. Cancellation may
+/// happen while goal submission is awaiting its acknowledgement, before a
+/// response stream exists, so abandoning this lease synchronously retires the
+/// cached checkout using its existing guarded Drop path.
+pub(super) struct WarmTurnLease {
+    pub(super) state: Arc<super::ModelClientState>,
+    pub(super) bridge: Arc<ZcodeWarmBridge>,
+    pub(super) turn_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl WarmTurnLease {
+    pub(super) fn release(mut self) {
+        drop(self.turn_guard.take());
+    }
+}
+
+impl Drop for WarmTurnLease {
+    fn drop(&mut self) {
+        if self.turn_guard.is_none() {
+            return;
+        }
+        self.bridge
+            .kill("warm turn preparation or stream was cancelled");
+        let previous = {
+            let mut slot = self
+                .state
+                .zcode_warm
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if matches!(slot.as_ref(), Some(super::ZcodeWarmSlot::Ready(entry)) if Arc::ptr_eq(&entry.bridge, &self.bridge))
+            {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        // Its checkout stays reserved through synchronous child reaping.
+        drop(previous);
+    }
+}
+
 /// Prevent the outer sampling retry ladder from replaying an inner agent turn.
 pub(crate) fn no_replay(stream: ResponseStream) -> ResponseStream {
     let upstream_request_id = stream.upstream_request_id;
@@ -126,10 +167,74 @@ pub(crate) fn no_replay(stream: ResponseStream) -> ResponseStream {
     }
 }
 
+/// A failed or abandoned warm turn must stop its executor before reporting
+/// failure or releasing the checkout. Healthy completed turns retain the cache.
+pub(super) fn guard_warm_stream(
+    state: Arc<super::ModelClientState>,
+    bridge: Arc<ZcodeWarmBridge>,
+    stream: ResponseStream,
+    turn_lease: WarmTurnLease,
+) -> ResponseStream {
+    let upstream_request_id = stream.upstream_request_id;
+    let mut incoming = stream.rx_event;
+    let (tx, rx_event) = mpsc::channel(/*buffer*/ 64);
+    tokio::spawn(async move {
+        loop {
+            let event = tokio::select! {
+                _ = tx.closed() => None,
+                event = incoming.recv() => event,
+            };
+            let failure = match event {
+                Some(Ok(event)) => {
+                    let completed = matches!(&event, ResponseEvent::Completed { .. });
+                    if tx.send(Ok(event)).await.is_ok() && completed {
+                        turn_lease.release();
+                        return;
+                    }
+                    continue;
+                }
+                Some(Err(error)) => Some(error),
+                None => None,
+            };
+            bridge.kill("warm turn failed or its consumer closed");
+            if let Err(error) = bridge.retire().await {
+                tracing::warn!("Warm executor retirement after failure: {error}");
+            }
+            {
+                let mut slot = state
+                    .zcode_warm
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(super::ZcodeWarmSlot::Ready(entry)) = slot.as_mut()
+                    && Arc::ptr_eq(&entry.bridge, &bridge)
+                {
+                    drop(entry.checkout.take());
+                }
+            }
+            if tx.is_closed() {
+                turn_lease.release();
+                return;
+            }
+            let error = failure.unwrap_or_else(|| ApiError::InvalidRequest {
+                message: "ZCode warm turn ended without completion; the turn will not be replayed"
+                    .to_string(),
+            });
+            let _ = tx.send(Err(error)).await;
+            turn_lease.release();
+            return;
+        }
+    });
+    ResponseStream {
+        rx_event,
+        upstream_request_id,
+    }
+}
+
 pub(crate) async fn stream_cold(
     runtime: ZcodeRuntime,
     prompt: &crate::Prompt,
     thread_id: &str,
+    model_slug: &str,
 ) -> Result<ResponseStream, String> {
     let workspace = prompt
         .zcode_execution
@@ -163,12 +268,14 @@ pub(crate) async fn stream_cold(
     let goal_already_reported = super::zcode_goal_already_reported_in_current_turn(&prompt.input);
     content.push_str(super::ZCODE_REPLY_BUDGET_NOTE);
     let prompt_bytes = content.len();
+    let model_slug = model_slug.to_string();
     let (tx, rx_event) = mpsc::channel(/*buffer*/ 64);
     tokio::spawn(async move {
         let prepared = tokio::select! {
             _ = tx.closed() => None,
             prepared = async {
             let session_id = bridge.prepare_session(&workspace, WarmMode::Build).await?;
+            bridge.select_model(&session_id, super::ZCODE_PROVIDER_ID, &model_slug).await?;
             // A fresh cold session has no server-side history for goal mirroring.
             bridge.turn(&session_id, &content, TurnInputChannel::LegacySend)
             } => Some(prepared),
@@ -260,11 +367,18 @@ pub(crate) async fn stream_cold(
                 }
             },
         };
+        if !matches!(&terminal, Some(Ok(ResponseEvent::Completed { .. }))) {
+            bridge.kill("cold turn failed or its consumer closed");
+        }
         let retired = bridge.retire().await;
+        if let Err(error) = &retired {
+            tracing::warn!("Cold executor retirement: {error}");
+        }
         drop(lease.checkout.take());
-        let terminal = match retired {
-            Ok(()) => terminal,
-            Err(error) => Some(Err(ApiError::InvalidRequest { message: error })),
+        let terminal = match (terminal, retired) {
+            (terminal @ Some(Err(_)), _) | (terminal @ None, _) => terminal,
+            (terminal, Ok(())) => terminal,
+            (_, Err(error)) => Some(Err(ApiError::InvalidRequest { message: error })),
         };
         if matches!(&terminal, Some(Ok(ResponseEvent::Completed { .. })))
             && let Some(status) = goal_status

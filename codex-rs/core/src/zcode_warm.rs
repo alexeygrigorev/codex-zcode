@@ -63,6 +63,11 @@ use crate::zcode_warm_permissions::PermissionRequestLog;
 use crate::zcode_warm_permissions::WarmPermissionPolicy;
 use crate::zcode_warm_resume;
 
+#[path = "zcode_warm_model.rs"]
+mod model;
+#[path = "zcode_warm_output.rs"]
+mod output;
+
 /// Env var enabling the warm bridge (`ZCODE_WARM=1`).
 const WARM_BRIDGE_ENV_VAR: &str = "ZCODE_WARM";
 
@@ -235,6 +240,11 @@ pub(crate) struct ZcodeWarmBridge {
     /// ever held across an await point (workspace clippy denies that).
     stdin: mpsc::UnboundedSender<Option<String>>,
     child: StdMutex<Option<Child>>,
+    /// Cache the result so concurrent or repeated retirement cannot signal a
+    /// process group after ownership has ended and its numeric id is reused.
+    retirement: tokio::sync::OnceCell<Result<(), String>>,
+    pub(crate) turn_lock: Arc<tokio::sync::Mutex<()>>,
+    model_catalog: StdMutex<Vec<serde_json::Value>>,
     /// Saved at spawn: the child leads its own process group, so this id
     /// stays valid for group kills even after the direct child exits.
     #[cfg(unix)]
@@ -367,6 +377,9 @@ impl ZcodeWarmBridge {
             state: StdMutex::new(WarmState::default()),
             stdin: stdin_tx,
             child: StdMutex::new(Some(child)),
+            retirement: tokio::sync::OnceCell::new(),
+            turn_lock: Arc::new(tokio::sync::Mutex::new(())),
+            model_catalog: StdMutex::new(Vec::new()),
             #[cfg(unix)]
             process_group_pid,
             #[cfg(windows)]
@@ -485,19 +498,13 @@ impl ZcodeWarmBridge {
             self.fail_collectors(reason);
         }
         // EOF can mark the reader dead while the process is still alive.
-        let owns_child = match self
+        let mut child = self
             .child
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_mut()
-        {
-            Some(child) => {
-                let _ = child.start_kill();
-                true
-            }
-            None => false,
-        };
-        if owns_child {
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(child) = child.as_mut() {
+            // Ownership and signaling share the lock with final retirement.
+            // Releasing it first could signal a group that has been reaped.
             #[cfg(unix)]
             codex_utils_pty::process_group::kill_process_group(self.process_group_pid)
                 .unwrap_or_else(|error| warn!("ZCode process group kill failed: {error}"));
@@ -505,85 +512,100 @@ impl ZcodeWarmBridge {
             self.job
                 .terminate()
                 .unwrap_or_else(|error| warn!("ZCode process job termination failed: {error}"));
+            let _ = child.start_kill();
         }
     }
 
     /// Closes this session and reaps the process before its checkout is released.
     /// A forced teardown is cleanup, never a successful natural retirement.
     pub(crate) async fn retire(&self) -> Result<(), String> {
-        let grace = self.request_timeout;
-        let close = if let Some(session_id) = self.session_id.get() {
-            tokio::time::timeout(
-                grace,
-                self.request(
-                    "session/close",
-                    serde_json::json!({ "sessionId": session_id }),
-                ),
-            )
-            .await
-            .map_err(|_| "session close timed out".to_string())
-            .and_then(|result| result.map_err(|error| error.to_string()))
-            .and_then(|result| {
-                if result.get("closed").and_then(serde_json::Value::as_bool) != Some(true) {
-                    Err("session close was refused".to_string())
+        self.retirement
+            .get_or_init(|| async {
+                let grace = self.request_timeout;
+                let close = if let Some(session_id) = self.session_id.get() {
+                    tokio::time::timeout(
+                        grace,
+                        self.request(
+                            "session/close",
+                            serde_json::json!({ "sessionId": session_id }),
+                        ),
+                    )
+                    .await
+                    .map_err(|_| "session close timed out".to_string())
+                    .and_then(|result| result.map_err(|error| error.to_string()))
+                    .and_then(|result| {
+                        if result.get("closed").and_then(serde_json::Value::as_bool) != Some(true) {
+                            Err("session close was refused".to_string())
+                        } else {
+                            Ok(())
+                        }
+                    })
                 } else {
                     Ok(())
-                }
-            })
-        } else {
-            Ok(())
-        };
-        let _ = self.stdin.send(None);
-        let deadline = tokio::time::Instant::now() + grace;
-        let mut failure = None;
-        let exit = loop {
-            let status = {
-                let mut child = self
-                    .child
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                match child.as_mut() {
-                    Some(child) => child.try_wait(),
-                    None => break Ok(()),
-                }
-            };
-            match status {
-                Ok(Some(status)) => {
-                    drop(self.take_child_for_retirement());
-                    break if let Some(error) = failure {
-                        Err(error)
-                    } else if status.success() {
-                        Ok(())
-                    } else {
-                        Err(format!("ZCode process exited with {status}"))
+                };
+                let _ = self.stdin.send(None);
+                let deadline = tokio::time::Instant::now() + grace;
+                let mut failure = None;
+                let (exit, cleanup) = loop {
+                    let status = {
+                        let mut child = self
+                            .child
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        match child.as_mut() {
+                            Some(process) => match process.try_wait() {
+                                Ok(Some(status)) => {
+                                    // Keep final group cleanup and child consumption
+                                    // under the same lock as every forced signal.
+                                    #[cfg(unix)]
+                                    let cleanup =
+                                        codex_utils_pty::process_group::kill_process_group(
+                                            self.process_group_pid,
+                                        );
+                                    #[cfg(windows)]
+                                    let cleanup = self.job.terminate();
+                                    #[cfg(not(any(unix, windows)))]
+                                    let cleanup = Ok::<(), io::Error>(());
+                                    drop(child.take());
+                                    let exit = if let Some(error) = failure {
+                                        Err(error)
+                                    } else if status.success() {
+                                        Ok(())
+                                    } else {
+                                        Err(format!("ZCode process exited with {status}"))
+                                    };
+                                    break (exit, cleanup);
+                                }
+                                Ok(None) => Ok(()),
+                                Err(error) => Err(error),
+                            },
+                            None => break (Ok(()), Ok(())),
+                        }
                     };
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    failure.get_or_insert_with(|| format!("could not reap ZCode process: {error}"));
-                    self.kill("child retirement failed");
-                }
-            }
-            if failure.is_none() && tokio::time::Instant::now() >= deadline {
-                failure = Some("ZCode process required forced retirement".to_string());
-                self.kill("natural retirement timed out");
-            }
-            // Keep the child in the bridge across awaits so cancellation's
-            // retained-permit guard can synchronously kill and reap it.
-            tokio::time::sleep(Duration::from_millis(/*millis*/ 10)).await;
-        };
-        self.dead.store(true, Ordering::Relaxed);
-        // The leader has been reaped, so resolving its group from its PID
-        // would miss surviving shells. The saved group/job still owns them.
-        #[cfg(unix)]
-        let cleanup = codex_utils_pty::process_group::kill_process_group(self.process_group_pid);
-        #[cfg(windows)]
-        let cleanup = self.job.terminate();
-        #[cfg(not(any(unix, windows)))]
-        let cleanup = Ok::<(), io::Error>(());
-        close
-            .and(exit)
-            .and(cleanup.map_err(|error| format!("could not retire ZCode descendants: {error}")))
+                    match status {
+                        Ok(()) => {}
+                        Err(error) => {
+                            failure.get_or_insert_with(|| {
+                                format!("could not reap ZCode process: {error}")
+                            });
+                            self.kill("child retirement failed");
+                        }
+                    }
+                    if failure.is_none() && tokio::time::Instant::now() >= deadline {
+                        failure = Some("ZCode process required forced retirement".to_string());
+                        self.kill("natural retirement timed out");
+                    }
+                    // Keep the child in the bridge across awaits so cancellation's
+                    // retained-permit guard can synchronously kill and reap it.
+                    tokio::time::sleep(Duration::from_millis(/*millis*/ 10)).await;
+                };
+                self.dead.store(true, Ordering::Relaxed);
+                close.and(exit).and(
+                    cleanup.map_err(|error| format!("could not retire ZCode descendants: {error}")),
+                )
+            })
+            .await
+            .clone()
     }
 
     /// Transfers child ownership to an awaited or blocking retirement path.
@@ -1078,6 +1100,13 @@ impl ZcodeWarmBridge {
                             .and_then(serde_json::Value::as_str)
                             .unwrap_or_default();
                         if kind == "text_delta" && !delta.is_empty() {
+                            if let Err(error) =
+                                output::check_message_bytes(reply.len().saturating_add(delta.len()))
+                            {
+                                stop_turn(&collector_bridge, &collector_session).await;
+                                let _ = tx.send(Err(error)).await;
+                                return;
+                            }
                             saw_text = true;
                             if !started_output {
                                 started_output = true;
@@ -1143,6 +1172,10 @@ impl ZcodeWarmBridge {
                         } else {
                             std::mem::take(&mut reply)
                         };
+                        if let Err(error) = output::check_message_bytes(response.len()) {
+                            let _ = tx.send(Err(error)).await;
+                            return;
+                        }
                         if !response.is_empty() {
                             let mut item = assistant_message(response);
                             if let ResponseItem::Message { phase, .. } = &mut item {
