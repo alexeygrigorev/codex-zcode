@@ -255,6 +255,13 @@ pub(crate) async fn turn_mirrored(
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or_default();
                     if kind == "text_delta" && !delta.is_empty() {
+                        if let Err(error) = crate::zcode_warm::output::check_message_bytes(
+                            reply.len().saturating_add(delta.len()),
+                        ) {
+                            stop_turn(&collector_bridge, &collector_session).await;
+                            let _ = tx.send(Err(error)).await;
+                            return;
+                        }
                         if !started_output {
                             started_output = true;
                             let item = assistant_message(String::new());
@@ -319,6 +326,13 @@ pub(crate) async fn turn_mirrored(
                     } else {
                         std::mem::take(&mut reply)
                     };
+                    if let Err(error) =
+                        crate::zcode_warm::output::check_message_bytes(response.len())
+                    {
+                        stop_turn(&collector_bridge, &collector_session).await;
+                        let _ = tx.send(Err(error)).await;
+                        return;
+                    }
                     if !response.is_empty()
                         && tx
                             .send(Ok(codex_api::ResponseEvent::OutputItemDone(

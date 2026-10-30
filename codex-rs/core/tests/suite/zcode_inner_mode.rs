@@ -69,6 +69,8 @@ enum Outcome {
     RejectMode,
     WrongModel,
     LostOutput,
+    OversizedGoalStream,
+    OversizedGoalFallback,
     InterruptSend,
     InterruptGoal,
     DenyClient,
@@ -118,7 +120,11 @@ async fn probe(
     let effect = work.path().join("effects");
     let output_peer = if matches!(
         outcome,
-        Outcome::LostOutput | Outcome::InterruptSend | Outcome::InterruptGoal
+        Outcome::LostOutput
+            | Outcome::InterruptSend
+            | Outcome::InterruptGoal
+            | Outcome::OversizedGoalStream
+            | Outcome::OversizedGoalFallback
     ) {
         Some(
             tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
@@ -148,8 +154,8 @@ function permission(tool) {
     sessionId, requestId: "request-" + turn + tool, toolCallId: "tool-" + tool,
     toolName: tool, riskLevel: "high", input: {}, reason: "test execution" } });
 }
-function holdExecutor() {
-  const socket = require("net").connect(%OUTPUT_PORT%, "127.0.0.1", () => socket.write("R"));
+function holdExecutor(onReady = () => {}) {
+  const socket = require("net").connect(%OUTPUT_PORT%, "127.0.0.1", () => { socket.write("R"); onReady(); });
   socket.on("error", () => process.exit(0));
   socket.on("end", () => process.exit(0));
   setTimeout(() => process.exit(0), 30000).unref();
@@ -248,7 +254,17 @@ require("readline").createInterface({ input: process.stdin }).on("line", (line) 
       reply({ status: "unknown-after-execution" }); break;
     case "session/close": record("close:" + process.pid); reply({ closed: true }); break;
     case "session/goal":
-      if (%INTERRUPT_GOAL%) {
+      if (%OVERSIZED_GOAL%) {
+        fs.appendFileSync(%EFFECT%, "inner\n");
+        holdExecutor(() => {
+          reply({ startedTurn: true });
+          if (%OVERSIZED_GOAL_STREAM%) {
+            for (const delta of ["ok", "x".repeat(7999)]) {
+              emit({ method: "session/event", params: { sessionId, type: "model.streaming", payload: { kind: "text_delta", delta } } });
+            }
+          } else emit({ method: "session/event", params: { sessionId, type: "turn.completed", payload: { response: "x".repeat(8001), resultType: "success" } } });
+        });
+      } else if (%INTERRUPT_GOAL%) {
         fs.appendFileSync(%EFFECT%, "inner\n"); holdExecutor();
       } else reply({ startedTurn: false });
       break;
@@ -260,6 +276,8 @@ process.stdin.on("end", () => record("eof:" + process.pid));
 "#
         .replace("%LOG%", &serde_json::to_string(&log).unwrap())
         .replace("%EFFECT%", &serde_json::to_string(&effect).unwrap())
+        .replace("%OVERSIZED_GOAL%", if matches!(outcome, Outcome::OversizedGoalStream | Outcome::OversizedGoalFallback) { "true" } else { "false" })
+        .replace("%OVERSIZED_GOAL_STREAM%", if matches!(outcome, Outcome::OversizedGoalStream) { "true" } else { "false" })
         .replace("%TEXT_SEGMENTS%", if matches!(outcome, Outcome::TextSegments) { "true" } else { "false" })
         .replace("%COMPACT_DISCONNECT%", if matches!(outcome, Outcome::CompactDisconnect) { "true" } else { "false" })
         .replace("%DISCONNECT%", if matches!(outcome, Outcome::Disconnect) { "true" } else { "false" })
@@ -363,6 +381,8 @@ process.stdin.on("end", () => record("eof:" + process.pid));
         | Outcome::RejectMode
         | Outcome::WrongModel
         | Outcome::LostOutput
+        | Outcome::OversizedGoalStream
+        | Outcome::OversizedGoalFallback
         | Outcome::InterruptSend
         | Outcome::InterruptGoal
         | Outcome::GatedMode
@@ -385,7 +405,13 @@ process.stdin.on("end", () => record("eof:" + process.pid));
         .build_with_auto_env(&server)
         .await
         .expect("build test Codex");
-    if matches!(outcome, Outcome::GoalContinuation | Outcome::InterruptGoal) {
+    if matches!(
+        outcome,
+        Outcome::GoalContinuation
+            | Outcome::InterruptGoal
+            | Outcome::OversizedGoalStream
+            | Outcome::OversizedGoalFallback
+    ) {
         let started = test
             .thread_manager
             .start_thread(StartThreadOptions {
@@ -449,13 +475,31 @@ process.stdin.on("end", () => record("eof:" + process.pid));
         1
     } {
         let message = match (outcome, turn) {
+            (Outcome::OversizedGoalStream | Outcome::OversizedGoalFallback, _) => {
+                "<objective>Bound output</objective>"
+            }
             (Outcome::GoalContinuation, 0) => "Prior user history: migrate records once.",
             (Outcome::GoalContinuation, _) => {
                 "New steering: verify the existing receipt; do not migrate again.\n<objective>Finish migration safely</objective>"
             }
             _ => "execute the probe",
         };
-        if matches!(outcome, Outcome::InterruptSend | Outcome::InterruptGoal) {
+        if matches!(
+            outcome,
+            Outcome::OversizedGoalStream | Outcome::OversizedGoalFallback
+        ) {
+            start_probe_turn(&test, message, approval, profile.clone()).await;
+            let mut errors = Vec::new();
+            wait_for_event(&test.codex, |event| {
+                if let EventMsg::Error(error) = event {
+                    errors.push(error.message.clone());
+                }
+                matches!(event, EventMsg::TurnComplete(_))
+            })
+            .await;
+            assert_eq!(errors.len(), 1);
+            assert!(errors[0].contains("history limit"));
+        } else if matches!(outcome, Outcome::InterruptSend | Outcome::InterruptGoal) {
             start_probe_turn(&test, message, approval, profile.clone()).await;
             let mut errors = Vec::new();
             let mut replies = Vec::new();
@@ -484,8 +528,10 @@ process.stdin.on("end", () => record("eof:" + process.pid));
             .await
             .expect("outer turn completes");
         }
-        if matches!(outcome, Outcome::LostOutput)
-            && let Some(peer) = &output_peer
+        if matches!(
+            outcome,
+            Outcome::LostOutput | Outcome::OversizedGoalStream | Outcome::OversizedGoalFallback
+        ) && let Some(peer) = &output_peer
         {
             use tokio::io::AsyncReadExt;
             let observed =
@@ -1005,4 +1051,29 @@ async fn zcode_warm_ambiguous_v4_acknowledgement_does_not_repeat_the_effect() {
         ),
         (1, 0),
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zcode_mirrored_goal_output_limit_retires_executor_without_replaying() {
+    core_test_support::skip_if_remote!("ZCode inner execution is explicitly host-local");
+    for outcome in [Outcome::OversizedGoalStream, Outcome::OversizedGoalFallback] {
+        let (log, effects) = probe(
+            Lifecycle::Warm,
+            outcome,
+            AskForApproval::Never,
+            PermissionProfile::Disabled,
+        )
+        .await;
+        assert_eq!(effects, "inner\n");
+        assert_eq!(
+            (
+                log.iter().filter(|line| line.starts_with("spawn:")).count(),
+                log.iter().filter(|line| *line == "goal").count(),
+                log.iter()
+                    .filter(|line| *line == "send" || *line == "v4-send")
+                    .count(),
+            ),
+            (1, 1, 0)
+        );
+    }
 }

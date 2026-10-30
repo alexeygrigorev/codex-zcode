@@ -6,7 +6,7 @@ use codex_api::ApiError;
 // tokenizer and leaves room below the 10K-token context-item limit.
 pub(super) const MAX_MESSAGE_BYTES: usize = 8_000;
 
-pub(super) fn check_message_bytes(bytes: usize) -> Result<(), ApiError> {
+pub(crate) fn check_message_bytes(bytes: usize) -> Result<(), ApiError> {
     if bytes > MAX_MESSAGE_BYTES {
         // A submitted inner turn may already have performed side effects.
         // Do not classify this as a context-window error, which can resubmit.

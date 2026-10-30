@@ -66,7 +66,7 @@ use crate::zcode_warm_resume;
 #[path = "zcode_warm_model.rs"]
 mod model;
 #[path = "zcode_warm_output.rs"]
-mod output;
+pub(super) mod output;
 
 /// Env var enabling the warm bridge (`ZCODE_WARM=1`).
 const WARM_BRIDGE_ENV_VAR: &str = "ZCODE_WARM";

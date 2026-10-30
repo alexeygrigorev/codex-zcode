@@ -110,6 +110,10 @@ pub(crate) enum GoalLoopMode {
     Paused,
     /// Emit fourteen bare continuation turns and never settle.
     Capped,
+    /// Exceed the history limit using streamed deltas.
+    OversizedStream,
+    /// Exceed the history limit using only the completed response.
+    OversizedFallback,
 }
 
 impl Default for FakeServerOptions {
@@ -324,6 +328,16 @@ function handle(msg) {
       }
       const target = { targetId: "tgt_1", objective: msg.params.objective, status: "active" };
       emit({ sessionId: msg.params.sessionId, type: "session.updated", payload: { action: "set", source: "command", target } });
+      if (GOAL_LOOP === "oversized-stream" || GOAL_LOOP === "oversized-fallback") {
+        const response = "x".repeat(8001);
+        if (GOAL_LOOP === "oversized-stream") {
+          emit({ sessionId: msg.params.sessionId, type: "model.streaming", payload: { kind: "text_delta", delta: "ok" } });
+          emit({ sessionId: msg.params.sessionId, type: "model.streaming", payload: { kind: "text_delta", delta: response.slice(0, 7999) } });
+        }
+        emit({ sessionId: msg.params.sessionId, type: "turn.completed", payload: { response, resultType: "success" } });
+        respond({ response: "Goal active", snapshot: {}, startedTurn: true });
+        break;
+      }
       if (GOAL_LOOP === "capped") {
         for (let i = 0; i < 14; i++) {
           emit({ sessionId: msg.params.sessionId, type: "turn.completed", payload: { response: "step " + i, resultType: "success" } });
@@ -567,6 +581,8 @@ process.stdin.on("data", (chunk) => {
                 GoalLoopMode::Complete => "\"complete\"",
                 GoalLoopMode::Paused => "\"paused\"",
                 GoalLoopMode::Capped => "\"capped\"",
+                GoalLoopMode::OversizedStream => "\"oversized-stream\"",
+                GoalLoopMode::OversizedFallback => "\"oversized-fallback\"",
             },
         )
         .replace("%RESULT_TYPE%", options.turn_result_type);
