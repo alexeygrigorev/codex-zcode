@@ -199,10 +199,10 @@ require("readline").createInterface({ input: process.stdin }).on("line", (line) 
           payload: { toolCallId: "tool-" + toolName, toolName,
             input: { command: "echo outer >> " + %EFFECT%, file_path: %EFFECT%, content: "outer" } } } });
       }
-      if (%TEXT_SEGMENTS%) emit({ method: "session/event", params: { sessionId,
+      if (%TEXT_SEGMENTS% && fs.readFileSync(%EFFECT%, "utf8") === "inner\n") emit({ method: "session/event", params: { sessionId,
         type: "model.streaming", payload: { kind: "text_delta", delta: "Done checking." } } });
       emit({ method: "session/event", params: { sessionId, type: "turn.completed",
-        payload: { response: "actual client allowed Bash and Write", resultType: "success" } } });
+        payload: { response: %TEXT_SEGMENTS% ? "Done checking." : "actual client allowed Bash and Write", resultType: "success" } } });
     }
     return;
   }
@@ -499,7 +499,19 @@ process.stdin.on("end", () => record("eof:" + process.pid));
             .await;
             assert_eq!(errors.len(), 1);
             assert!(errors[0].contains("history limit"));
-        } else if matches!(outcome, Outcome::InterruptSend | Outcome::InterruptGoal) {
+        } else if matches!(outcome, Outcome::InterruptSend | Outcome::InterruptGoal)
+            || (approval == AskForApproval::Never
+                && profile == PermissionProfile::Disabled
+                && matches!(
+                    outcome,
+                    Outcome::Complete
+                        | Outcome::GoalContinuation
+                        | Outcome::TextSegments
+                        | Outcome::Compact
+                        | Outcome::CompactThenTurn
+                        | Outcome::CompactDisconnect
+                ))
+        {
             start_probe_turn(&test, message, approval, profile.clone()).await;
             let mut errors = Vec::new();
             let mut replies = Vec::new();
@@ -516,7 +528,11 @@ process.stdin.on("end", () => record("eof:" + process.pid));
                 (errors, replies),
                 (
                     Vec::<String>::new(),
-                    vec!["actual client allowed Bash and Write".to_string()]
+                    if matches!(outcome, Outcome::TextSegments) {
+                        vec!["Let me check.".to_string(), "Done checking.".to_string()]
+                    } else {
+                        vec!["actual client allowed Bash and Write".to_string()]
+                    }
                 )
             );
         } else {
@@ -603,13 +619,31 @@ process.stdin.on("end", () => record("eof:" + process.pid));
         );
     }
     if matches!(outcome, Outcome::CompactThenTurn) {
-        test.submit_turn_with_approval_and_permission_profile(
+        start_probe_turn(
+            &test,
             "Execute the next ordinary turn after compaction",
             approval,
             profile.clone(),
         )
-        .await
-        .expect("ordinary turn after compaction");
+        .await;
+        let mut errors = Vec::new();
+        let mut replies = Vec::new();
+        wait_for_event(&test.codex, |event| {
+            match event {
+                EventMsg::Error(error) => errors.push(error.message.clone()),
+                EventMsg::AgentMessage(message) => replies.push(message.message.clone()),
+                _ => {}
+            }
+            matches!(event, EventMsg::TurnComplete(_))
+        })
+        .await;
+        assert_eq!(
+            (errors, replies),
+            (
+                Vec::<String>::new(),
+                vec!["actual client allowed Bash and Write".to_string()]
+            )
+        );
     }
     test.codex
         .shutdown_and_wait()

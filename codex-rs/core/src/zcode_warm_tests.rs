@@ -361,6 +361,12 @@ function handle(msg) {
 // Both input surfaces feed the same turn: tool activity, deltas, terminal
 // event — only the request/ACK envelope differs.
 function runTurn(sessionId, content) {
+  if (content.startsWith("boundary-fallback:")) {
+    emit({ sessionId, type: "model.streaming", payload: { kind: "text_delta", delta: "checking" } });
+    emit({ sessionId, type: "model.streaming", payload: { kind: "tool_input_start" } });
+    emit({ sessionId, type: "turn.completed", payload: { response: content.slice("boundary-fallback:".length), resultType: "success" } });
+    return;
+  }
   if (TOOL_EVENTS) {
     emit({ sessionId: sessionId, type: "tool_call_scheduled", payload: { toolCallId: "tc_1", toolName: "Bash", input: { command: "ls /tmp" } } });
     emit({ sessionId: sessionId, type: "tool_call_scheduled", payload: { toolCallId: "tc_2", toolName: "Read", input: { file: "/x" } } });
@@ -1761,6 +1767,58 @@ async fn warm_retirement_runs_once_for_concurrent_and_repeated_callers() {
         ),
         (Some("close"), 1),
     );
+}
+
+#[tokio::test]
+async fn final_fallback_after_tool_boundary_preserves_only_distinct_text() {
+    for (fallback, expected) in [
+        ("final answer", vec!["checking", "final answer"]),
+        ("checking", vec!["checking"]),
+    ] {
+        let fixture = write_fake_server();
+        let bridge = ZcodeWarmBridge::spawn(
+            &test_runtime(&fixture),
+            "/tmp",
+            WarmMode::Build,
+            WarmPermissionPolicy::DenyAll,
+            SessionSeed::Fresh,
+        )
+        .expect("spawn fake app-server");
+        let session_id = bridge
+            .prepare_session("/tmp", WarmMode::Build)
+            .await
+            .expect("prepare session");
+        let mut stream = bridge
+            .turn(
+                &session_id,
+                &format!("boundary-fallback:{fallback}"),
+                TurnInputChannel::LegacySend,
+            )
+            .expect("start turn");
+        let mut items = Vec::new();
+        loop {
+            match next_event(&mut stream.rx_event).await {
+                ResponseEvent::OutputItemDone(item) => items.push(item),
+                ResponseEvent::Completed { .. } => break,
+                _ => {}
+            }
+        }
+        let expected = expected
+            .into_iter()
+            .enumerate()
+            .map(|(index, text)| {
+                let mut item = assistant_message(text);
+                if index > 0
+                    && let ResponseItem::Message { phase, .. } = &mut item
+                {
+                    *phase = Some(codex_protocol::models::MessagePhase::FinalAnswer);
+                }
+                item
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(items, expected);
+        bridge.retire().await.expect("retire fake app-server");
+    }
 }
 
 #[tokio::test]
