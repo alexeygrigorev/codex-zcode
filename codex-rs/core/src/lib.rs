@@ -244,6 +244,7 @@ pub use installation_id::resolve_installation_id;
 pub mod compact;
 mod memory_usage;
 pub mod otel_init;
+mod zcode_home;
 mod zcode_process;
 mod zcode_warm;
 mod zcode_warm_events;

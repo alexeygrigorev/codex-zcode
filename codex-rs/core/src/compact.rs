@@ -33,6 +33,7 @@ use codex_context_fragments::AnnotatedContent;
 use codex_context_fragments::set_annotated_content;
 use codex_history::CodexHarnessMetadata;
 use codex_history::ResponseItemEnvelope;
+use codex_model_provider_info::WireApi;
 use codex_protocol::ResponseItemId;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::CodexErrorDetails;
@@ -274,6 +275,25 @@ async fn run_compact_task_inner_impl(
     let responses_metadata = sess
         .compaction_responses_metadata(turn_context.as_ref(), compaction_metadata)
         .await;
+    let zcode_execution = match &initial_context_injection {
+        InitialContextInjection::BeforeLastUserMessage { step_context, .. } => {
+            crate::client::zcode_execution::ZcodeExecutionPolicy {
+                approval_policy: step_context.settings.approval_policy(),
+                permission_profile: turn_context
+                    .permission_profile_for_environments(&step_context.environments),
+                workspace: step_context.environments.single_local_environment_cwd(),
+            }
+        }
+        InitialContextInjection::DoNotInject => {
+            crate::client::zcode_execution::ZcodeExecutionPolicy {
+                approval_policy: turn_context.approval_policy(),
+                permission_profile: turn_context.permission_profile(),
+                workspace: turn_context
+                    .initial_environments
+                    .single_local_environment_cwd(),
+            }
+        }
+    };
 
     let compaction_response = loop {
         // Clone is required because of the loop
@@ -287,6 +307,7 @@ async fn run_compact_task_inner_impl(
         let prompt = Prompt {
             input: turn_input,
             base_instructions: sess.get_prompt_base_instructions().await,
+            zcode_execution: zcode_execution.clone(),
             ..Default::default()
         };
         let attempt_result = drain_to_completed(
@@ -312,6 +333,11 @@ async fn run_compact_task_inner_impl(
                 return Err(err);
             }
             Err(e) if matches!(e.details(), CodexErrorDetails::SessionBudgetExceeded) => {
+                return Err(e);
+            }
+            Err(e) if turn_context.provider.info().wire_api == WireApi::Zcode => {
+                // Inner execution may have happened before this failure. Both
+                // retries and history-trimming resubmissions would replay it.
                 return Err(e);
             }
             Err(e) if matches!(e.details(), CodexErrorDetails::ContextWindowExceeded) => {

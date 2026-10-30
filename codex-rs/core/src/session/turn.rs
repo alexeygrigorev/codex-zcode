@@ -7,7 +7,6 @@ use std::sync::atomic::Ordering;
 use crate::client::ModelClientSession;
 use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
-use crate::client_common::ZcodeInnerMode;
 use crate::compact::InitialContextInjection;
 use crate::compact::run_inline_auto_compact_task;
 use crate::compact_remote_v2::run_inline_remote_auto_compact_task as run_inline_remote_auto_compact_task_v2;
@@ -1577,9 +1576,12 @@ pub(crate) fn build_prompt(
             &turn_context.session_source,
         ),
         cyber_access_program: turn_context.cyber_access_program,
-        zcode_inner_mode: ZcodeInnerMode::from_approval_policy(
-            step_context.settings.approval_policy(),
-        ),
+        zcode_execution: crate::client::zcode_execution::ZcodeExecutionPolicy {
+            approval_policy: step_context.settings.approval_policy(),
+            permission_profile: turn_context
+                .permission_profile_for_environments(&step_context.environments),
+            workspace: step_context.environments.single_local_environment_cwd(),
+        },
     }
 }
 

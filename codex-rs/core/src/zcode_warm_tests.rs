@@ -11,6 +11,7 @@ use super::ZcodeWarmBridge;
 use super::warm_bridge_enabled_from_value;
 use super::warm_mode_from_value;
 use crate::client::ZcodeRuntime;
+use crate::client_common::ZcodeInnerMode;
 use crate::zcode_warm_permissions::PermissionRequest;
 use crate::zcode_warm_permissions::RiskTier;
 use crate::zcode_warm_permissions::WarmPermissionPolicy;
@@ -31,6 +32,14 @@ fn assistant_message(text: &str) -> ResponseItem {
         phase: None,
         internal_chat_message_metadata_passthrough: None,
     }
+}
+
+fn final_assistant_message(text: &str) -> ResponseItem {
+    let mut item = assistant_message(text);
+    if let ResponseItem::Message { phase, .. } = &mut item {
+        *phase = Some(codex_protocol::models::MessagePhase::FinalAnswer);
+    }
+    item
 }
 
 /// Writes the fake app-server fixture and returns its path; the fake appends
@@ -67,6 +76,8 @@ pub(crate) struct FakeServerOptions {
     pub(crate) turn_result_type: &'static str,
     /// Reject `session/resume` so the bridge's create fallback is exercised.
     pub(crate) fails_resume: bool,
+    /// Reject mode enforcement to verify a turn is never submitted.
+    pub(crate) fails_set_mode: bool,
     /// Answer `session/send`, emit one delta, then exit, so the collector is
     /// left waiting when the child's stdout closes.
     pub(crate) exits_mid_turn: bool,
@@ -112,6 +123,7 @@ impl Default for FakeServerOptions {
             emits_tool_events: false,
             turn_result_type: "success",
             fails_resume: false,
+            fails_set_mode: false,
             exits_mid_turn: false,
             empty_session_list: false,
             fails_v4_command: false,
@@ -143,6 +155,8 @@ let pendingMcpAuth = null;
 // Event envelopes carry a monotonic seq; the subscribe result pins the
 // stream head it starts from.
 let seqCounter = 7;
+const modelSettings = { model: { available: [{ ref: { providerId: "zai", modelId: "glm-5.3-flash" },
+  reasoning: { levels: [{ label: "Fixture", value: "fixture-default" }], defaultLevel: "fixture-default" } }] } };
 function write(obj) { process.stdout.write(JSON.stringify(obj) + "\n"); }
 function emit(params) { params.seq = ++seqCounter; write({ method: "session/event", params }); }
 function sendProbe(kind, original) {
@@ -224,11 +238,30 @@ function handle(msg) {
       if (FAIL_RESUME) {
         write({ id: msg.id, error: { code: -32000, message: "session not found: " + msg.params.sessionId } });
       } else {
-        respond({ sessionId: msg.params.sessionId, session: { sessionId: msg.params.sessionId }, messages: [], settings: {} });
+        respond({ sessionId: msg.params.sessionId, session: { sessionId: msg.params.sessionId }, messages: [], settings: modelSettings });
+      }
+      break;
+    case "session/close":
+      respond({ closed: true });
+      break;
+    case "session/setModel":
+      stats("model:" + JSON.stringify(msg.params.model));
+      if (msg.params.model.options?.reasoningLevel !== "fixture-default") {
+        write({ id: msg.id, error: { code: -32602, message: "reasoning level missing or invalid" } });
+        break;
+      }
+      respond({ session: { sessionId: msg.params.sessionId }, settings: { model: { current: msg.params.model } } });
+      break;
+    case "session/setMode":
+      stats("enforced-mode:" + msg.params.mode);
+      if (FAIL_SET_MODE) {
+        write({ id: msg.id, error: { code: -32000, message: "mode rejected" } });
+      } else {
+        respond({});
       }
       break;
     case "session/create":
-      respond({ session: { sessionId: "sess_fake" }, protocol: { name: "ZCode Protocol", version: 1 } });
+      respond({ session: { sessionId: "sess_fake" }, settings: modelSettings, protocol: { name: "ZCode Protocol", version: 1 } });
       break;
     case "session/subscribe":
       respond({ sessionId: msg.params.sessionId, eventSeq: 7, events: [] });
@@ -341,6 +374,7 @@ const PROBE_RUNTIME = %PROBE_RUNTIME%;
 const PERM_RISK = "%PERM_RISK%";
 const REANNOUNCE_PROBE = %REANNOUNCE_PROBE%;
 const TOOL_EVENTS = %TOOL_EVENTS%;
+const FAIL_SET_MODE = %FAIL_SET_MODE%;
 const FAIL_RESUME = %FAIL_RESUME%;
 const EXIT_MID_TURN = %EXIT_MID_TURN%;
 const EMPTY_LIST = %EMPTY_LIST%;
@@ -435,6 +469,14 @@ process.stdin.on("data", (chunk) => {
 });
 "#;
     let script = script
+        .replace(
+            "%FAIL_SET_MODE%",
+            if options.fails_set_mode {
+                "true"
+            } else {
+                "false"
+            },
+        )
         .replace(
             "%REJECT_DRIFT%",
             if options.rejects_unknown_create_keys {
@@ -597,7 +639,7 @@ async fn warm_turn_streams_deltas_and_completes_with_usage() {
         other => panic!("expected OutputTextDelta, got {other:?}"),
     }
     match next_event(&mut rx).await {
-        ResponseEvent::OutputItemDone(item) => assert_eq!(item, assistant_message("first")),
+        ResponseEvent::OutputItemDone(item) => assert_eq!(item, final_assistant_message("first")),
         other => panic!("expected OutputItemDone, got {other:?}"),
     }
     match next_event(&mut rx).await {
@@ -696,7 +738,7 @@ async fn warm_turn_maps_tool_call_events_to_bridge_activity() {
         match next_event(&mut rx).await {
             ResponseEvent::OutputTextDelta(_) => continue,
             ResponseEvent::OutputItemDone(item) => {
-                assert_eq!(item, assistant_message("toolturn"));
+                assert_eq!(item, final_assistant_message("toolturn"));
                 break;
             }
             other => panic!("expected streamed output, got {other:?}"),
@@ -843,7 +885,7 @@ async fn warm_turn_reports_budget_exhaustion_instead_of_success() {
     let err = loop {
         match tokio::time::timeout(Duration::from_secs(30), rx.recv()).await {
             Ok(Some(Ok(ResponseEvent::OutputItemDone(item)))) => {
-                assert_eq!(item, assistant_message("nodelta!"));
+                assert_eq!(item, final_assistant_message("nodelta!"));
                 saw_partial_reply = true;
             }
             Ok(Some(Ok(_))) => continue,
@@ -924,11 +966,26 @@ async fn compat_retry_does_not_retry_unrelated_rejections() {
 
 #[test]
 fn warm_mode_value_parsing() {
-    assert_eq!(warm_mode_from_value(None), WarmMode::Yolo);
-    assert_eq!(warm_mode_from_value(Some("yolo")), WarmMode::Yolo);
-    assert_eq!(warm_mode_from_value(Some("garbage")), WarmMode::Yolo);
-    assert_eq!(warm_mode_from_value(Some("build")), WarmMode::Build);
-    assert_eq!(warm_mode_from_value(Some(" build ")), WarmMode::Build);
+    assert_eq!(
+        warm_mode_from_value(None, ZcodeInnerMode::Yolo),
+        WarmMode::Yolo
+    );
+    assert_eq!(
+        warm_mode_from_value(Some("yolo"), ZcodeInnerMode::Yolo),
+        WarmMode::Yolo
+    );
+    assert_eq!(
+        warm_mode_from_value(Some("garbage"), ZcodeInnerMode::Yolo),
+        WarmMode::Yolo
+    );
+    assert_eq!(
+        warm_mode_from_value(Some("build"), ZcodeInnerMode::Yolo),
+        WarmMode::Build
+    );
+    assert_eq!(
+        warm_mode_from_value(Some(" build "), ZcodeInnerMode::Yolo),
+        WarmMode::Build
+    );
 }
 
 #[tokio::test]
@@ -1077,7 +1134,7 @@ async fn reannounced_permission_request_is_answered_each_time() {
 }
 
 #[tokio::test]
-async fn yolo_bridge_rejects_interaction_callbacks() {
+async fn initially_yolo_bridge_can_answer_gated_interaction_callbacks() {
     let fixture = write_fake_server_with(FakeServerOptions {
         probes_interactions: true,
         ..FakeServerOptions::default()
@@ -1099,11 +1156,13 @@ async fn yolo_bridge_rejects_interaction_callbacks() {
     let lines: Vec<&str> = stats_text.lines().collect();
     assert!(lines.contains(&"mode:yolo"), "stats: {stats_text}");
     assert!(
-        lines.contains(&"permission:rejected:-32601"),
+        lines.contains(
+            &permission_stats_line(WarmPermissionPolicy::DenyAll, RiskTier::Medium).as_str()
+        ),
         "stats: {stats_text}"
     );
     assert!(
-        lines.contains(&"userinput:rejected:-32601"),
+        lines.contains(&"userinput:{\"action\":\"decline\",\"reason\":\"Declined by the Codex host: the warm ZCode bridge has no interactive approver\"}"),
         "stats: {stats_text}"
     );
     bridge.kill("test end");
@@ -1497,10 +1556,138 @@ async fn v4_send_channel_sends_text_through_v4_command() {
 }
 
 #[tokio::test]
-async fn v4_send_failure_falls_back_to_legacy_send() {
+async fn v4_ambiguous_ack_after_execution_does_not_resubmit_input() {
+    let fixture = write_fake_server();
+    let source = std::fs::read_to_string(&fixture).expect("read fixture");
+    std::fs::write(
+        &fixture,
+        source
+            .replace(
+                r#"status: "accepted","#,
+                r#"status: "unknown-after-execution","#,
+            )
+            .replace(
+                "function runTurn(sessionId, content) {",
+                r#"function runTurn(sessionId, content) { stats("effect"); setTimeout(() => stats("late-effect"), 500);"#,
+            ),
+    )
+    .expect("replace v4 acknowledgement");
+    let bridge = ZcodeWarmBridge::spawn(
+        &test_runtime(&fixture),
+        "/tmp",
+        WarmMode::Build,
+        WarmPermissionPolicy::DenyAll,
+        SessionSeed::Fresh,
+    )
+    .expect("spawn fake app-server");
+    let session_id = bridge
+        .ensure_session("/tmp")
+        .await
+        .expect("session created");
+    let mut stream = bridge
+        .turn(&session_id, "execute once", TurnInputChannel::V4Command)
+        .expect("turn starts");
+    let error = tokio::time::timeout(Duration::from_secs(/*secs*/ 5), stream.rx_event.recv())
+        .await
+        .expect("submission must finish")
+        .expect("submission outcome")
+        .expect_err("ambiguous acknowledgement must fail");
+    assert!(
+        error.to_string().contains("unknown-after-execution"),
+        "{error}"
+    );
+    assert_eq!(
+        (
+            bridge.is_dead(),
+            bridge.take_child_for_retirement().is_none()
+        ),
+        (true, true),
+    );
+    tokio::time::sleep(Duration::from_millis(/*millis*/ 750)).await;
+    let stats = std::fs::read_to_string(stats_path(&fixture)).expect("stats written");
+    assert_eq!(
+        (
+            stats
+                .lines()
+                .filter(|line| line.starts_with("v4command:"))
+                .count(),
+            stats
+                .lines()
+                .filter(|line| line.starts_with("send:"))
+                .count(),
+            stats.lines().filter(|line| *line == "effect").count(),
+            stats.lines().filter(|line| *line == "late-effect").count(),
+        ),
+        (1, 0, 1, 0),
+        "{stats}",
+    );
+}
+
+#[test]
+fn warm_mode_cannot_weaken_turn_approval_policy() {
+    for value in [None, Some("yolo"), Some("build"), Some("garbage")] {
+        assert_eq!(
+            warm_mode_from_value(value, ZcodeInnerMode::Build),
+            WarmMode::Build
+        );
+    }
+}
+
+#[tokio::test]
+async fn warm_reused_and_resumed_sessions_reassert_turn_mode() {
+    for seed in [
+        SessionSeed::Fresh,
+        SessionSeed::Predecessor {
+            session_id: "sess_previous".to_string(),
+            last_event_seq: 0,
+        },
+    ] {
+        let fixture = write_fake_server();
+        let bridge = ZcodeWarmBridge::spawn(
+            &test_runtime(&fixture),
+            "/tmp",
+            WarmMode::Yolo,
+            WarmPermissionPolicy::DenyAll,
+            seed,
+        )
+        .expect("spawn fake app-server");
+        for (mode, content) in [(WarmMode::Yolo, "first"), (WarmMode::Build, "second")] {
+            let session_id = bridge
+                .prepare_session("/tmp", mode)
+                .await
+                .expect("mode acknowledged");
+            let stream = bridge
+                .turn(&session_id, content, TurnInputChannel::LegacySend)
+                .expect("turn starts");
+            let mut rx = stream.rx_event;
+            loop {
+                if matches!(next_event(&mut rx).await, ResponseEvent::Completed { .. }) {
+                    break;
+                }
+            }
+        }
+        let stats = std::fs::read_to_string(stats_path(&fixture)).expect("read fake stats");
+        assert_eq!(
+            stats
+                .lines()
+                .filter(|line| line.starts_with("enforced-mode:") || line.starts_with("send:"))
+                .collect::<Vec<_>>(),
+            vec![
+                "enforced-mode:yolo",
+                "send:first",
+                "enforced-mode:build",
+                "send:second"
+            ]
+        );
+        bridge.kill("test end");
+    }
+}
+
+#[tokio::test]
+async fn warm_rejected_mode_does_not_prepare_a_turn() {
     let fixture = write_fake_server_with(FakeServerOptions {
-        fails_v4_command: true,
-        ..FakeServerOptions::default()
+        fails_set_mode: true,
+        ..Default::default()
     });
     let bridge = ZcodeWarmBridge::spawn(
         &test_runtime(&fixture),
@@ -1510,37 +1697,201 @@ async fn v4_send_failure_falls_back_to_legacy_send() {
         SessionSeed::Fresh,
     )
     .expect("spawn fake app-server");
-    let session_id = bridge
-        .ensure_session("/tmp")
+    let error = bridge
+        .prepare_session("/tmp", WarmMode::Build)
         .await
-        .expect("session created");
-    let stream = bridge
-        .turn(&session_id, "fallback", TurnInputChannel::V4Command)
-        .expect("turn starts");
-    let mut rx = stream.rx_event;
-
-    loop {
-        match next_event(&mut rx).await {
-            ResponseEvent::Completed { end_turn, .. } => {
-                assert_eq!(end_turn, Some(true));
-                break;
-            }
-            ResponseEvent::OutputItemAdded(_)
-            | ResponseEvent::OutputTextDelta(_)
-            | ResponseEvent::OutputItemDone(_) => continue,
-            other => panic!("expected Completed, got {other:?}"),
-        }
-    }
-
-    let stats_text = std::fs::read_to_string(stats_path(&fixture)).expect("stats written");
-    let lines: Vec<&str> = stats_text.lines().collect();
-    assert!(
-        lines.contains(&"v4/command"),
-        "the v4 attempt must have been made: {stats_text}"
-    );
-    assert!(
-        lines.iter().any(|line| line.starts_with("send:fallback")),
-        "the rejected v4 command must fall back to session/send: {stats_text}"
+        .expect_err("mode rejection must fail preparation");
+    assert!(error.contains("mode rejected"), "{error}");
+    let stats = std::fs::read_to_string(stats_path(&fixture)).expect("read fake stats");
+    assert_eq!(
+        stats
+            .lines()
+            .filter(|line| line.starts_with("enforced-mode:") || line.starts_with("send:"))
+            .collect::<Vec<_>>(),
+        vec!["enforced-mode:build"]
     );
     bridge.kill("test end");
+}
+
+#[tokio::test]
+async fn warm_retirement_runs_once_for_concurrent_and_repeated_callers() {
+    let fixture = write_fake_server();
+    let bridge = ZcodeWarmBridge::spawn(
+        &test_runtime(&fixture),
+        "/tmp",
+        WarmMode::Build,
+        WarmPermissionPolicy::DenyAll,
+        SessionSeed::Fresh,
+    )
+    .expect("spawn fake app-server");
+    bridge
+        .prepare_session("/tmp", WarmMode::Build)
+        .await
+        .expect("prepare session");
+    assert_eq!(
+        tokio::join!(bridge.retire(), bridge.retire()),
+        (Ok(()), Ok(())),
+    );
+    bridge.retire().await.expect("cached natural retirement");
+    assert_eq!(
+        (bridge.is_dead(), bridge.child.lock().unwrap().is_none()),
+        (true, true),
+    );
+    let stats = std::fs::read_to_string(stats_path(&fixture)).expect("read protocol log");
+    assert_eq!(
+        (
+            stats.lines().last(),
+            stats.lines().filter(|line| *line == "close").count(),
+        ),
+        (Some("close"), 1),
+    );
+}
+
+#[tokio::test]
+async fn oversized_assistant_items_fail_without_completing_or_resubmitting() {
+    for content in [
+        "x".repeat(/*n*/ 8_001),
+        format!("nodelta{}", "x".repeat(/*n*/ 8_001)),
+    ] {
+        let fixture = write_fake_server();
+        let bridge = ZcodeWarmBridge::spawn(
+            &test_runtime(&fixture),
+            "/tmp",
+            WarmMode::Build,
+            WarmPermissionPolicy::DenyAll,
+            SessionSeed::Fresh,
+        )
+        .expect("spawn fake app-server");
+        let session_id = bridge
+            .prepare_session("/tmp", WarmMode::Build)
+            .await
+            .expect("prepare session");
+        let mut stream = bridge
+            .turn(&session_id, &content, TurnInputChannel::LegacySend)
+            .expect("start turn");
+        let mut terminal_items = Vec::new();
+        let mut forwarded = String::new();
+        let error = loop {
+            match stream.rx_event.recv().await.expect("terminal event") {
+                Ok(ResponseEvent::OutputItemDone(item)) => terminal_items.push(item),
+                Ok(ResponseEvent::OutputTextDelta(delta)) => forwarded.push_str(&delta),
+                Ok(ResponseEvent::Completed { .. }) => panic!("oversized reply completed"),
+                Ok(_) => {}
+                Err(error) => break error,
+            }
+        };
+        assert_eq!(
+            (terminal_items, forwarded),
+            (
+                Vec::<ResponseItem>::new(),
+                if content.starts_with("nodelta") {
+                    String::new()
+                } else {
+                    "xx".to_string()
+                }
+            ),
+        );
+        assert!(matches!(error, codex_api::ApiError::InvalidRequest { .. }));
+        let _ = bridge.retire().await;
+        let stats = std::fs::read_to_string(stats_path(&fixture)).expect("read protocol log");
+        assert_eq!(
+            stats
+                .lines()
+                .filter(|line| line.starts_with("send:"))
+                .count(),
+            1,
+        );
+    }
+}
+
+#[tokio::test]
+async fn retirement_stops_descendants_after_natural_exit_and_forced_kill() {
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
+
+    enum Retirement {
+        Natural,
+        Forced,
+    }
+
+    for retirement in [Retirement::Natural, Retirement::Forced] {
+        // A descendant holds this connection independently of the leader's
+        // stdio. Closing the test socket also makes it exit on any failure;
+        // the timer bounds its lifetime if the entire test process crashes.
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let descendant = format!(
+            r#"const socket = require("net").connect({port}, "127.0.0.1", () => socket.write("R"));
+            socket.on("error", () => process.exit(0));
+            socket.on("end", () => process.exit(0));
+            setTimeout(() => process.exit(0), 30000).unref();"#,
+        );
+        let fixture = write_fake_server();
+        let source = std::fs::read_to_string(&fixture).unwrap();
+        std::fs::write(
+            &fixture,
+            source.replace(
+                "function runTurn(sessionId, content) {",
+                &format!(
+                    r#"function runTurn(sessionId, content) {{
+                    require("child_process").spawn(process.execPath, ["-e", {}], {{ stdio: "ignore" }}).unref();"#,
+                    serde_json::to_string(&descendant).unwrap(),
+                ),
+            ),
+        )
+        .unwrap();
+        let bridge = ZcodeWarmBridge::spawn(
+            &test_runtime(&fixture),
+            "/tmp",
+            WarmMode::Build,
+            WarmPermissionPolicy::DenyAll,
+            SessionSeed::Fresh,
+        )
+        .unwrap();
+        let session_id = bridge
+            .prepare_session("/tmp", WarmMode::Build)
+            .await
+            .unwrap();
+        let mut stream = bridge
+            .turn(&session_id, "descendant", TurnInputChannel::LegacySend)
+            .unwrap();
+        let (mut socket, _) =
+            tokio::time::timeout(Duration::from_secs(/*secs*/ 5), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+        let mut ready = [0];
+        tokio::time::timeout(
+            Duration::from_secs(/*secs*/ 5),
+            socket.read_exact(&mut ready),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(ready, [b'R']);
+        while let Some(event) = stream.rx_event.recv().await {
+            if matches!(event.unwrap(), ResponseEvent::Completed { .. }) {
+                break;
+            }
+        }
+        if matches!(retirement, Retirement::Forced) {
+            bridge.kill("exercise forced descendant retirement");
+        }
+        let retired = bridge.retire().await;
+        assert_eq!(retired.is_ok(), matches!(retirement, Retirement::Natural));
+        assert_eq!(bridge.retire().await, retired);
+        let mut remaining = Vec::new();
+        let closed = tokio::time::timeout(
+            Duration::from_secs(/*secs*/ 5),
+            socket.read_to_end(&mut remaining),
+        )
+        .await
+        .expect("retirement must close the descendant's connection");
+        if let Err(error) = closed {
+            assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+        }
+        assert_eq!(remaining, Vec::<u8>::new());
+    }
 }

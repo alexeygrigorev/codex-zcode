@@ -15,9 +15,8 @@
 //! exists server-side via `session/list` (identity queries read persisted
 //! sessions) before resuming it.
 //!
-//! Today's `session/create` pins only the workspace, so resume mirrors it
-//! with exactly that. The resume schema carries no `mode` member, so gating
-//! is not re-asserted either. Subscribing stays live-only on purpose: the
+//! Create and resume both pin the workspace and any hard tool allowlist.
+//! Mode is reasserted after establishment. Subscribing stays live-only: the
 //! core returns an empty replay gap unless `afterSeq` is passed, and no
 //! collector is waiting during the handshake — replaying queued events
 //! through the stream could only deliver a stale `turn.completed` into a
@@ -119,7 +118,7 @@ async fn resume_session(
     catch_up_from: u64,
 ) -> Result<(), String> {
     let resumed = bridge
-        .request_with_compat_retry(
+        .request_session(
             "session/resume",
             serde_json::json!({
                 "sessionId": session_id,
@@ -131,6 +130,7 @@ async fn resume_session(
         )
         .await?;
     observe_protocol_version(bridge, &resumed);
+    bridge.record_model_catalog(&resumed);
     subscribe(bridge, session_id).await?;
     catch_up_missed_events(bridge, session_id, catch_up_from).await;
     Ok(())
@@ -143,7 +143,7 @@ async fn create_session(
     mode: WarmMode,
 ) -> Result<String, String> {
     let created = bridge
-        .request_with_compat_retry(
+        .request_session(
             "session/create",
             serde_json::json!({
                 "workspace": {
@@ -156,6 +156,7 @@ async fn create_session(
         )
         .await?;
     observe_protocol_version(bridge, &created);
+    bridge.record_model_catalog(&created);
     let session_id = created
         .pointer("/session/sessionId")
         .and_then(serde_json::Value::as_str)

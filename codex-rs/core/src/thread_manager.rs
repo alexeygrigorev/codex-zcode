@@ -454,10 +454,10 @@ const ZCODE_AUTO_COMPACT_TOKEN_LIMIT: i64 = 120_000;
 /// Zcode exposes no browsable `/models` endpoint through Codex's normal discovery path. Build the
 /// catalog from local ZCode configuration, retaining the configured model as a guaranteed entry.
 fn zcode_static_models_catalog(config: &Config) -> ModelsResponse {
-    let cli_config = dirs::home_dir()
+    let cli_config = crate::zcode_home::home_dir()
         .map(|home| home.join(".zcode/cli/config.json"))
         .and_then(|path| read_json_config(&path));
-    let v2_config = dirs::home_dir()
+    let v2_config = crate::zcode_home::home_dir()
         .map(|home| home.join(".zcode/v2/config.json"))
         .and_then(|path| read_json_config(&path));
     zcode_models_catalog(

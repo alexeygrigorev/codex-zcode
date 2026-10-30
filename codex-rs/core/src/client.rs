@@ -25,6 +25,9 @@
 //! WebSocket prewarm is treated as the first websocket connection attempt for a turn. If it
 //! fails, normal stream retry/fallback logic handles recovery on the same turn.
 
+#[path = "zcode_execution.rs"]
+pub(crate) mod zcode_execution;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -890,14 +893,14 @@ fn zcodex_task_name_from_description(description: &str) -> String {
 
 /// Registers `model_slug` in the user's real ZCode config and selects it.
 ///
-/// The ZCode CLI resolves its config as `$HOME/.zcode/cli/config.json`
+/// The ZCode CLI resolves its config under Node's home as `.zcode/cli/config.json`
 /// (no flag or environment variable relocates it), and running under the
 /// standard home keeps `~/.gitconfig` and `~/.config/gh` visible to the
 /// tools ZCode launches. The model override is therefore merged into the
 /// real config instead of an isolated home copy.
 fn prepare_zcode_config(model_slug: &str) -> std::io::Result<()> {
-    let Some(home) = dirs::home_dir() else {
-        return Err(std::io::Error::other("HOME is not set"));
+    let Some(home) = crate::zcode_home::home_dir() else {
+        return Err(std::io::Error::other("ZCode home directory is unavailable"));
     };
     let config_path = home.join(".zcode").join("cli").join("config.json");
     let original: serde_json::Value =
@@ -1016,7 +1019,7 @@ struct ModelClientState {
 enum ZcodeWarmSlot {
     /// Another call is acquiring the checkout and spawning a child; other
     /// callers wait for this state to resolve instead of racing it.
-    Claiming,
+    Claiming(Arc<AtomicBool>),
     /// A child is cached on the thread. It owns the checkout session
     /// permit, so the checkout is reserved for as long as it lives.
     Ready(ZcodeWarmSlotEntry),
@@ -1024,21 +1027,44 @@ enum ZcodeWarmSlot {
 
 /// The cached warm app-server child plus its checkout session permit.
 ///
-/// Field order matters on drop: the child is torn down before the checkout
-/// is released, so no other spawn can claim the checkout while this
-/// process is still exiting. `checkout` is an `Option` because a failed
-/// turn kills the child and releases the checkout (so the fallback cold
-/// spawn can run) while the dead bridge stays cached for its replacement
-/// to resume the session from.
+/// The checkout remains owned through awaited retirement or synchronous
+/// drop cleanup. Explicit retirement takes the checkout before drop so
+/// cleanup cannot run twice.
 struct ZcodeWarmSlotEntry {
+    workspace: codex_utils_absolute_path::AbsolutePathBuf,
+    permission_policy: zcode_warm_permissions::WarmPermissionPolicy,
     bridge: Arc<crate::zcode_warm::ZcodeWarmBridge>,
     checkout: Option<zcode_process::ZcodeSessionPermit>,
+}
+
+impl Drop for ZcodeWarmSlotEntry {
+    fn drop(&mut self) {
+        let Some(checkout) = self.checkout.take() else {
+            return;
+        };
+        // Drop can run while the async runtime is shutting down. Retain the
+        // checkout through synchronous forced cleanup, even in that case.
+        self.bridge.kill("retiring a dropped warm executor");
+        if let Some(mut child) = self.bridge.take_child_for_retirement() {
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) => {}
+                    Err(_) => {
+                        let _ = child.start_kill();
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(/*millis*/ 10));
+            }
+        }
+        drop(checkout);
+    }
 }
 
 impl std::fmt::Debug for ZcodeWarmSlot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ZcodeWarmSlot::Claiming => f.write_str("ZcodeWarmSlot::Claiming"),
+            ZcodeWarmSlot::Claiming(_) => f.write_str("ZcodeWarmSlot::Claiming"),
             ZcodeWarmSlot::Ready(entry) => {
                 f.debug_tuple("ZcodeWarmSlot::Ready").field(entry).finish()
             }
@@ -3025,37 +3051,58 @@ impl ModelClientSession {
             }
             WireApi::Zcode => {
                 let inference_trace_attempt = inference_trace.start_attempt();
-                let runtime = ZcodeRuntime::from_env(&model_info.slug);
-                // Goal bookkeeping turns exist purely to record a status
-                // change; the legacy path already ends them without
-                // re-prompting, and the warm bridge must not see them.
-                let api_stream = if zcode_warm::warm_bridge_enabled()
-                    && !zcode_only_goal_bookkeeping(&prompt.input)
-                    && self
+                // These requests have a local answer and must never start an inner agent.
+                let local_only = zcode_only_goal_bookkeeping(&prompt.input)
+                    || zcode_process::side_request_reply(&zcode_flatten_transcript(&prompt.input))
+                        .is_some();
+                if !local_only && let Err(error) = prompt.zcode_execution.admitted_workspace() {
+                    let previous = self
                         .client
                         .state
-                        .zcode_warm_spawn_failures
-                        .load(Ordering::Relaxed)
-                        < zcode_warm::ZCODE_WARM_MAX_CONSECUTIVE_FAILURES
-                {
-                    match Self::stream_zcode_warm(&self.client.state, &runtime, prompt).await {
-                        Ok(stream) => stream,
-                        Err(warm_error) => {
-                            warn!(
-                                "ZCode warm bridge unavailable ({warm_error}); using \
-                                 spawn-per-turn"
-                            );
-                            Self::stream_zcode(
-                                runtime,
-                                prompt,
-                                self.client.state.thread_id.to_string(),
-                            )
-                            .await?
+                        .zcode_warm
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take();
+                    match previous {
+                        Some(ZcodeWarmSlot::Ready(mut entry)) => {
+                            let _ = entry.bridge.retire().await;
+                            drop(entry.checkout.take());
                         }
+                        Some(ZcodeWarmSlot::Claiming(cancelled)) => {
+                            cancelled.store(true, Ordering::Relaxed);
+                        }
+                        None => {}
                     }
+                    return Err(CodexErr::InvalidRequest(error));
+                }
+                let runtime = ZcodeRuntime::from_env(&model_info.slug);
+                let api_stream = if local_only {
+                    Self::stream_zcode_local_only(
+                        runtime,
+                        prompt,
+                        self.client.state.thread_id.to_string(),
+                    )
+                    .await?
+                } else if zcode_warm::warm_bridge_enabled() {
+                    zcode_execution::no_replay(
+                        Self::stream_zcode_warm(
+                            &self.client.state,
+                            &runtime,
+                            prompt,
+                            &model_info.slug,
+                        )
+                        .await
+                        .map_err(CodexErr::InvalidRequest)?,
+                    )
                 } else {
-                    Self::stream_zcode(runtime, prompt, self.client.state.thread_id.to_string())
-                        .await?
+                    zcode_execution::stream_cold(
+                        runtime,
+                        prompt,
+                        &self.client.state.thread_id.to_string(),
+                        &model_info.slug,
+                    )
+                    .await
+                    .map_err(CodexErr::InvalidRequest)?
                 };
                 let (stream, _) = map_response_stream(
                     api_stream,
@@ -3068,23 +3115,36 @@ impl ModelClientSession {
         }
     }
 
-    /// Streams the turn through the warm app-server child, falling back to
-    /// the spawn-per-turn bridge on any startup or protocol failure.
+    /// Streams the turn through the warm permission client. Failures are
+    /// returned without starting a second executor or replaying the turn.
     ///
     /// The child holds its checkout's session permit for its whole life
-    /// (the checkout cannot outlive it: replacement and fallback both kill
-    /// the child before touching the checkout again), so the warm path can
+    /// (replacement and shutdown reap the child before releasing it), so the warm path can
     /// never run a second ZCode process in the same tree.
     async fn stream_zcode_warm(
-        state: &ModelClientState,
+        state: &Arc<ModelClientState>,
         runtime: &ZcodeRuntime,
         prompt: &Prompt,
+        model_slug: &str,
     ) -> std::result::Result<codex_api::ResponseStream, String> {
-        let workspace_path = std::env::current_dir()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-        let bridge = 'claim: loop {
+        let workspace = prompt.zcode_execution.admitted_workspace()?.clone();
+        let workspace_path = workspace.to_string_lossy().into_owned();
+        let permission_policy = zcode_execution::permission_policy(prompt);
+        // An explicit build override strengthens the otherwise unrestricted
+        // turn: its unset callback policy must retain the historical denial.
+        let permission_policy = if permission_policy
+            == zcode_warm_permissions::WarmPermissionPolicy::AllowUnrestricted
+            && zcode_warm::warm_mode_from_env(
+                crate::client_common::ZcodeInnerMode::from_approval_policy(
+                    prompt.zcode_execution.approval_policy,
+                ),
+            ) == zcode_warm::WarmMode::Build
+        {
+            zcode_warm_permissions::WarmPermissionPolicy::DenyAll
+        } else {
+            permission_policy
+        };
+        let (bridge, turn_guard) = 'claim: loop {
             enum Decision {
                 Reuse(Arc<crate::zcode_warm::ZcodeWarmBridge>),
                 Wait,
@@ -3098,6 +3158,8 @@ impl ModelClientSession {
                 match slot.as_ref() {
                     Some(ZcodeWarmSlot::Ready(entry))
                         if !entry.bridge.is_dead()
+                            && entry.workspace == workspace
+                            && entry.permission_policy == permission_policy
                             && entry.bridge.consecutive_failures()
                                 < zcode_warm::ZCODE_WARM_MAX_CONSECUTIVE_FAILURES =>
                     {
@@ -3105,14 +3167,24 @@ impl ModelClientSession {
                     }
                     // Another call is acquiring the checkout and spawning
                     // the child; wait for the claim to settle instead of
-                    // racing it to the checkout (its cold fallback would
-                    // block behind the fresh bridge's lifetime permit).
-                    Some(ZcodeWarmSlot::Claiming) => Decision::Wait,
+                    // racing it for the same checkout reservation.
+                    Some(ZcodeWarmSlot::Claiming(_)) => Decision::Wait,
                     _ => Decision::Claim,
                 }
             };
             match decision {
-                Decision::Reuse(bridge) => break bridge,
+                Decision::Reuse(bridge) => {
+                    let guard = Arc::clone(&bridge.turn_lock).lock_owned().await;
+                    if bridge.is_dead()
+                        || !matches!(
+                            state.zcode_warm.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref(),
+                            Some(ZcodeWarmSlot::Ready(entry)) if Arc::ptr_eq(&entry.bridge, &bridge)
+                        )
+                    {
+                        continue 'claim;
+                    }
+                    break (bridge, guard);
+                }
                 Decision::Wait => {
                     tokio::time::sleep(Duration::from_millis(20)).await;
                     continue 'claim;
@@ -3128,7 +3200,7 @@ impl ModelClientSession {
             // — a fresh process after a zcodex restart — the persisted
             // per-thread record, if any, is adopted through `session/list`
             // + `session/resume`.
-            let (dead_predecessor, evicted) = {
+            let (dead_predecessor, mut evicted, cancelled) = {
                 let mut slot = state
                     .zcode_warm
                     .lock()
@@ -3140,38 +3212,40 @@ impl ModelClientSession {
                 // kill the first one's freshly spawned healthy child or
                 // queue behind its lifetime checkout permit.
                 match slot.as_ref() {
-                    Some(ZcodeWarmSlot::Claiming) => continue 'claim,
+                    Some(ZcodeWarmSlot::Claiming(_)) => continue 'claim,
                     Some(ZcodeWarmSlot::Ready(entry))
                         if !entry.bridge.is_dead()
+                            && entry.workspace == workspace
+                            && entry.permission_policy == permission_policy
                             && entry.bridge.consecutive_failures()
                                 < zcode_warm::ZCODE_WARM_MAX_CONSECUTIVE_FAILURES =>
                     {
-                        break 'claim Arc::clone(&entry.bridge);
+                        continue 'claim;
                     }
                     _ => {}
                 }
                 let dead_predecessor = match slot.as_ref() {
-                    Some(ZcodeWarmSlot::Ready(entry)) if entry.bridge.is_dead() => {
+                    Some(ZcodeWarmSlot::Ready(entry))
+                        if entry.bridge.is_dead() && entry.workspace == workspace =>
+                    {
                         Some((entry.bridge.session_id(), entry.bridge.last_event_seq()))
                     }
                     _ => None,
                 };
-                // Kill an abandoned child before claiming the checkout
-                // again: this entry's permit must drop before the new
-                // acquisition waits, or the replacement would queue behind
-                // its own predecessor forever.
-                if let Some(ZcodeWarmSlot::Ready(entry)) = slot.as_ref()
-                    && !entry.bridge.is_dead()
-                {
-                    entry.bridge.kill("replacing the warm app-server");
-                }
                 let evicted = slot.take();
-                *slot = Some(ZcodeWarmSlot::Claiming);
-                (dead_predecessor, evicted)
+                let cancelled = Arc::new(AtomicBool::new(/*v*/ false));
+                *slot = Some(ZcodeWarmSlot::Claiming(Arc::clone(&cancelled)));
+                (dead_predecessor, evicted, cancelled)
             };
-            // Dropping the evicted entry tears down its child and only then
-            // releases the checkout. Guards are not held across the wait
-            // below; the Claiming state keeps concurrent callers away.
+            let _claim = zcode_execution::WarmClaim {
+                slot: &state.zcode_warm,
+                owner: Arc::clone(&cancelled),
+            };
+            // Keep the previous checkout reserved until its child has been reaped.
+            if let Some(ZcodeWarmSlot::Ready(entry)) = evicted.as_mut() {
+                let _ = entry.bridge.retire().await;
+                drop(entry.checkout.take());
+            }
             drop(evicted);
             let checkout = match zcode_process::acquire_zcode_session(
                 &workspace_path,
@@ -3181,10 +3255,6 @@ impl ModelClientSession {
             {
                 Ok(checkout) => checkout,
                 Err(e) => {
-                    *state
-                        .zcode_warm
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
                     state
                         .zcode_warm_spawn_failures
                         .fetch_add(1, Ordering::Relaxed);
@@ -3205,19 +3275,26 @@ impl ModelClientSession {
                 .zcode_warm
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if cancelled.load(Ordering::Relaxed)
+                || !matches!(slot.as_ref(), Some(ZcodeWarmSlot::Claiming(owner)) if Arc::ptr_eq(owner, &cancelled))
+            {
+                return Err("warm execution claim was cancelled".to_string());
+            }
             match zcode_warm::ZcodeWarmBridge::spawn(
                 runtime,
                 &workspace_path,
-                zcode_warm::warm_mode_from_env(),
-                zcode_warm_permissions::WarmPermissionPolicy::from_env(),
+                zcode_warm::WarmMode::Build,
+                permission_policy,
                 resume_seed,
             ) {
                 Ok(bridge) => {
                     *slot = Some(ZcodeWarmSlot::Ready(ZcodeWarmSlotEntry {
+                        workspace: workspace.clone(),
+                        permission_policy,
                         bridge: Arc::clone(&bridge),
                         checkout: Some(checkout),
                     }));
-                    break bridge;
+                    continue 'claim;
                 }
                 // `checkout` drops here, releasing the claim's reservation.
                 Err(e) => {
@@ -3229,34 +3306,29 @@ impl ModelClientSession {
                 }
             }
         };
+        let turn_lease = zcode_execution::WarmTurnLease {
+            state: Arc::clone(state),
+            bridge: Arc::clone(&bridge),
+            turn_guard: Some(turn_guard),
+        };
         let turned = async {
-            let session_id = bridge.ensure_session(&workspace_path).await?;
+            let session_id = bridge
+                .prepare_session(&workspace_path, zcode_warm::WarmMode::Build)
+                .await?;
+            bridge
+                .select_model(&session_id, ZCODE_PROVIDER_ID, model_slug)
+                .await?;
             let content = zcode_warm_turn_content(&prompt.input);
             let channel = crate::zcode_warm_v4_send::channel_from_env();
             // A goal-active prompt can hand its turn to the core's own goal
             // loop (`session/goal` + the core's completion verifier, issue
-            // #40); anything the mirror cannot set up falls back to the plain
-            // warm prompt.
+            // #40). A failure must not submit a second ordinary turn.
             let stream =
                 match crate::zcode_warm_goal::mirrored_goal_objective(&prompt.tools, &prompt.input)
                 {
                     Some(objective) => {
-                        match crate::zcode_warm_goal::turn_mirrored(
-                            &bridge,
-                            &session_id,
-                            &objective,
-                        )
-                        .await
-                        {
-                            Ok(stream) => stream,
-                            Err(error) => {
-                                warn!(
-                                    "ZCode warm goal mirror unavailable ({error}); \
-                                     sending the goal turn as a normal warm prompt"
-                                );
-                                bridge.turn(&session_id, &content, channel)?
-                            }
-                        }
+                        crate::zcode_warm_goal::turn_mirrored(&bridge, &session_id, &objective)
+                            .await?
                     }
                     None => bridge.turn(&session_id, &content, channel)?,
                 };
@@ -3282,17 +3354,21 @@ impl ModelClientSession {
                         },
                     },
                 );
-                Ok(stream)
+                Ok(zcode_execution::guard_warm_stream(
+                    Arc::clone(state),
+                    Arc::clone(&bridge),
+                    stream,
+                    turn_lease,
+                ))
             }
             Err(e) => {
                 bridge.register_failure();
-                // The dispatch falls back to the spawn-per-turn bridge for
-                // this turn, so the warm child must not keep the checkout:
-                // kill it and release the slot's permit. The dead bridge
+                // The failed request must not be replayed. Retire the inner
+                // executor before releasing its checkout. The dead bridge
                 // stays cached so its replacement still resumes the session
                 // (issue #42). If another call already replaced this entry,
                 // its checkout belongs to the replacement and stays alone.
-                bridge.kill("turn failed; falling back to spawn-per-turn");
+                let _ = bridge.retire().await;
                 let mut slot = state
                     .zcode_warm
                     .lock()
@@ -3303,6 +3379,7 @@ impl ModelClientSession {
                     entry.checkout = None;
                 }
                 let stderr = bridge.stderr_text();
+                turn_lease.release();
                 Err(if stderr.is_empty() {
                     e
                 } else {
@@ -3312,7 +3389,8 @@ impl ModelClientSession {
         }
     }
 
-    /// Streams model inference through ZCode's headless CLI.
+    /// Retained legacy adapter, admitted only for local bookkeeping replies.
+    /// Its subprocess implementation is unreachable behind the entry guard.
     ///
     /// Spawns `node zcode.cjs --prompt ... --output-format stream-json` and
     /// maps NDJSON streaming events to Codex response events.
@@ -3323,11 +3401,18 @@ impl ModelClientSession {
     /// is failed as stalled, and stalled or aborted invocations are torn down
     /// in stages (graceful termination request, grace period, process-tree
     /// kill) so spawned shells never strand.
-    async fn stream_zcode(
+    async fn stream_zcode_local_only(
         runtime: ZcodeRuntime,
         prompt: &Prompt,
         thread_id: String,
     ) -> Result<codex_api::ResponseStream> {
+        if !zcode_only_goal_bookkeeping(&prompt.input)
+            && zcode_process::side_request_reply(&zcode_flatten_transcript(&prompt.input)).is_none()
+        {
+            return Err(CodexErr::InvalidRequest(
+                "legacy ZCode CLI execution is disabled".to_string(),
+            ));
+        }
         use std::process::Stdio;
         use tokio::process::Command;
         use tokio::sync::mpsc;
@@ -3408,8 +3493,21 @@ impl ModelClientSession {
         // Captured before the prompt text moves into the spawn task; feeds
         // the token-usage fallback estimate for the Completed event.
         let prompt_bytes = user_text.len();
-        // Inner `--mode` follows Codex `/permissions` (Never → yolo).
-        let inner_mode = prompt.zcode_inner_mode.as_cli_arg();
+        // Retained legacy bookkeeping code preserves its stricter mode.
+        // The entry guard above rejects all CLI execution requests.
+        let inner_mode = if zcode_warm::warm_bridge_enabled() {
+            zcode_warm::warm_mode_from_env(
+                crate::client_common::ZcodeInnerMode::from_approval_policy(
+                    prompt.zcode_execution.approval_policy,
+                ),
+            )
+            .wire_session_mode()
+        } else {
+            crate::client_common::ZcodeInnerMode::from_approval_policy(
+                prompt.zcode_execution.approval_policy,
+            )
+            .as_cli_arg()
+        };
 
         // A goal-status marker is translated by the previous invocation into
         // a synthesized `update_goal` call; the follow-up request that

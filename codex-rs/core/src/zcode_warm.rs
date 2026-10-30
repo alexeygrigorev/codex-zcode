@@ -55,6 +55,7 @@ use crate::client::ZCODE_STDERR_TAIL_CAP;
 use crate::client::ZcodeRuntime;
 use crate::client::zcode_failure_message;
 use crate::client::zcode_stderr_tail;
+use crate::client_common::ZcodeInnerMode;
 use crate::zcode_process;
 use crate::zcode_warm_events::bridge_tool_activity_from_notification;
 use crate::zcode_warm_permissions::PermissionRequest;
@@ -62,12 +63,17 @@ use crate::zcode_warm_permissions::PermissionRequestLog;
 use crate::zcode_warm_permissions::WarmPermissionPolicy;
 use crate::zcode_warm_resume;
 
+#[path = "zcode_warm_model.rs"]
+mod model;
+#[path = "zcode_warm_output.rs"]
+mod output;
+
 /// Env var enabling the warm bridge (`ZCODE_WARM=1`).
 const WARM_BRIDGE_ENV_VAR: &str = "ZCODE_WARM";
 
 /// Env var selecting the warm session mode (`ZCODE_WARM_MODE`): `yolo` (the
-/// default, ungated core-side execution) or `build` (the core asks before
-/// risky actions; the bridge denies).
+/// default when the turn allows it) or `build` (the core asks before risky
+/// actions). This override can strengthen, but never weaken, the turn policy.
 const WARM_MODE_ENV_VAR: &str = "ZCODE_WARM_MODE";
 
 /// How the warm session balances gating against tool access.
@@ -75,8 +81,7 @@ const WARM_MODE_ENV_VAR: &str = "ZCODE_WARM_MODE";
 /// `Yolo` is today's behavior: the core executes everything itself and
 /// permission callbacks never fire. `Build` creates the session in `build`
 /// mode so the core requests permission through `interaction/*` callbacks;
-/// the bridge answers every request with a denial and logs it, since there
-/// is no interactive approver on the Codex side of the wire.
+/// the bridge applies its configured permission policy and logs the answer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum WarmMode {
     Yolo,
@@ -93,18 +98,18 @@ impl WarmMode {
     }
 }
 
-/// Resolves [`WarmMode`] from the `ZCODE_WARM_MODE` value; unknown values
-/// stay on the default ungated mode.
-pub(crate) fn warm_mode_from_value(value: Option<&str>) -> WarmMode {
-    match value.map(str::trim) {
-        Some("build") => WarmMode::Build,
-        _ => WarmMode::Yolo,
+/// Resolves the warm mode without allowing an environment override to
+/// weaken the approval policy selected for this turn.
+pub(crate) fn warm_mode_from_value(value: Option<&str>, inner_mode: ZcodeInnerMode) -> WarmMode {
+    match (inner_mode, value.map(str::trim)) {
+        (ZcodeInnerMode::Build, _) | (ZcodeInnerMode::Yolo, Some("build")) => WarmMode::Build,
+        (ZcodeInnerMode::Yolo, _) => WarmMode::Yolo,
     }
 }
 
 /// [`warm_mode_from_value`] against the process environment.
-pub(crate) fn warm_mode_from_env() -> WarmMode {
-    warm_mode_from_value(std::env::var(WARM_MODE_ENV_VAR).ok().as_deref())
+pub(crate) fn warm_mode_from_env(inner_mode: ZcodeInnerMode) -> WarmMode {
+    warm_mode_from_value(std::env::var(WARM_MODE_ENV_VAR).ok().as_deref(), inner_mode)
 }
 
 /// Consecutive startup/protocol failures tolerated before the warm bridge is
@@ -233,11 +238,19 @@ pub(crate) struct ZcodeWarmBridge {
     /// Frames for the child's stdin. A dedicated writer task owns the pipe
     /// and is the only place that awaits on writes, so no mutex guard is
     /// ever held across an await point (workspace clippy denies that).
-    stdin: mpsc::UnboundedSender<String>,
-    child: StdMutex<Child>,
+    stdin: mpsc::UnboundedSender<Option<String>>,
+    child: StdMutex<Option<Child>>,
+    /// Cache the result so concurrent or repeated retirement cannot signal a
+    /// process group after ownership has ended and its numeric id is reused.
+    retirement: tokio::sync::OnceCell<Result<(), String>>,
+    pub(crate) turn_lock: Arc<tokio::sync::Mutex<()>>,
+    model_catalog: StdMutex<Vec<serde_json::Value>>,
     /// Saved at spawn: the child leads its own process group, so this id
     /// stays valid for group kills even after the direct child exits.
+    #[cfg(unix)]
     process_group_pid: u32,
+    #[cfg(windows)]
+    job: codex_utils_pty::JobObject,
     stderr_tail: Arc<StdMutex<Vec<u8>>>,
     /// Fan-out of `session/event` notification params to turn collectors.
     events: broadcast::Sender<serde_json::Value>,
@@ -297,8 +310,14 @@ impl ZcodeWarmBridge {
         // Own process group so teardown reaches shells the core spawned.
         #[cfg(unix)]
         command.process_group(0);
+        #[cfg(windows)]
+        let job = codex_utils_pty::JobObject::create_without_breakaway()?;
+        #[cfg(windows)]
+        let mut child = job.spawn_contained(&mut command)?;
+        #[cfg(not(windows))]
         let mut child = command.spawn()?;
 
+        #[cfg(unix)]
         let process_group_pid = child.id().ok_or_else(|| {
             io::Error::other("warm ZCode app-server has no process id after spawn")
         })?;
@@ -338,12 +357,12 @@ impl ZcodeWarmBridge {
 
         let (events, _) = broadcast::channel(4096);
         let dead = Arc::new(AtomicBool::new(false));
-        let (stdin_tx, mut stdin_rx) = mpsc::unbounded_channel::<String>();
+        let (stdin_tx, mut stdin_rx) = mpsc::unbounded_channel::<Option<String>>();
         // The writer task owns the child's stdin for its whole lifetime;
         // losing the pipe only surfaces to senders on the next frame.
         tokio::spawn(async move {
             let mut stdin = stdin;
-            while let Some(line) = stdin_rx.recv().await {
+            while let Some(Some(line)) = stdin_rx.recv().await {
                 let write_error = match stdin.write_all(line.as_bytes()).await {
                     Err(e) => Some(e),
                     Ok(()) => stdin.flush().await.err(),
@@ -357,8 +376,14 @@ impl ZcodeWarmBridge {
         let bridge = Arc::new(Self {
             state: StdMutex::new(WarmState::default()),
             stdin: stdin_tx,
-            child: StdMutex::new(child),
+            child: StdMutex::new(Some(child)),
+            retirement: tokio::sync::OnceCell::new(),
+            turn_lock: Arc::new(tokio::sync::Mutex::new(())),
+            model_catalog: StdMutex::new(Vec::new()),
+            #[cfg(unix)]
             process_group_pid,
+            #[cfg(windows)]
+            job,
             stderr_tail,
             events,
             session_id: tokio::sync::OnceCell::new(),
@@ -467,17 +492,128 @@ impl ZcodeWarmBridge {
     /// Used instead of waiting for `Drop` when a turn must give up on the
     /// child while the bridge handle may still be cached by the thread.
     pub(crate) fn kill(&self, reason: &str) {
-        if self.dead.swap(true, Ordering::Relaxed) {
-            return;
+        if !self.dead.swap(true, Ordering::Relaxed) {
+            warn!("ZCode warm app-server killed: {reason}");
+            self.fail_pending(reason);
+            self.fail_collectors(reason);
         }
-        warn!("ZCode warm app-server killed: {reason}");
-        self.fail_pending(reason);
-        self.fail_collectors(reason);
-        if let Ok(mut child) = self.child.lock() {
+        // EOF can mark the reader dead while the process is still alive.
+        let mut child = self
+            .child
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(child) = child.as_mut() {
+            // Ownership and signaling share the lock with final retirement.
+            // Releasing it first could signal a group that has been reaped.
+            #[cfg(unix)]
+            codex_utils_pty::process_group::kill_process_group(self.process_group_pid)
+                .unwrap_or_else(|error| warn!("ZCode process group kill failed: {error}"));
+            #[cfg(windows)]
+            self.job
+                .terminate()
+                .unwrap_or_else(|error| warn!("ZCode process job termination failed: {error}"));
             let _ = child.start_kill();
         }
-        codex_utils_pty::process_group::kill_process_group_by_pid(self.process_group_pid)
-            .unwrap_or_else(|e| warn!("ZCode warm process group kill failed: {e}"));
+    }
+
+    /// Closes this session and reaps the process before its checkout is released.
+    /// A forced teardown is cleanup, never a successful natural retirement.
+    pub(crate) async fn retire(&self) -> Result<(), String> {
+        self.retirement
+            .get_or_init(|| async {
+                let grace = self.request_timeout;
+                let close = if let Some(session_id) = self.session_id.get() {
+                    tokio::time::timeout(
+                        grace,
+                        self.request(
+                            "session/close",
+                            serde_json::json!({ "sessionId": session_id }),
+                        ),
+                    )
+                    .await
+                    .map_err(|_| "session close timed out".to_string())
+                    .and_then(|result| result.map_err(|error| error.to_string()))
+                    .and_then(|result| {
+                        if result.get("closed").and_then(serde_json::Value::as_bool) != Some(true) {
+                            Err("session close was refused".to_string())
+                        } else {
+                            Ok(())
+                        }
+                    })
+                } else {
+                    Ok(())
+                };
+                let _ = self.stdin.send(None);
+                let deadline = tokio::time::Instant::now() + grace;
+                let mut failure = None;
+                let (exit, cleanup) = loop {
+                    let status = {
+                        let mut child = self
+                            .child
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        match child.as_mut() {
+                            Some(process) => match process.try_wait() {
+                                Ok(Some(status)) => {
+                                    // Keep final group cleanup and child consumption
+                                    // under the same lock as every forced signal.
+                                    #[cfg(unix)]
+                                    let cleanup =
+                                        codex_utils_pty::process_group::kill_process_group(
+                                            self.process_group_pid,
+                                        );
+                                    #[cfg(windows)]
+                                    let cleanup = self.job.terminate();
+                                    #[cfg(not(any(unix, windows)))]
+                                    let cleanup = Ok::<(), io::Error>(());
+                                    drop(child.take());
+                                    let exit = if let Some(error) = failure {
+                                        Err(error)
+                                    } else if status.success() {
+                                        Ok(())
+                                    } else {
+                                        Err(format!("ZCode process exited with {status}"))
+                                    };
+                                    break (exit, cleanup);
+                                }
+                                Ok(None) => Ok(()),
+                                Err(error) => Err(error),
+                            },
+                            None => break (Ok(()), Ok(())),
+                        }
+                    };
+                    match status {
+                        Ok(()) => {}
+                        Err(error) => {
+                            failure.get_or_insert_with(|| {
+                                format!("could not reap ZCode process: {error}")
+                            });
+                            self.kill("child retirement failed");
+                        }
+                    }
+                    if failure.is_none() && tokio::time::Instant::now() >= deadline {
+                        failure = Some("ZCode process required forced retirement".to_string());
+                        self.kill("natural retirement timed out");
+                    }
+                    // Keep the child in the bridge across awaits so cancellation's
+                    // retained-permit guard can synchronously kill and reap it.
+                    tokio::time::sleep(Duration::from_millis(/*millis*/ 10)).await;
+                };
+                self.dead.store(true, Ordering::Relaxed);
+                close.and(exit).and(
+                    cleanup.map_err(|error| format!("could not retire ZCode descendants: {error}")),
+                )
+            })
+            .await
+            .clone()
+    }
+
+    /// Transfers child ownership to an awaited or blocking retirement path.
+    pub(crate) fn take_child_for_retirement(&self) -> Option<Child> {
+        self.child
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
     }
 
     fn fail_pending(&self, reason: &str) {
@@ -607,7 +743,7 @@ impl ZcodeWarmBridge {
                     },
                 })
             }
-            "interaction/requestPermission" if self.mode == WarmMode::Build => {
+            "interaction/requestPermission" => {
                 let request = PermissionRequest::from_params(params);
                 let answer = self.permission_policy.resolve(&request);
                 // The core re-sends a pending interaction every second with a
@@ -644,7 +780,7 @@ impl ZcodeWarmBridge {
                     },
                 })
             }
-            "interaction/requestUserInput" if self.mode == WarmMode::Build => {
+            "interaction/requestUserInput" => {
                 let prompt = params
                     .get("prompt")
                     .and_then(serde_json::Value::as_str)
@@ -686,7 +822,7 @@ impl ZcodeWarmBridge {
             line.push('\n');
         }
         self.stdin
-            .send(line)
+            .send(Some(line))
             .map_err(|_| io::Error::other("ZCode warm app-server stdin is closed"))
     }
 
@@ -738,6 +874,23 @@ impl ZcodeWarmBridge {
                 self.kill(&format!("{method} timed out"));
                 Err(ProtocolRequestError::plain(format!("{method} timed out")))
             }
+        }
+    }
+
+    /// Pins hard tool constraints during creation and cold resume. These
+    /// requests never strip constraints after a schema rejection.
+    pub(crate) async fn request_session(
+        &self,
+        method: &str,
+        mut params: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        if self.permission_policy == WarmPermissionPolicy::NoTools {
+            params["toolAllowlist"] = serde_json::json!([]);
+            self.request(method, params)
+                .await
+                .map_err(|error| error.to_string())
+        } else {
+            self.request_with_compat_retry(method, params).await
         }
     }
 
@@ -795,6 +948,26 @@ impl ZcodeWarmBridge {
             .cloned()
     }
 
+    /// Reasserts this turn's policy after session creation, resume, or reuse.
+    /// A failed acknowledgement must prevent submission of the turn.
+    pub(crate) async fn prepare_session(
+        &self,
+        workspace_path: &str,
+        mode: WarmMode,
+    ) -> Result<String, String> {
+        let session_id = self.ensure_session(workspace_path).await?;
+        self.request(
+            "session/setMode",
+            serde_json::json!({
+                "sessionId": session_id,
+                "mode": mode.wire_session_mode(),
+            }),
+        )
+        .await
+        .map_err(|error| format!("could not enforce warm session permission mode: {error}"))?;
+        Ok(session_id)
+    }
+
     /// Sends one user turn and returns the mapped Codex event stream.
     ///
     /// The input goes out on `channel` (legacy `session/send` or the
@@ -828,41 +1001,52 @@ impl ZcodeWarmBridge {
             )
             .await;
             if let Err(message) = sent {
+                // A missing or malformed acknowledgement may follow real
+                // execution. Stop our executor before reporting the failure.
+                send_bridge.kill("turn input outcome is uncertain");
+                let _ = send_bridge.retire().await;
                 let _ = tx.send(Err(ApiError::Stream(message))).await;
                 return;
             }
 
             let mut reply = String::new();
             let mut started_output = false;
+            let mut saw_text = false;
             let mut tool_names = HashMap::new();
             loop {
-                let notification =
-                    match tokio::time::timeout(collector_timeout, events.recv()).await {
-                        Ok(Ok(params)) => params,
-                        Ok(Err(broadcast::error::RecvError::Lagged(_skipped))) => continue,
-                        Ok(Err(broadcast::error::RecvError::Closed)) => {
-                            let _ = tx
-                                .send(Err(ApiError::Stream(
-                                    "ZCode warm app-server event stream closed".to_string(),
-                                )))
-                                .await;
-                            return;
+                let received = tokio::select! {
+                    _ = tx.closed() => {
+                        stop_turn(&collector_bridge, &collector_session).await;
+                        return;
+                    }
+                    received = tokio::time::timeout(collector_timeout, events.recv()) => received,
+                };
+                let notification = match received {
+                    Ok(Ok(params)) => params,
+                    Ok(Err(broadcast::error::RecvError::Lagged(_skipped))) => continue,
+                    Ok(Err(broadcast::error::RecvError::Closed)) => {
+                        let _ = tx
+                            .send(Err(ApiError::Stream(
+                                "ZCode warm app-server event stream closed".to_string(),
+                            )))
+                            .await;
+                        return;
+                    }
+                    Err(_elapsed) => {
+                        if let Some(bridge) = collector_bridge.upgrade() {
+                            bridge.register_failure();
+                            bridge.kill("turn events stalled");
                         }
-                        Err(_elapsed) => {
-                            if let Some(bridge) = collector_bridge.upgrade() {
-                                bridge.register_failure();
-                                bridge.kill("turn events stalled");
-                            }
-                            let _ = tx
-                                .send(Err(ApiError::Stream(
-                                    "ZCode warm turn stalled: no session events before the idle \
+                        let _ = tx
+                            .send(Err(ApiError::Stream(
+                                "ZCode warm turn stalled: no session events before the idle \
                                  window elapsed"
-                                        .to_string(),
-                                )))
-                                .await;
-                            return;
-                        }
-                    };
+                                    .to_string(),
+                            )))
+                            .await;
+                        return;
+                    }
+                };
                 if notification
                     .get("sessionId")
                     .and_then(serde_json::Value::as_str)
@@ -870,7 +1054,41 @@ impl ZcodeWarmBridge {
                 {
                     continue;
                 }
-                match notification.get("type").and_then(serde_json::Value::as_str) {
+                let notification_type =
+                    notification.get("type").and_then(serde_json::Value::as_str);
+                let tool_boundary = notification_type == Some("tool_call_scheduled")
+                    || (notification_type == Some("model.streaming")
+                        && matches!(
+                            notification
+                                .pointer("/payload/kind")
+                                .and_then(serde_json::Value::as_str),
+                            Some("tool_input_start" | "tool_call")
+                        ));
+                // Preserve the cold adapter's message boundaries. Combining
+                // all inner model steps would create an oversized history item.
+                if tool_boundary && started_output {
+                    let item = ResponseItem::Message {
+                        id: None,
+                        role: "assistant".to_string(),
+                        content: vec![codex_protocol::models::ContentItem::OutputText {
+                            text: std::mem::take(&mut reply),
+                        }],
+                        // Commentary would let mailbox input preempt a still
+                        // executing inner turn and start another executor.
+                        phase: None,
+                        internal_chat_message_metadata_passthrough: None,
+                    };
+                    if tx
+                        .send(Ok(ResponseEvent::OutputItemDone(item)))
+                        .await
+                        .is_err()
+                    {
+                        stop_turn(&collector_bridge, &collector_session).await;
+                        return;
+                    }
+                    started_output = false;
+                }
+                match notification_type {
                     Some("model.streaming") => {
                         let payload = notification.get("payload");
                         let kind = payload
@@ -882,6 +1100,14 @@ impl ZcodeWarmBridge {
                             .and_then(serde_json::Value::as_str)
                             .unwrap_or_default();
                         if kind == "text_delta" && !delta.is_empty() {
+                            if let Err(error) =
+                                output::check_message_bytes(reply.len().saturating_add(delta.len()))
+                            {
+                                stop_turn(&collector_bridge, &collector_session).await;
+                                let _ = tx.send(Err(error)).await;
+                                return;
+                            }
+                            saw_text = true;
                             if !started_output {
                                 started_output = true;
                                 let item = assistant_message(String::new());
@@ -937,7 +1163,7 @@ impl ZcodeWarmBridge {
                             .unwrap_or("success");
                         // Prefer the streamed text; fall back to the final
                         // response for turns whose deltas never arrived.
-                        let response = if reply.is_empty() {
+                        let response = if !saw_text {
                             payload
                                 .get("response")
                                 .and_then(serde_json::Value::as_str)
@@ -946,15 +1172,24 @@ impl ZcodeWarmBridge {
                         } else {
                             std::mem::take(&mut reply)
                         };
-                        if !response.is_empty()
-                            && tx
-                                .send(Ok(codex_api::ResponseEvent::OutputItemDone(
-                                    assistant_message(response),
-                                )))
+                        if let Err(error) = output::check_message_bytes(response.len()) {
+                            let _ = tx.send(Err(error)).await;
+                            return;
+                        }
+                        if !response.is_empty() {
+                            let mut item = assistant_message(response);
+                            if let ResponseItem::Message { phase, .. } = &mut item {
+                                // Cold goal markers are eligible only here,
+                                // after the inner turn has completed.
+                                *phase = Some(codex_protocol::models::MessagePhase::FinalAnswer);
+                            }
+                            if tx
+                                .send(Ok(codex_api::ResponseEvent::OutputItemDone(item)))
                                 .await
                                 .is_err()
-                        {
-                            return;
+                            {
+                                return;
+                            }
                         }
                         match zcode_completed_turn_error(result_type) {
                             Some(err) => {
@@ -998,14 +1233,7 @@ pub(crate) fn assistant_message(text: String) -> ResponseItem {
 
 impl Drop for ZcodeWarmBridge {
     fn drop(&mut self) {
-        if self.dead.swap(true, Ordering::Relaxed) {
-            return;
-        }
-        if let Ok(mut child) = self.child.lock() {
-            let _ = child.start_kill();
-        }
-        codex_utils_pty::process_group::kill_process_group_by_pid(self.process_group_pid)
-            .unwrap_or_else(|e| warn!("ZCode warm process group kill failed on drop: {e}"));
+        self.kill("bridge dropped");
     }
 }
 
