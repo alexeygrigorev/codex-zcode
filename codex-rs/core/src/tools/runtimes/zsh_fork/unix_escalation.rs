@@ -10,6 +10,7 @@ use crate::tools::runtimes::exec_env_for_sandbox_permissions;
 use crate::tools::sandboxing::SandboxAttempt;
 use crate::tools::sandboxing::ToolCtx;
 use crate::tools::sandboxing::ToolError;
+use crate::tools::sandboxing::sandbox_permissions_preserving_denied_reads;
 use crate::tools::sandboxing::unsandboxed_execution_allowed;
 use codex_execpolicy::Decision;
 use codex_execpolicy::Evaluation;
@@ -155,8 +156,13 @@ pub(crate) async fn prepare_unified_exec_zsh_fork(
         approval_policy: ctx.step_context.settings.approval_policy(),
         permission_profile: exec_request.permission_profile.clone(),
         sandbox_permissions: req.sandbox_permissions,
+        // Denied reads keep an approved escalation sandboxed, so intercepted
+        // execs are evaluated as the sandboxed commands they actually run as.
         approval_sandbox_permissions: approval_sandbox_permissions(
-            req.sandbox_permissions,
+            sandbox_permissions_preserving_denied_reads(
+                req.sandbox_permissions,
+                &exec_request.permission_profile.file_system_sandbox_policy(),
+            ),
             req.additional_permissions_preapproved,
         ),
         prompt_permissions: req.additional_permissions.clone(),
