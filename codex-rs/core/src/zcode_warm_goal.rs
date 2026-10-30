@@ -287,7 +287,9 @@ pub(crate) async fn turn_mirrored(
                         }
                     }
                 }
-                Some("tool_call_scheduled" | "tool_call_result" | "tool_call_error") => {
+                Some(
+                    "tool.updated" | "tool_call_scheduled" | "tool_call_result" | "tool_call_error",
+                ) => {
                     if let Some(activity) =
                         bridge_tool_activity_from_notification(&notification, &mut tool_names)
                         && tx

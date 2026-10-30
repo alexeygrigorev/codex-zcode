@@ -189,14 +189,14 @@ require("readline").createInterface({ input: process.stdin }).on("line", (line) 
         return;
       }
       if (%DISCONNECT%) process.exit(0);
-      if (%TEXT_SEGMENTS%) emit({ method: "session/event", params: { sessionId,
+      if (%TEXT_SEGMENTS% && fs.readFileSync(%EFFECT%, "utf8") === "inner\n") emit({ method: "session/event", params: { sessionId,
         type: "model.streaming", payload: { kind: "tool_input_start" } } });
       permission("Write");
     } else {
       fs.writeFileSync(%EFFECT% + ".written", "written by inner Write");
       for (const toolName of ["Bash", "Write"]) {
-        emit({ method: "session/event", params: { sessionId, type: "tool_call_scheduled",
-          payload: { toolCallId: "tool-" + toolName, toolName,
+        emit({ method: "session/event", params: { sessionId, type: "tool.updated",
+          payload: { kind: "scheduled", toolCallId: "tool-" + toolName, toolName,
             input: { command: "echo outer >> " + %EFFECT%, file_path: %EFFECT%, content: "outer" } } } });
       }
       if (%TEXT_SEGMENTS% && fs.readFileSync(%EFFECT%, "utf8") === "inner\n") emit({ method: "session/event", params: { sessionId,
@@ -515,10 +515,14 @@ process.stdin.on("end", () => record("eof:" + process.pid));
             start_probe_turn(&test, message, approval, profile.clone()).await;
             let mut errors = Vec::new();
             let mut replies = Vec::new();
+            let mut activities = Vec::new();
             wait_for_event(&test.codex, |event| {
                 match event {
                     EventMsg::Error(error) => errors.push(error.message.clone()),
                     EventMsg::AgentMessage(message) => replies.push(message.message.clone()),
+                    EventMsg::BridgeToolActivity(activity) => {
+                        activities.push((activity.tool.clone(), activity.status))
+                    }
                     _ => {}
                 }
                 matches!(event, EventMsg::TurnComplete(_))
@@ -534,6 +538,19 @@ process.stdin.on("end", () => record("eof:" + process.pid));
                         vec!["actual client allowed Bash and Write".to_string()]
                     }
                 )
+            );
+            assert_eq!(
+                activities,
+                vec![
+                    (
+                        "Bash".to_string(),
+                        codex_protocol::protocol::BridgeToolActivityStatus::Started
+                    ),
+                    (
+                        "Write".to_string(),
+                        codex_protocol::protocol::BridgeToolActivityStatus::Started
+                    ),
+                ]
             );
         } else {
             test.submit_turn_with_approval_and_permission_profile(

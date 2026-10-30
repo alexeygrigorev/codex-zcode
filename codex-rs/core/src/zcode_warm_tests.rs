@@ -345,6 +345,7 @@ function handle(msg) {
         respond({ response: "Goal active", snapshot: {}, startedTurn: true });
         break;
       }
+      if (TOOL_EVENTS) emit({ sessionId: msg.params.sessionId, type: "tool.updated", payload: { kind: "scheduled", toolCallId: "goal_read", toolName: "Read", input: { file: "/x" } } });
       emit({ sessionId: msg.params.sessionId, type: "model.streaming", payload: { kind: "text_delta", delta: "go" } });
       emit({ sessionId: msg.params.sessionId, type: "model.streaming", payload: { kind: "text_delta", delta: "al" } });
       emit({ sessionId: msg.params.sessionId, type: "turn.completed", payload: { response: "goal work done", usage: { inputTokens: 7, outputTokens: 3, totalTokens: 10 }, resultType: "success" } });
@@ -368,10 +369,11 @@ function runTurn(sessionId, content) {
     return;
   }
   if (TOOL_EVENTS) {
-    emit({ sessionId: sessionId, type: "tool_call_scheduled", payload: { toolCallId: "tc_1", toolName: "Bash", input: { command: "ls /tmp" } } });
-    emit({ sessionId: sessionId, type: "tool_call_scheduled", payload: { toolCallId: "tc_2", toolName: "Read", input: { file: "/x" } } });
-    emit({ sessionId: sessionId, type: "tool_call_result", payload: { toolCallId: "tc_1", result: { success: true, content: "out" }, duration: 3 } });
-    emit({ sessionId: sessionId, type: "tool_call_error", payload: { toolCallId: "tc_2", error: { type: "ToolError", message: "boom" } } });
+    emit({ sessionId: sessionId, type: "tool.updated", payload: { kind: "scheduled", toolCallId: "tc_1", toolName: "Bash", input: { command: "ls /tmp" } } });
+    emit({ sessionId: sessionId, type: "tool.updated", payload: { kind: "started", toolCallId: "tc_1", toolName: "Bash", startedAt: 1 } });
+    emit({ sessionId: sessionId, type: "tool.updated", payload: { kind: "scheduled", toolCallId: "tc_2", toolName: "Read", input: { file: "/x" } } });
+    emit({ sessionId: sessionId, type: "tool.updated", payload: { kind: "result", toolCallId: "tc_1", result: { success: true, content: "out" }, duration: 3 } });
+    emit({ sessionId: sessionId, type: "tool.updated", payload: { kind: "error", toolCallId: "tc_2", error: { type: "ToolError", message: "boom" } } });
   }
   if (!content.includes("nodelta")) {
     emit({ sessionId: sessionId, type: "model.streaming", payload: { kind: "text_delta", delta: content.slice(0, 2) } });

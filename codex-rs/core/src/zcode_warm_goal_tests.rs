@@ -255,10 +255,23 @@ async fn mirrored_goal_rejects_oversized_output_without_completed_items() {
 async fn mirrored_goal_turn_sets_the_goal_and_reports_verified_completion() {
     let fixture = write_fake_server_with(FakeServerOptions {
         goal_loop: GoalLoopMode::Complete,
+        emits_tool_events: true,
         ..FakeServerOptions::default()
     });
     let (mut rx, bridge) = mirrored_turn(&fixture, "Write the epic poem").await;
 
+    match next_event(&mut rx).await {
+        ResponseEvent::BridgeToolActivity(activity) => assert_eq!(
+            activity,
+            codex_protocol::protocol::BridgeToolActivityEvent {
+                call_id: "goal_read".to_string(),
+                tool: "Read".to_string(),
+                status: codex_protocol::protocol::BridgeToolActivityStatus::Started,
+                detail: Some(r#"{"file":"/x"}"#.to_string()),
+            },
+        ),
+        other => panic!("expected native tool activity, got {other:?}"),
+    }
     match next_event(&mut rx).await {
         ResponseEvent::OutputItemAdded(item) => assert_eq!(item, assistant_message(String::new())),
         other => panic!("expected OutputItemAdded, got {other:?}"),

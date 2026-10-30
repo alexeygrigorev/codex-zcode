@@ -1057,6 +1057,11 @@ impl ZcodeWarmBridge {
                 let notification_type =
                     notification.get("type").and_then(serde_json::Value::as_str);
                 let tool_boundary = notification_type == Some("tool_call_scheduled")
+                    || (notification_type == Some("tool.updated")
+                        && notification
+                            .pointer("/payload/kind")
+                            .and_then(serde_json::Value::as_str)
+                            == Some("scheduled"))
                     || (notification_type == Some("model.streaming")
                         && matches!(
                             notification
@@ -1133,7 +1138,12 @@ impl ZcodeWarmBridge {
                             }
                         }
                     }
-                    Some("tool_call_scheduled" | "tool_call_result" | "tool_call_error") => {
+                    Some(
+                        "tool.updated"
+                        | "tool_call_scheduled"
+                        | "tool_call_result"
+                        | "tool_call_error",
+                    ) => {
                         // Display-only tool activity from the core's own
                         // agent loop (issue #38): surfaced as an event, never
                         // as a ResponseItem the ToolCallRuntime would run.

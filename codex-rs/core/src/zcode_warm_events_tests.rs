@@ -25,6 +25,37 @@ fn activity(
 }
 
 #[test]
+fn native_tool_updated_matches_legacy_activity_sequence() {
+    let mut native_names = HashMap::new();
+    let mut legacy_names = HashMap::new();
+    for (kind, payload) in [
+        (
+            "scheduled",
+            serde_json::json!({"toolCallId": "tc_1", "toolName": "Bash", "input": {"command": "pwd"}}),
+        ),
+        (
+            "result",
+            serde_json::json!({"toolCallId": "tc_1", "result": {"success": true, "content": "workspace"}}),
+        ),
+        (
+            "error",
+            serde_json::json!({"toolCallId": "tc_2", "toolName": "Write", "error": {"message": "write failed"}}),
+        ),
+    ] {
+        let legacy = serde_json::json!({"type": format!("tool_call_{kind}"), "payload": payload});
+        let mut native = serde_json::json!({"type": "tool.updated", "payload": payload});
+        native["payload"]["kind"] = serde_json::json!(kind);
+        let expected = bridge_tool_activity_from_notification(&legacy, &mut legacy_names)
+            .expect("legacy tool activity");
+        assert_eq!(
+            bridge_tool_activity_from_notification(&native, &mut native_names),
+            Some(expected),
+        );
+    }
+    assert_eq!(native_names, legacy_names);
+}
+
+#[test]
 fn scheduled_maps_to_started_with_input_detail() {
     let mut tool_names = HashMap::new();
     assert_eq!(
