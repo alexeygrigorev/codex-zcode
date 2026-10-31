@@ -405,8 +405,24 @@ async fn repo_ancestry_without_project_marker_does_not_walk_parents() {
     let cwd = outer.join("nested/inner");
     fs::create_dir_all(outer.join(".agents/skills")).expect("create outer skills");
     fs::create_dir_all(cwd.join(".agents/skills")).expect("create cwd skills");
+    // A marker no ancestor can have keeps the result independent of stray
+    // `.git` entries above the temp directory on the host.
+    let mut config = toml::map::Map::new();
+    config.insert(
+        "project_root_markers".to_string(),
+        toml::Value::Array(vec![toml::Value::String(
+            ".codex-skills-test-project-root".to_string(),
+        )]),
+    );
+    let user = ConfigLayerEntry::new(
+        ConfigLayerSource::User {
+            file: absolute(temp_dir.path().join("config.toml")),
+            profile: None,
+        },
+        toml::Value::Table(config),
+    );
 
-    let roots = repo_agents_skill_roots(Some(Arc::clone(&LOCAL_FS)), &stack(Vec::new()), &cwd)
+    let roots = repo_agents_skill_roots(Some(Arc::clone(&LOCAL_FS)), &stack(vec![user]), &cwd)
         .await
         .into_iter()
         .map(|root| root.path)
