@@ -558,11 +558,10 @@ async fn unified_exec_zsh_fork_guardian_reviews_persistent_terminal_in_current_t
 
     let next_cwd = test.config.cwd.join("next-turn");
     fs::create_dir(&next_cwd)?;
-    let next_denied_path = next_cwd.join("next-environment-private");
-    let (sandbox_policy, permission_profile) = turn_permission_fields(
-        denied_read_permission_profile(next_denied_path.as_path())?,
-        next_cwd.as_path(),
-    );
+    // The next turn moves the environment without adding denied reads: input
+    // to a terminal that cannot enforce new denied reads is rejected outright.
+    let (sandbox_policy, permission_profile) =
+        turn_permission_fields(restrictive_workspace_write_profile(), next_cwd.as_path());
     test.codex
         .start_or_steer_turn(
             TurnInputRequest::user_input(vec![UserInput::Text {
@@ -653,7 +652,6 @@ async fn unified_exec_zsh_fork_guardian_reviews_persistent_terminal_in_current_t
         .map(|(permissions, _)| permissions)
         .context("intercepted command's Guardian permissions")?;
     assert!(permissions.contains(initial_denied_path.to_string_lossy().as_ref()));
-    assert!(!permissions.contains(next_denied_path.to_string_lossy().as_ref()));
 
     Ok(())
 }
