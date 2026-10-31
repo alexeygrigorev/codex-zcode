@@ -8,11 +8,13 @@ use app_test_support::create_final_assistant_message_sse_response;
 use app_test_support::create_mock_responses_server_sequence;
 use app_test_support::create_mock_responses_server_sequence_unchecked;
 use codex_app_server_protocol::ClientRequest;
+use codex_app_server_protocol::ItemStartedNotification;
 use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::ServerRequestResolvedNotification;
+use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::TurnCompletedNotification;
@@ -402,6 +404,18 @@ async fn turn_interrupt_with_pending_steer_aborts_and_thread_stays_usable() -> R
         DEFAULT_READ_TIMEOUT,
         mcp.read_stream_until_notification_message("turn/started"),
     )
+    .await??;
+
+    // Steer only once the sleep command is in flight: interrupting before the
+    // turn consumes its mocked response would hand that response to the next turn.
+    timeout(DEFAULT_READ_TIMEOUT, async {
+        loop {
+            let started: ItemStartedNotification = mcp.read_notification("item/started").await?;
+            if matches!(started.item, ThreadItem::CommandExecution { .. }) {
+                return anyhow::Ok(());
+            }
+        }
+    })
     .await??;
 
     // Accept a steer while the long tool call is still in flight; it sits in

@@ -721,6 +721,18 @@ async fn turn_steer_and_interrupt_work_on_resumed_thread() -> Result<()> {
     )
     .await??;
 
+    // Steer only once the sleep command is in flight: interrupting before the
+    // turn consumes its mocked response would hand that response to the next turn.
+    timeout(DEFAULT_READ_TIMEOUT, async {
+        loop {
+            let started: ItemStartedNotification = mcp.read_notification("item/started").await?;
+            if matches!(started.item, ThreadItem::CommandExecution { .. }) {
+                return anyhow::Ok(());
+            }
+        }
+    })
+    .await??;
+
     let steer: TurnSteerResponse = mcp
         .request(|request_id| ClientRequest::TurnSteer {
             request_id,
