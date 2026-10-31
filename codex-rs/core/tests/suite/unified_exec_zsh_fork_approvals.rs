@@ -6,12 +6,15 @@ use codex_config::types::ApprovalsReviewer;
 use codex_core::TurnInputRequest;
 use codex_core::config::Config;
 use codex_core::sandboxing::SandboxPermissions;
+use codex_core::windows_sandbox::WindowsSandboxLevelExt;
 use codex_extension_api::ExtensionRegistryBuilder;
 use codex_features::Feature;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Settings;
+use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::PermissionProfile;
+use codex_protocol::models::PermissionProfileSnapshot;
 use codex_protocol::permissions::FileSystemAccessMode;
 use codex_protocol::permissions::FileSystemPath;
 use codex_protocol::permissions::FileSystemSandboxEntry;
@@ -19,6 +22,8 @@ use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::permissions::FileSystemSpecialPath;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::EnvironmentConfig;
+use codex_protocol::protocol::EnvironmentConfigState;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ExecApprovalRequestEvent;
 use codex_protocol::protocol::GuardianAssessmentAction;
@@ -563,6 +568,27 @@ async fn unified_exec_zsh_fork_guardian_reviews_persistent_terminal_in_current_t
         denied_read_permission_profile(next_denied_path.as_path())?,
         next_cwd.as_path(),
     );
+    // Input to a terminal whose environment now has denied reads it cannot
+    // enforce is rejected outright. The owner supplies the moved environment's
+    // configuration, so the thread's denied reads do not carry over into it.
+    let mut next_environments = local_selections(next_cwd);
+    let next_local = next_environments
+        .environments
+        .first_mut()
+        .context("local environment selection")?;
+    next_local.config = EnvironmentConfigState::Ready(EnvironmentConfig {
+        allow_login_shell: test.config.permissions.allow_login_shell,
+        workspace_roots: next_local.workspace_roots.clone(),
+        permission_profile: PermissionProfileSnapshot::legacy(restrictive_workspace_write_profile()),
+        shell_environment_policy: Default::default(),
+        windows_sandbox_level: WindowsSandboxLevel::from_config(&test.config),
+        windows_sandbox_type: test.config.permissions.windows_sandbox_type,
+        use_legacy_landlock: test.config.features.use_legacy_landlock(),
+        exec_policy: None,
+        mcp_policy: None,
+        network_policy: None,
+        selected_capability_roots: Vec::new(),
+    });
     test.codex
         .start_or_steer_turn(
             TurnInputRequest::user_input(vec![UserInput::Text {
@@ -570,7 +596,7 @@ async fn unified_exec_zsh_fork_guardian_reviews_persistent_terminal_in_current_t
                 text_elements: Vec::new(),
             }])
             .with_thread_settings(ThreadSettingsOverrides {
-                environments: Some(local_selections(next_cwd)),
+                environments: Some(next_environments),
                 approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
                 sandbox_policy: Some(sandbox_policy),
                 permission_profile,
