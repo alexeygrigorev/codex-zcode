@@ -712,6 +712,8 @@ async fn snapshot_discovers_and_redacts_shell_initialized_credentials() -> Resul
                 "https://api.vendor.example/v2".to_string(),
             ),
         ]),
+        // The runner's ambient environment only slows the credential scans.
+        inherit: codex_protocol::config_types::ShellEnvironmentPolicyInherit::Core,
         ..ShellEnvironmentPolicy::default()
     };
     let credential_broker = SnapshotCredentialBroker {
@@ -812,6 +814,8 @@ async fn snapshot_discovers_and_redacts_shell_initialized_credentials() -> Resul
                 EnvironmentVariablePattern::new_case_insensitive("PATH"),
                 EnvironmentVariablePattern::new_case_insensitive("EXCLUDED_PARENT_HOME"),
             ],
+            // The runner's ambient environment only slows the credential scans.
+            inherit: codex_protocol::config_types::ShellEnvironmentPolicyInherit::Core,
             ..ShellEnvironmentPolicy::default()
         },
         allow_login_shell: false,
@@ -1069,6 +1073,8 @@ async fn snapshot_discovers_and_redacts_shell_initialized_credentials() -> Resul
                 credential_key,
             )],
             r#set: HashMap::from([(context_key.to_string(), current_host.to_string())]),
+            // The runner's ambient environment only slows the credential scans.
+            inherit: codex_protocol::config_types::ShellEnvironmentPolicyInherit::Core,
             ..ShellEnvironmentPolicy::default()
         };
         let mut restored_env = create_env_from_vars([], &policy, /*thread_id*/ None);
@@ -1167,6 +1173,8 @@ async fn snapshot_discovers_and_redacts_shell_initialized_credentials() -> Resul
 
     let filtered_policy = ShellEnvironmentPolicy {
         include_only: vec![EnvironmentVariablePattern::new_case_insensitive("GH_HOST")],
+        // The runner's ambient environment only slows the credential scans.
+        inherit: codex_protocol::config_types::ShellEnvironmentPolicyInherit::Core,
         ..ShellEnvironmentPolicy::default()
     };
     let mut filtered_env = HashMap::new();
@@ -1183,6 +1191,8 @@ async fn snapshot_discovers_and_redacts_shell_initialized_credentials() -> Resul
                 EnvironmentVariablePattern::new_case_insensitive("AUTH_HEADER"),
                 EnvironmentVariablePattern::new_case_insensitive("AUTH_BUNDLE"),
             ],
+            // The runner's ambient environment only slows the credential scans.
+            inherit: codex_protocol::config_types::ShellEnvironmentPolicyInherit::Core,
             ..ShellEnvironmentPolicy::default()
         },
         allow_login_shell: false,
@@ -1248,6 +1258,8 @@ async fn snapshot_discovers_and_redacts_shell_initialized_credentials() -> Resul
         network_proxy: network_proxy.clone(),
         shell_environment_policy: ShellEnvironmentPolicy {
             r#set: HashMap::from([("ENV".to_string(), "$PWD/posix-startup.sh".to_string())]),
+            // The runner's ambient environment only slows the credential scans.
+            inherit: codex_protocol::config_types::ShellEnvironmentPolicyInherit::Core,
             ..ShellEnvironmentPolicy::default()
         },
         allow_login_shell: true,
@@ -1307,6 +1319,8 @@ async fn snapshot_discovers_and_redacts_shell_initialized_credentials() -> Resul
         network_proxy: network_proxy.clone(),
         shell_environment_policy: ShellEnvironmentPolicy {
             r#set: HashMap::from([trusted_startup]),
+            // The runner's ambient environment only slows the credential scans.
+            inherit: codex_protocol::config_types::ShellEnvironmentPolicyInherit::Core,
             ..ShellEnvironmentPolicy::default()
         },
         allow_login_shell: false,
