@@ -250,6 +250,13 @@ impl ShellSnapshotCache {
             "{startup}if ! eval \"unset {state_variables}\n{state_expansion}\" >/dev/null; then printf 'failed to restore shell snapshot\\n' >&2; fi\n{}",
             params.argv[2]
         );
+        if shell_type == ShellType::Bash {
+            // Bash still sources ~/.bashrc for `-c` when stdin looks like an
+            // rshd socket, and seccomp's EPERM for getpeername looks like one.
+            prepared
+                .command
+                .insert(shell_start + 1, "--norc".to_string());
+        }
 
         Ok(())
     }
