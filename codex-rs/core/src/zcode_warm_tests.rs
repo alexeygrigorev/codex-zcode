@@ -1212,16 +1212,25 @@ async fn bridge_fast_fails_runtime_header_callbacks_with_host_fallback_shapes() 
         .expect("session created");
 
     let stats_text = std::fs::read_to_string(stats_path(&fixture)).expect("stats written");
-    let lines: Vec<&str> = stats_text.lines().collect();
-    assert!(
-        lines.contains(
-            &"headers:{\"errorMessage\":\"Provider request auth is unavailable\",\"headersApplied\":false}"
-        ),
-        "stats: {stats_text}"
+    // Compare parsed JSON: key order depends on whether serde_json's
+    // `preserve_order` feature is unified into the build.
+    let callback_result = |prefix: &str| -> serde_json::Value {
+        let line = stats_text
+            .lines()
+            .find_map(|line| line.strip_prefix(prefix))
+            .unwrap_or_else(|| panic!("missing {prefix} stats line: {stats_text}"));
+        serde_json::from_str(line).expect("callback result is JSON")
+    };
+    assert_eq!(
+        callback_result("headers:"),
+        serde_json::json!({
+            "headersApplied": false,
+            "errorMessage": "Provider request auth is unavailable",
+        })
     );
-    assert!(
-        lines.contains(&"mcpauth:{\"ok\":false,\"reason\":\"official_auth_unavailable\"}"),
-        "stats: {stats_text}"
+    assert_eq!(
+        callback_result("mcpauth:"),
+        serde_json::json!({ "ok": false, "reason": "official_auth_unavailable" })
     );
     bridge.kill("test end");
 }
