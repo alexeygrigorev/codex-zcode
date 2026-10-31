@@ -3460,7 +3460,6 @@ async fn thread_goal_keeps_original_root_until_external_objective_edit() -> Resu
             gate: Some(edited_turn_gate),
             body: responses::sse_completed("second-goal-continuation"),
         }],
-        ungated_goal_response(responses::sse_completed("reopened-goal-turn")),
         ungated_goal_response(responses::sse(vec![
             responses::ev_response_created("rootless-goal-continuation"),
             responses::ev_completed_with_tokens(
@@ -3587,7 +3586,7 @@ async fn thread_goal_keeps_original_root_until_external_objective_edit() -> Resu
     }
 
     let requests = server.requests().await;
-    assert_eq!(requests.len(), 8);
+    assert_eq!(requests.len(), 7);
     let reopened_original_request = serde_json::from_slice::<serde_json::Value>(&requests[2])?;
     assert_eq!(
         reopened_original_request["client_metadata"]["turn_id"].as_str(),
@@ -3618,19 +3617,21 @@ async fn thread_goal_keeps_original_root_until_external_objective_edit() -> Resu
         .as_str()
         .expect("second continuation turn ID");
 
-    let reopened_request = serde_json::from_slice::<serde_json::Value>(&requests[6])?;
-    assert_eq!(
-        reopened_request["client_metadata"]["turn_id"].as_str(),
-        Some(edited_turn_id)
-    );
-    responses::assert_root_turn(&reopened_request, Some(original_turn.turn.id.as_str()))?;
-    let continuation_request = serde_json::from_slice::<serde_json::Value>(&requests[7])?;
+    // The external edit does not reopen the running turn: its objective
+    // reminder is deferred to the next turn boundary, which starts a new root.
+    let continuation_request = serde_json::from_slice::<serde_json::Value>(&requests[6])?;
     let continuation_turn_id = continuation_request["client_metadata"]["turn_id"]
         .as_str()
         .expect("independent continuation turn ID");
     assert_ne!(continuation_turn_id, edited_turn_id);
     responses::assert_root_turn(&continuation_request, Some(continuation_turn_id))?;
     responses::assert_parent_turn(&continuation_request, /*expected*/ None)?;
+    assert!(
+        continuation_request
+            .to_string()
+            .contains("externally updated goal"),
+        "deferred objective reminder should reach the next turn: {continuation_request}"
+    );
 
     server.shutdown().await;
     Ok(())
