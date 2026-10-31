@@ -99,6 +99,7 @@ impl App {
             app_server.thread_goal_get(thread_id).await,
             Ok(response) if response
                 .goal
+                .as_ref()
                 .is_some_and(|goal| goal.status == ThreadGoalStatus::Active)
         );
         if let Err(err) = app_server.turn_interrupt(thread_id, turn_id.clone()).await {
