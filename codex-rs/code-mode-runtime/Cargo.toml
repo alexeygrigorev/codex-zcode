@@ -23,11 +23,7 @@ serde_json = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 tokio-util = { workspace = true, features = ["rt"] }
 tracing = { workspace = true }
-# v8_enable_sandbox requests the ptrcomp_sandbox prebuilt archive, which
-# denoland/rusty_v8 has never published (checked v150.2.0..v152.2.0), leaving
-# `cargo build --workspace --bins` unbuildable on clean machines. Use the
-# published default archive until upstream ships sandbox prebuilts.
-v8 = { workspace = true }
+v8 = { workspace = true, features = ["v8_enable_sandbox"] }
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }

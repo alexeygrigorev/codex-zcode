@@ -52,6 +52,11 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # Code mode links sandbox-enabled V8; use the checksum-pinned prebuilt.
+      - uses: ./.github/actions/setup-rusty-v8
+        with:
+          target: ${{ matrix.target }}
+
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: codex-rs
@@ -125,6 +130,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
         with:
           components: clippy, rustfmt
+
+      # Code mode links sandbox-enabled V8; use the checksum-pinned prebuilt.
+      - uses: ./.github/actions/setup-rusty-v8
+        with:
+          target: x86_64-unknown-linux-gnu
 
       - uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
         with:
