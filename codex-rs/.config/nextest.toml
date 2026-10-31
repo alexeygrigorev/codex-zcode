@@ -21,11 +21,6 @@ path = "junit.xml"
 [profile.local]
 inherits = "default"
 
-# JUnit output is not inherited; `just test` runs this profile in CI, which
-# keeps the report as validation evidence.
-[profile.local.junit]
-path = "junit.xml"
-
 [test-groups.app_server_protocol_codegen]
 max-threads = 1
 
