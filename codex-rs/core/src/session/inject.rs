@@ -19,7 +19,11 @@ impl Session {
         input: Vec<T>,
     ) -> Result<(), Vec<T>> {
         let mut active = self.active_turn.lock().await;
-        match active.as_mut() {
+        // A finished task has already drained its pending input for the last time.
+        match active
+            .as_mut()
+            .filter(|active_turn| active_turn.task.is_some())
+        {
             Some(active_turn) => {
                 self.input_queue
                     .extend_pending_input_and_accept_mailbox_delivery_for_turn_state(
@@ -81,7 +85,11 @@ impl Session {
             .map(|item| self.annotate_client_response_item(item))
             .collect::<Vec<_>>();
         let mut active = self.active_turn.lock().await;
-        if let Some(active_turn) = active.as_mut() {
+        // A finished task has already drained its pending input for the last time.
+        if let Some(active_turn) = active
+            .as_mut()
+            .filter(|active_turn| active_turn.task.is_some())
+        {
             self.input_queue
                 .extend_pending_input_and_accept_mailbox_delivery_for_turn_state(
                     active_turn.turn_state.as_ref(),
