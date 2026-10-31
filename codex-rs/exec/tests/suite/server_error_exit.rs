@@ -22,7 +22,16 @@ async fn exits_non_zero_when_server_reports_error() -> anyhow::Result<()> {
     })]);
     responses::mount_sse_once(&server, body).await;
 
-    test.cmd_with_server(&server)
+    // Rate-limit stream errors are retried after a minute or more; disable
+    // stream retries so the reported error ends the run.
+    let mock_provider = format!(
+        "model_providers.mock_provider={{name=\"Mock provider for test\",base_url=\"{}/v1\",wire_api=\"responses\",supports_websockets=false,stream_max_retries=0}}",
+        server.uri()
+    );
+    test.cmd()
+        .arg("-c")
+        .arg(mock_provider)
+        .args(["-c", "model_provider=\"mock_provider\""])
         .arg("--skip-git-repo-check")
         .arg("tell me something")
         .arg("--experimental-json")
