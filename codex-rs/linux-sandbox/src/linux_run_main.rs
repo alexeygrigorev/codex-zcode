@@ -191,6 +191,16 @@ pub fn run_main() -> ! {
     // Inner stage: apply seccomp/no_new_privs after bubblewrap has already
     // established the filesystem view.
     if apply_seccomp_then_exec {
+        // bwrap's --die-with-parent does not always survive the exec into this
+        // stage: an exec that changes security context (such as Ubuntu's
+        // bwrap AppArmor profile transition) clears the parent-death signal.
+        // As init of the sandbox PID namespace, this process takes every
+        // sandboxed descendant with it, so re-arm it here. Only SIGKILL reaches
+        // a namespace init from outside the namespace.
+        if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } < 0 {
+            let err = std::io::Error::last_os_error();
+            panic!("failed to set sandbox init parent-death signal: {err}");
+        }
         if let Err(err) = crate::fd_mount::verify_fd_mounts(&verify_fd_mounts) {
             panic!("failed to verify descriptor-backed bubblewrap mount: {err}");
         }
