@@ -133,7 +133,14 @@ impl RouteAwareRequestError {
             if error.to_string() == "tunnel error: proxy authorization required" {
                 return Some(RouteFailureClass::ProxyAuthenticationRequired);
             }
-            source = error.source();
+            // `io::Error::source` skips the error it wraps, which is where
+            // hyper's connector leaves the rustls handshake failure.
+            source = match error.downcast_ref::<io::Error>() {
+                Some(io_error) => io_error
+                    .get_ref()
+                    .map(|inner| inner as &(dyn std::error::Error + 'static)),
+                None => error.source(),
+            };
         }
 
         match self {
