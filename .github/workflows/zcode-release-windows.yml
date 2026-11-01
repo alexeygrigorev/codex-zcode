@@ -1,14 +1,32 @@
 name: ZCode Release Windows
 
+# Builds zcodex for windows-amd64 from an EXISTING zcode-* release tag and
+# publishes a reviewed build in a second dispatch as zcodex-windows-amd64.exe,
+# extending the existing release checksums.
+# SHA256SUMS. Agent Hub provisioning (host/agent_hub_host/provisioning.py)
+# downloads exactly this asset name from the pinned tag; before this the
+# workflow only produced a short-lived workflow artifact, so no release ever
+# carried a Windows binary and Windows hosts could not auto-install zcodex
+# (Hub intake 608a2f9a AC1, found on LAPTOP-PHA6TCNC).
 on:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing zcode-* release tag to build and attach the Windows asset to
+        required: true
+      build_run_id:
+        description: 'Publish only: successful build-only run ID reviewed by orchestrator (empty builds only)'
+        required: false
+      expected_sha256:
+        description: 'Publish only: orchestrator-reviewed Windows binary SHA256'
+        required: false
 
 permissions:
   contents: read
 
 concurrency:
-  group: zcode-release-windows-${{ github.ref }}
-  cancel-in-progress: true
+  group: zcode-release-windows-${{ inputs.tag }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -16,6 +34,7 @@ env:
 jobs:
   build:
     name: Build windows-amd64
+    if: inputs.build_run_id == ''
     runs-on: windows-latest
     timeout-minutes: 240
     defaults:
@@ -23,7 +42,29 @@ jobs:
         working-directory: codex-rs
 
     steps:
+      - name: Validate tag name
+        shell: bash
+        working-directory: ${{ github.workspace }}
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^zcode-[A-Za-z0-9._-]+$ ]] || { echo "invalid tag: $TAG" >&2; exit 1; }
+
       - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+
+      - name: Verify checkout is the exact tag commit
+        shell: bash
+        working-directory: ${{ github.workspace }}
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "refs/tags/$TAG:refs/tags/$TAG"
+          test "$(git rev-parse HEAD)" = "$(git rev-parse "refs/tags/$TAG^{commit}")"
+          echo "building $TAG at $(git rev-parse HEAD)"
 
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
         with:
@@ -46,17 +87,91 @@ jobs:
       - name: Package binary
         shell: pwsh
         working-directory: ${{ github.workspace }}
+        env:
+          TAG: ${{ inputs.tag }}
         run: |
           Copy-Item codex-rs/target/x86_64-pc-windows-msvc/release/zcodex.exe zcodex-windows-amd64.exe
-          if (Test-Path codex-rs/target/x86_64-pc-windows-msvc/release/zcodex.pdb) {
-            Copy-Item codex-rs/target/x86_64-pc-windows-msvc/release/zcodex.pdb zcodex-windows-amd64.pdb
-          }
-          Get-ChildItem zcodex-windows-amd64.* | Compress-Archive -DestinationPath zcodex-windows-amd64.zip -Force
-          Get-Item zcodex-windows-amd64.* | Select-Object Name, Length
+          Get-Item zcodex-windows-amd64.exe | Select-Object Name, Length
+          $hash = (Get-FileHash zcodex-windows-amd64.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          $source = git rev-parse HEAD
+          @{ tag = $env:TAG; source = $source; sha256 = $hash } | ConvertTo-Json | Set-Content provenance.json
+          "Source: $source; SHA256: $hash" | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: zcodex-windows-amd64-zip
-          path: zcodex-windows-amd64.zip
+          name: zcodex-windows-amd64-exe
+          path: |
+            zcodex-windows-amd64.exe
+            provenance.json
           if-no-files-found: error
+
+  release:
+    name: Attach to release ${{ inputs.tag }}
+    if: inputs.build_run_id != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Validate reviewed build run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ inputs.build_run_id }}
+          EXPECTED_SHA256: ${{ inputs.expected_sha256 }}
+        run: |
+          set -euo pipefail
+          [[ "$RUN_ID" =~ ^[0-9]+$ ]]
+          [[ "$EXPECTED_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          gh api "repos/$REPO/actions/runs/$RUN_ID" > run.json
+          jq -e --arg repo "$REPO" '
+            .conclusion == "success" and .event == "workflow_dispatch" and
+            .path == ".github/workflows/zcode-release-windows.yml" and
+            .repository.full_name == $repo' run.json
+
+      - name: Download Windows binary
+        uses: actions/download-artifact@v4
+        with:
+          name: zcodex-windows-amd64-exe
+          path: dist
+          run-id: ${{ inputs.build_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Attach binary, then extend SHA256SUMS (existing lines byte-identical)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          REPO: ${{ github.repository }}
+          EXPECTED_SHA256: ${{ inputs.expected_sha256 }}
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^zcode-[A-Za-z0-9._-]+$ ]]
+          asset=zcodex-windows-amd64.exe
+          if gh release view "$TAG" -R "$REPO" --json assets -q '.assets[].name' | grep -qx "$asset"; then
+            echo "$asset is already attached to $TAG; refusing to replace a published asset" >&2
+            exit 1
+          fi
+          mkdir -p old new
+          gh release download "$TAG" -R "$REPO" -p SHA256SUMS -D old
+          if grep -q "$asset" old/SHA256SUMS; then
+            echo "SHA256SUMS already lists $asset; refusing to rewrite it" >&2
+            exit 1
+          fi
+          sum=$(sha256sum "dist/$asset" | cut -d' ' -f1)
+          test "$sum" = "$EXPECTED_SHA256"
+          source=$(gh api "repos/$REPO/commits/$TAG" --jq .sha)
+          jq -e --arg tag "$TAG" --arg source "$source" --arg sum "$sum" \
+            '.tag == $tag and .source == $source and .sha256 == $sum' dist/provenance.json
+          cp old/SHA256SUMS new/SHA256SUMS
+          # Same path form as the Linux lines written by zcode-release.yml.
+          printf '%s  release/%s\n' "$sum" "$asset" >> new/SHA256SUMS
+          size=$(stat -c %s old/SHA256SUMS)
+          head -c "$size" new/SHA256SUMS | cmp - old/SHA256SUMS
+          # The asset lands first, so no host ever reads a checksum line for a
+          # file that is not downloadable yet.
+          gh release upload "$TAG" "dist/$asset" -R "$REPO"
+          gh release upload "$TAG" new/SHA256SUMS -R "$REPO" --clobber
+          gh release download "$TAG" -R "$REPO" -p SHA256SUMS -D check
+          cmp check/SHA256SUMS new/SHA256SUMS
+          echo "$TAG: $asset sha256 $sum" | tee -a "$GITHUB_STEP_SUMMARY"
