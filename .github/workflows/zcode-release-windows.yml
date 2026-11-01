@@ -1,9 +1,10 @@
 name: ZCode Release Windows
 
-# Builds zcodex for windows-amd64 from an EXISTING zcode-* release tag and
+# Makes a locked Windows amd64 build from an EXISTING zcode-* release tag and
 # publishes a reviewed build in a second dispatch as zcodex-windows-amd64.exe,
-# extending the existing release checksums.
-# SHA256SUMS. Agent Hub provisioning (host/agent_hub_host/provisioning.py)
+# extending the existing release checksums. Runner/cache inputs are not pinned
+# for byte-identical rebuilds; provenance identifies the exact published build.
+# Agent Hub provisioning (host/agent_hub_host/provisioning.py)
 # downloads exactly this asset name from the pinned tag; before this the
 # workflow only produced a short-lived workflow artifact, so no release ever
 # carried a Windows binary and Windows hosts could not auto-install zcodex
@@ -51,7 +52,7 @@ jobs:
           set -euo pipefail
           [[ "$TAG" =~ ^zcode-[A-Za-z0-9._-]+$ ]] || { echo "invalid tag: $TAG" >&2; exit 1; }
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: refs/tags/${{ inputs.tag }}
 
@@ -70,7 +71,7 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: codex-rs
           key: zcode-release-x86_64-pc-windows-msvc
@@ -98,7 +99,7 @@ jobs:
           "Source: $source; SHA256: $hash" | Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: zcodex-windows-amd64-exe
           path: |
@@ -131,7 +132,7 @@ jobs:
             .repository.full_name == $repo' run.json
 
       - name: Download Windows binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: zcodex-windows-amd64-exe
           path: dist
