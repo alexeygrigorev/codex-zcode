@@ -55,6 +55,9 @@ case "$action" in
     exec 9>"$lock_dir/$name.lock"
     flock -n 9 || fail 'another command owns this task target/output; choose a distinct task'
     mkdir -p "$CARGO_TARGET_DIR" "$TMPDIR" "$ZCODE_BUNDLE_OUT_DIR"
+    # The Storage Box SFTP server has a per-session open-handle ceiling. Keep
+    # Cargo's default parallelism at the empirically stable level for SSHFS.
+    export CARGO_BUILD_JOBS=2
     exec "$@"
     ;;
 esac

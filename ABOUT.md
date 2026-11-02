@@ -75,7 +75,9 @@ scripts/storagebox-dev.sh run sh -c '"$CARGO_TARGET_DIR/dev-small/zcodex" --vers
 
 On the development server, this is the default process: an existing SSHFS mount
 at `~/storagebox` holds new worktrees, target binaries, temporary build files and
-bundle outputs. The wrapper fails closed if the mount is absent or unusable.
+bundle outputs. The wrapper fails closed if the mount is absent or unusable and
+limits Cargo to two concurrent jobs to stay within the Storage Box SFTP handle
+budget.
 Create an owned worktree with `scripts/storagebox-dev.sh worktree TASK HEAD`,
 then work in `~/storagebox/worktrees/codex-zcode/TASK`. Local Git objects remain
 in the main clone. `scripts/storagebox-dev.sh paths` prints the actual selected
