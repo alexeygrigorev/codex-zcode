@@ -8,7 +8,7 @@ expression: "format!(\"{}\\n{}\",\nlines_to_single_string(&app.transcript_cells.
 
 • Queued follow-up inputs
   ↳ queued before disconnect
-    shift+← edit last queued message
+    ⌥+↑ edit last queued message
 
 › keep this draft!
 

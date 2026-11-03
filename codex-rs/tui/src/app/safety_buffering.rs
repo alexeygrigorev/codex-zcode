@@ -8,6 +8,7 @@ use crate::app_server_session::turn_permissions_overrides;
 use crate::chatwidget::ThreadInputState;
 use crate::chatwidget::ThreadInputStateRestoreMode;
 use crate::chatwidget::UserMessage;
+use codex_app_server_protocol::ThreadGoalStatus;
 use codex_app_server_protocol::ThreadHistoryMode;
 use codex_app_server_protocol::TurnItemsView;
 use codex_app_server_protocol::UserInput;
@@ -92,6 +93,15 @@ impl App {
             )
         });
 
+        // Interrupting pauses an active goal, but the retry continues the same
+        // work, so its fork resumes a goal that was active before the interrupt.
+        let goal_was_active = matches!(
+            app_server.thread_goal_get(thread_id).await,
+            Ok(response) if response
+                .goal
+                .as_ref()
+                .is_some_and(|goal| goal.status == ThreadGoalStatus::Active)
+        );
         if let Err(err) = app_server.turn_interrupt(thread_id, turn_id.clone()).await {
             self.chat_widget
                 .add_error_message(format!("Failed to retry with a faster model: {err}"));
@@ -199,6 +209,19 @@ impl App {
             }
         };
         let retry_thread_id = started.session.thread_id;
+        if goal_was_active
+            && let Err(err) = app_server
+                .thread_goal_set(
+                    retry_thread_id,
+                    /*objective*/ None,
+                    Some(ThreadGoalStatus::Active),
+                    /*token_budget*/ None,
+                )
+                .await
+        {
+            self.fail_safety_buffered_branch(input_state, prompt, err);
+            return;
+        }
 
         self.shutdown_current_thread(app_server).await;
         if let Err(err) = self
