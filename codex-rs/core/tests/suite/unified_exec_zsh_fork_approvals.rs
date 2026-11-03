@@ -33,6 +33,7 @@ use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
+use codex_utils_path_uri::PathUri;
 use core_test_support::responses::ResponseMock;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
@@ -465,6 +466,7 @@ async fn unified_exec_zsh_fork_guardian_reviews_persistent_terminal_in_current_t
         .path()
         .join("unified-exec-zsh-fork-current-turn.txt");
     let initial_denied_path = outside_dir.path().join("original-environment-private");
+    fs::create_dir_all(&initial_denied_path)?;
     let permission_profile = denied_read_permission_profile(&initial_denied_path)?;
     let rules = r#"prefix_rule(pattern=["touch"], decision="prompt")"#.to_string();
 
@@ -768,9 +770,24 @@ fn permission_profile_from_toml(profile: &str) -> Result<PermissionProfile> {
                 ":project_roots" => FileSystemPath::Special {
                     value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
                 },
-                _ if *access == FileSystemAccessMode::Deny => FileSystemPath::GlobPattern {
-                    pattern: path.clone(),
-                },
+                _ if *access == FileSystemAccessMode::Deny => {
+                    // Mirror production profile compilation: only patterns with
+                    // glob metacharacters become GlobPattern entries. A literal
+                    // deny path must stay a Path entry, otherwise the Linux
+                    // sandbox fails to expand it as a glob when the test
+                    // environment starts.
+                    if path.chars().any(|ch| matches!(ch, '*' | '?' | '[' | ']')) {
+                        FileSystemPath::GlobPattern {
+                            pattern: path.clone(),
+                        }
+                    } else {
+                        FileSystemPath::Path {
+                            path: PathUri::from_host_native_path(path).with_context(|| {
+                                format!("test deny path should be absolute: {path}")
+                            })?,
+                        }
+                    }
+                }
                 _ => anyhow::bail!("unexpected filesystem entry in test profile: {path}"),
             };
             Ok(FileSystemSandboxEntry {
