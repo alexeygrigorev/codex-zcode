@@ -6,12 +6,15 @@ use codex_config::types::ApprovalsReviewer;
 use codex_core::TurnInputRequest;
 use codex_core::config::Config;
 use codex_core::sandboxing::SandboxPermissions;
+use codex_core::windows_sandbox::WindowsSandboxLevelExt;
 use codex_extension_api::ExtensionRegistryBuilder;
 use codex_features::Feature;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Settings;
+use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::PermissionProfile;
+use codex_protocol::models::PermissionProfileSnapshot;
 use codex_protocol::permissions::FileSystemAccessMode;
 use codex_protocol::permissions::FileSystemPath;
 use codex_protocol::permissions::FileSystemSandboxEntry;
@@ -19,6 +22,8 @@ use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::permissions::FileSystemSpecialPath;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::EnvironmentConfig;
+use codex_protocol::protocol::EnvironmentConfigState;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ExecApprovalRequestEvent;
 use codex_protocol::protocol::GuardianAssessmentAction;
@@ -65,7 +70,10 @@ async fn unified_exec_zsh_fork_parent_approval_preserves_denied_reads() -> Resul
     let denied_path = denied_dir.path().join("secret.env");
     let secret = "unified-exec-zsh-fork-denied-read-secret";
     fs::write(&denied_path, format!("{secret}\n"))?;
-    let permission_profile = denied_read_permission_profile(&denied_path)?;
+    // Deny the directory with an expandable glob: the sandbox can only mask
+    // glob patterns it can expand, and production never produces bare
+    // metacharacter-free glob entries.
+    let permission_profile = denied_read_permission_profile(&denied_dir.path().join("**"))?;
     assert!(
         permission_profile
             .file_system_sandbox_policy()
@@ -460,7 +468,11 @@ async fn unified_exec_zsh_fork_guardian_reviews_persistent_terminal_in_current_t
         .path()
         .join("unified-exec-zsh-fork-current-turn.txt");
     let initial_denied_path = outside_dir.path().join("original-environment-private");
-    let permission_profile = denied_read_permission_profile(&initial_denied_path)?;
+    fs::create_dir_all(&initial_denied_path)?;
+    // Deny with an expandable glob over the originating directory so the
+    // sandbox can mask it; the literal directory path stays a substring of
+    // the pattern for the Guardian assertions below.
+    let permission_profile = denied_read_permission_profile(&initial_denied_path.join("**"))?;
     let rules = r#"prefix_rule(pattern=["touch"], decision="prompt")"#.to_string();
 
     let outside_path_for_hook = outside_path.clone();
@@ -558,11 +570,30 @@ async fn unified_exec_zsh_fork_guardian_reviews_persistent_terminal_in_current_t
 
     let next_cwd = test.config.cwd.join("next-turn");
     fs::create_dir(&next_cwd)?;
-    let next_denied_path = next_cwd.join("next-environment-private");
-    let (sandbox_policy, permission_profile) = turn_permission_fields(
-        denied_read_permission_profile(next_denied_path.as_path())?,
-        next_cwd.as_path(),
-    );
+    // stdin_approval rejects a terminal when the current environment adds
+    // denied reads it cannot enforce. This turn changes to a profile without
+    // denied reads, so Guardian can review the input while the intercepted
+    // exec is still evaluated against the terminal's originating restrictions.
+    let (sandbox_policy, permission_profile) =
+        turn_permission_fields(restrictive_workspace_write_profile(), next_cwd.as_path());
+    let mut next_environments = local_selections(next_cwd);
+    let next_local = next_environments
+        .environments
+        .first_mut()
+        .context("local environment selection")?;
+    next_local.config = EnvironmentConfigState::Ready(EnvironmentConfig {
+        allow_login_shell: test.config.permissions.allow_login_shell,
+        workspace_roots: next_local.workspace_roots.clone(),
+        permission_profile: PermissionProfileSnapshot::legacy(restrictive_workspace_write_profile()),
+        shell_environment_policy: Default::default(),
+        windows_sandbox_level: WindowsSandboxLevel::from_config(&test.config),
+        windows_sandbox_type: test.config.permissions.windows_sandbox_type,
+        use_legacy_landlock: test.config.features.use_legacy_landlock(),
+        exec_policy: None,
+        mcp_policy: None,
+        network_policy: None,
+        selected_capability_roots: Vec::new(),
+    });
     test.codex
         .start_or_steer_turn(
             TurnInputRequest::user_input(vec![UserInput::Text {
@@ -570,7 +601,7 @@ async fn unified_exec_zsh_fork_guardian_reviews_persistent_terminal_in_current_t
                 text_elements: Vec::new(),
             }])
             .with_thread_settings(ThreadSettingsOverrides {
-                environments: Some(local_selections(next_cwd)),
+                environments: Some(next_environments),
                 approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
                 sandbox_policy: Some(sandbox_policy),
                 permission_profile,
@@ -653,7 +684,6 @@ async fn unified_exec_zsh_fork_guardian_reviews_persistent_terminal_in_current_t
         .map(|(permissions, _)| permissions)
         .context("intercepted command's Guardian permissions")?;
     assert!(permissions.contains(initial_denied_path.to_string_lossy().as_ref()));
-    assert!(!permissions.contains(next_denied_path.to_string_lossy().as_ref()));
 
     Ok(())
 }
