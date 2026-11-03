@@ -33,7 +33,6 @@ use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
-use codex_utils_path_uri::PathUri;
 use core_test_support::responses::ResponseMock;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
@@ -71,7 +70,10 @@ async fn unified_exec_zsh_fork_parent_approval_preserves_denied_reads() -> Resul
     let denied_path = denied_dir.path().join("secret.env");
     let secret = "unified-exec-zsh-fork-denied-read-secret";
     fs::write(&denied_path, format!("{secret}\n"))?;
-    let permission_profile = denied_read_permission_profile(&denied_path)?;
+    // Deny the directory with an expandable glob: the sandbox can only mask
+    // glob patterns it can expand, and production never produces bare
+    // metacharacter-free glob entries.
+    let permission_profile = denied_read_permission_profile(&denied_dir.path().join("**"))?;
     assert!(
         permission_profile
             .file_system_sandbox_policy()
@@ -467,7 +469,10 @@ async fn unified_exec_zsh_fork_guardian_reviews_persistent_terminal_in_current_t
         .join("unified-exec-zsh-fork-current-turn.txt");
     let initial_denied_path = outside_dir.path().join("original-environment-private");
     fs::create_dir_all(&initial_denied_path)?;
-    let permission_profile = denied_read_permission_profile(&initial_denied_path)?;
+    // Deny with an expandable glob over the originating directory so the
+    // sandbox can mask it; the literal directory path stays a substring of
+    // the pattern for the Guardian assertions below.
+    let permission_profile = denied_read_permission_profile(&initial_denied_path.join("**"))?;
     let rules = r#"prefix_rule(pattern=["touch"], decision="prompt")"#.to_string();
 
     let outside_path_for_hook = outside_path.clone();
@@ -770,24 +775,9 @@ fn permission_profile_from_toml(profile: &str) -> Result<PermissionProfile> {
                 ":project_roots" => FileSystemPath::Special {
                     value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
                 },
-                _ if *access == FileSystemAccessMode::Deny => {
-                    // Mirror production profile compilation: only patterns with
-                    // glob metacharacters become GlobPattern entries. A literal
-                    // deny path must stay a Path entry, otherwise the Linux
-                    // sandbox fails to expand it as a glob when the test
-                    // environment starts.
-                    if path.chars().any(|ch| matches!(ch, '*' | '?' | '[' | ']')) {
-                        FileSystemPath::GlobPattern {
-                            pattern: path.clone(),
-                        }
-                    } else {
-                        FileSystemPath::Path {
-                            path: PathUri::from_host_native_path(path).with_context(|| {
-                                format!("test deny path should be absolute: {path}")
-                            })?,
-                        }
-                    }
-                }
+                _ if *access == FileSystemAccessMode::Deny => FileSystemPath::GlobPattern {
+                    pattern: path.clone(),
+                },
                 _ => anyhow::bail!("unexpected filesystem entry in test profile: {path}"),
             };
             Ok(FileSystemSandboxEntry {
