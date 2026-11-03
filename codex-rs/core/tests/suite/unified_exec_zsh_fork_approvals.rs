@@ -563,14 +563,12 @@ async fn unified_exec_zsh_fork_guardian_reviews_persistent_terminal_in_current_t
 
     let next_cwd = test.config.cwd.join("next-turn");
     fs::create_dir(&next_cwd)?;
-    let next_denied_path = next_cwd.join("next-environment-private");
-    let (sandbox_policy, permission_profile) = turn_permission_fields(
-        denied_read_permission_profile(next_denied_path.as_path())?,
-        next_cwd.as_path(),
-    );
-    // Input to a terminal whose environment now has denied reads it cannot
-    // enforce is rejected outright. The owner supplies the moved environment's
-    // configuration, so the thread's denied reads do not carry over into it.
+    // stdin_approval rejects a terminal when the current environment adds
+    // denied reads it cannot enforce. This turn changes to a profile without
+    // denied reads, so Guardian can review the input while the intercepted
+    // exec is still evaluated against the terminal's originating restrictions.
+    let (sandbox_policy, permission_profile) =
+        turn_permission_fields(restrictive_workspace_write_profile(), next_cwd.as_path());
     let mut next_environments = local_selections(next_cwd);
     let next_local = next_environments
         .environments
@@ -679,7 +677,6 @@ async fn unified_exec_zsh_fork_guardian_reviews_persistent_terminal_in_current_t
         .map(|(permissions, _)| permissions)
         .context("intercepted command's Guardian permissions")?;
     assert!(permissions.contains(initial_denied_path.to_string_lossy().as_ref()));
-    assert!(!permissions.contains(next_denied_path.to_string_lossy().as_ref()));
 
     Ok(())
 }
