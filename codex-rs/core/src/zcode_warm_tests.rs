@@ -1213,15 +1213,33 @@ async fn bridge_fast_fails_runtime_header_callbacks_with_host_fallback_shapes() 
 
     let stats_text = std::fs::read_to_string(stats_path(&fixture)).expect("stats written");
     let lines: Vec<&str> = stats_text.lines().collect();
-    assert!(
-        lines.contains(
-            &"headers:{\"errorMessage\":\"Provider request auth is unavailable\",\"headersApplied\":false}"
-        ),
-        "stats: {stats_text}"
+    let headers: serde_json::Value = serde_json::from_str(
+        lines
+            .iter()
+            .find_map(|line| line.strip_prefix("headers:"))
+            .expect("runtime header callback stats"),
+    )
+    .expect("runtime header callback JSON");
+    assert_eq!(
+        headers,
+        serde_json::json!({
+            "errorMessage": "Provider request auth is unavailable",
+            "headersApplied": false,
+        })
     );
-    assert!(
-        lines.contains(&"mcpauth:{\"ok\":false,\"reason\":\"official_auth_unavailable\"}"),
-        "stats: {stats_text}"
+    let mcpauth: serde_json::Value = serde_json::from_str(
+        lines
+            .iter()
+            .find_map(|line| line.strip_prefix("mcpauth:"))
+            .expect("MCP auth callback stats"),
+    )
+    .expect("MCP auth callback JSON");
+    assert_eq!(
+        mcpauth,
+        serde_json::json!({
+            "ok": false,
+            "reason": "official_auth_unavailable",
+        })
     );
     bridge.kill("test end");
 }

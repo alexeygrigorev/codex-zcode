@@ -794,6 +794,11 @@ impl UnifiedExecProcessManager {
             initial_exec_command_guard
                 .finish_plugin_metrics(context, exit)
                 .await;
+            // Short-lived commands emit their end event here instead of in the
+            // exit watcher, so wait until its output task has finished updating
+            // the transcript first.
+            let output_drained = process.output_drained_notify();
+            output_drained.notified().await;
             emit_exec_end_for_unified_exec(
                 Arc::clone(&context.session),
                 Arc::clone(&context.step_context.turn),

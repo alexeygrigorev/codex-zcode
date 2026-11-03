@@ -3585,6 +3585,11 @@ async fn thread_goal_keeps_original_root_until_external_objective_edit() -> Resu
         )
         .await??;
     }
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        server.wait_for_request_count(/*count*/ 8),
+    )
+    .await?;
 
     let requests = server.requests().await;
     assert_eq!(requests.len(), 8);
