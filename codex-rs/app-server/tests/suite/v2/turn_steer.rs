@@ -13,6 +13,7 @@ use codex_app_server::INVALID_PARAMS_ERROR_CODE;
 use codex_app_server_protocol::AdditionalContextEntry;
 use codex_app_server_protocol::AdditionalContextKind;
 use codex_app_server_protocol::ClientRequest;
+use codex_app_server_protocol::CommandExecutionStatus;
 use codex_app_server_protocol::ItemStartedNotification;
 use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCNotification;
@@ -719,6 +720,22 @@ async fn turn_steer_and_interrupt_work_on_resumed_thread() -> Result<()> {
         DEFAULT_READ_TIMEOUT,
         mcp.read_stream_until_notification_message("turn/started"),
     )
+    .await??;
+
+    timeout(DEFAULT_READ_TIMEOUT, async {
+        loop {
+            let notification = mcp
+                .read_stream_until_notification_message("item/started")
+                .await?;
+            let started: ItemStartedNotification =
+                serde_json::from_value(notification.params.expect("item/started params"))?;
+            if let ThreadItem::CommandExecution { id, status, .. } = started.item {
+                assert_eq!(id, "call_sleep");
+                assert_eq!(status, CommandExecutionStatus::InProgress);
+                return Ok::<(), anyhow::Error>(());
+            }
+        }
+    })
     .await??;
 
     let steer: TurnSteerResponse = mcp
