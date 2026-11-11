@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -74,6 +75,8 @@ pub struct EventProcessorWithJsonOutput {
     native_identity: Option<(String, String)>,
     native_calls: HashMap<String, Option<String>>,
     native_overflow: bool,
+    seen_native_turns: HashSet<(String, String)>,
+    native_turn_overflow: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -104,6 +107,20 @@ impl EventProcessorWithJsonOutput {
             native_identity: None,
             native_calls: HashMap::new(),
             native_overflow: false,
+            seen_native_turns: HashSet::new(),
+            native_turn_overflow: false,
+        }
+    }
+
+    // Configuration can be reprinted. It must not reopen completed turns or
+    // reset lifetime overflow, including when a thread is configured again.
+    fn configure_native_thread(&mut self, thread_id: String) {
+        if self.active_thread_id.as_ref() != Some(&thread_id) {
+            self.active_thread_id = Some(thread_id);
+            self.active_turn_id = None;
+            self.native_identity = None;
+            self.native_calls.clear();
+            self.native_overflow = false;
         }
     }
 
@@ -463,6 +480,7 @@ impl EventProcessorWithJsonOutput {
             ServerNotification::BridgeToolActivity(notification) => {
                 if self.active_thread_id.as_deref() == Some(notification.thread_id.as_str())
                     && self.active_turn_id.as_deref() == Some(notification.turn_id.as_str())
+                    && !self.native_turn_overflow
                     && !notification.call_id.is_empty()
                     && notification.call_id.len() <= 128
                     && !notification.tool.is_empty()
@@ -648,11 +666,27 @@ impl EventProcessorWithJsonOutput {
                 CodexStatus::Running
             }
             ServerNotification::TurnCompleted(notification) => {
-                if self.active_thread_id.as_deref() == Some(notification.thread_id.as_str())
-                    && self.active_turn_id.as_deref() == Some(notification.turn.id.as_str())
-                {
-                    self.active_turn_id = None;
-                    self.native_identity = None;
+                if self.active_thread_id.as_deref() == Some(notification.thread_id.as_str()) {
+                    // A completion observed before its start must still close
+                    // that turn. Late start/schedule notifications cannot heal it.
+                    if !self.native_turn_overflow
+                        && !notification.turn.id.is_empty()
+                        && notification.turn.id.len() <= 128
+                    {
+                        let identity =
+                            (notification.thread_id.clone(), notification.turn.id.clone());
+                        if !self.seen_native_turns.contains(&identity) {
+                            if self.seen_native_turns.len() >= 128 {
+                                self.native_turn_overflow = true;
+                            } else {
+                                self.seen_native_turns.insert(identity);
+                            }
+                        }
+                    }
+                    if self.active_turn_id.as_deref() == Some(notification.turn.id.as_str()) {
+                        self.active_turn_id = None;
+                        self.native_identity = None;
+                    }
                 }
                 if let Some(running) = self.running_todo_list.take() {
                     events.push(ThreadEvent::ItemCompleted(ItemCompletedEvent {
@@ -736,12 +770,25 @@ impl EventProcessorWithJsonOutput {
             }
             ServerNotification::TurnStarted(notification) => {
                 if self.active_thread_id.as_deref() == Some(notification.thread_id.as_str())
-                    && self.active_turn_id.as_deref() != Some(notification.turn.id.as_str())
+                    && !self.native_turn_overflow
+                    && !notification.turn.id.is_empty()
+                    && notification.turn.id.len() <= 128
                 {
-                    self.active_turn_id = Some(notification.turn.id);
-                    self.native_identity = None;
-                    self.native_calls.clear();
-                    self.native_overflow = false;
+                    let identity = (notification.thread_id, notification.turn.id);
+                    if !self.seen_native_turns.contains(&identity) {
+                        // Bounded lifetime tombstones: never evict old turns and
+                        // accidentally make a replay eligible for proof again.
+                        if self.seen_native_turns.len() >= 128 {
+                            self.native_turn_overflow = true;
+                            self.active_turn_id = None;
+                        } else {
+                            self.seen_native_turns.insert(identity.clone());
+                            self.active_turn_id = Some(identity.1);
+                            self.native_identity = None;
+                            self.native_calls.clear();
+                            self.native_overflow = false;
+                        }
+                    }
                 }
                 events.push(ThreadEvent::TurnStarted(TurnStartedEvent {}));
                 CodexStatus::Running
@@ -760,11 +807,7 @@ impl EventProcessor for EventProcessorWithJsonOutput {
         _: &str,
         session_configured: &SessionConfiguredEvent,
     ) {
-        self.active_thread_id = Some(session_configured.thread_id.to_string());
-        self.active_turn_id = None;
-        self.native_identity = None;
-        self.native_calls.clear();
-        self.native_overflow = false;
+        self.configure_native_thread(session_configured.thread_id.to_string());
         self.emit(Self::thread_started_event(session_configured));
     }
 

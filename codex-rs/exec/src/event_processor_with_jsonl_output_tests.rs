@@ -159,6 +159,166 @@ fn native_result_rejects_foreign_outer_binding_replays_and_late_completion() {
     );
 }
 
+fn start_bridge_turn(processor: &mut EventProcessorWithJsonOutput, id: &str) {
+    let mut turn = bridge_turn(TurnStatus::InProgress);
+    turn.id = id.to_string();
+    processor.collect_thread_events(ServerNotification::TurnStarted(
+        codex_app_server_protocol::TurnStartedNotification {
+            thread_id: "thread-1".to_string(),
+            turn,
+        },
+    ));
+}
+
+fn schedule_and_collect_bridge_result(
+    processor: &mut EventProcessorWithJsonOutput,
+    turn_id: &str,
+) -> Vec<ThreadEvent> {
+    let mut result = bridge_result_fixture();
+    result.turn_id = turn_id.to_string();
+    let mut started = result.clone();
+    started.status = codex_app_server_protocol::BridgeToolActivityStatus::Started;
+    started.native_result = None;
+    processor.collect_thread_events(ServerNotification::BridgeToolActivity(started));
+    processor
+        .collect_thread_events(ServerNotification::BridgeToolActivity(result))
+        .events
+}
+
+#[test]
+fn native_result_completed_turn_cannot_be_reopened_by_replayed_start() {
+    let mut processor = bridge_processor();
+    assert_eq!(
+        processor
+            .collect_thread_events(ServerNotification::BridgeToolActivity(
+                bridge_result_fixture(),
+            ))
+            .events
+            .len(),
+        1
+    );
+    processor.collect_thread_events(ServerNotification::TurnCompleted(
+        codex_app_server_protocol::TurnCompletedNotification {
+            thread_id: "thread-1".to_string(),
+            turn: bridge_turn(TurnStatus::Completed),
+        },
+    ));
+    start_bridge_turn(&mut processor, "turn-1");
+    assert!(schedule_and_collect_bridge_result(&mut processor, "turn-1").is_empty());
+}
+
+#[test]
+fn native_result_old_turn_replay_does_not_displace_a_genuine_new_turn() {
+    let mut processor = bridge_processor();
+    start_bridge_turn(&mut processor, "turn-2");
+    start_bridge_turn(&mut processor, "turn-1");
+    assert!(schedule_and_collect_bridge_result(&mut processor, "turn-1").is_empty());
+    assert_eq!(
+        schedule_and_collect_bridge_result(&mut processor, "turn-2").len(),
+        1
+    );
+    start_bridge_turn(&mut processor, "turn-1");
+    assert!(schedule_and_collect_bridge_result(&mut processor, "turn-1").is_empty());
+}
+
+#[test]
+fn native_result_configuration_reprints_cannot_reset_turn_tombstones() {
+    let mut processor = bridge_processor();
+    assert_eq!(
+        processor
+            .collect_thread_events(ServerNotification::BridgeToolActivity(
+                bridge_result_fixture(),
+            ))
+            .events
+            .len(),
+        1
+    );
+    // This is the same state hook used by print_config_summary. Reprinting an
+    // active thread must not clear the consumed call or the lifetime turn set.
+    processor.configure_native_thread("thread-1".to_string());
+    assert!(schedule_and_collect_bridge_result(&mut processor, "turn-1").is_empty());
+    processor.collect_thread_events(ServerNotification::TurnCompleted(
+        codex_app_server_protocol::TurnCompletedNotification {
+            thread_id: "thread-1".to_string(),
+            turn: bridge_turn(TurnStatus::Completed),
+        },
+    ));
+    processor.configure_native_thread("thread-1".to_string());
+    start_bridge_turn(&mut processor, "turn-1");
+    assert!(schedule_and_collect_bridge_result(&mut processor, "turn-1").is_empty());
+    // Switching away and back also cannot reopen a previously observed turn.
+    processor.configure_native_thread("thread-2".to_string());
+    processor.configure_native_thread("thread-1".to_string());
+    start_bridge_turn(&mut processor, "turn-1");
+    assert!(schedule_and_collect_bridge_result(&mut processor, "turn-1").is_empty());
+    start_bridge_turn(&mut processor, "turn-2");
+    assert_eq!(
+        schedule_and_collect_bridge_result(&mut processor, "turn-2").len(),
+        1
+    );
+}
+
+#[test]
+fn native_result_turn_capacity_fails_closed_without_eviction_or_configuration_healing() {
+    let mut processor = bridge_processor();
+    for index in 2..=128 {
+        start_bridge_turn(&mut processor, &format!("turn-{index}"));
+    }
+    assert_eq!(
+        schedule_and_collect_bridge_result(&mut processor, "turn-128").len(),
+        1
+    );
+    start_bridge_turn(&mut processor, "turn-129");
+    assert!(processor.native_turn_overflow);
+    assert_eq!(processor.seen_native_turns.len(), 128);
+    processor.configure_native_thread("thread-2".to_string());
+    processor.configure_native_thread("thread-1".to_string());
+    for turn in ["turn-1", "turn-128", "turn-129", "turn-130"] {
+        start_bridge_turn(&mut processor, turn);
+        assert!(schedule_and_collect_bridge_result(&mut processor, turn).is_empty());
+    }
+    assert_eq!(processor.seen_native_turns.len(), 128);
+}
+
+#[test]
+fn native_result_orphan_completions_are_bounded_tombstones_without_reopening() {
+    let mut processor = bridge_processor();
+    let complete = |processor: &mut EventProcessorWithJsonOutput, id: &str| {
+        let mut turn = bridge_turn(TurnStatus::Completed);
+        turn.id = id.to_string();
+        processor.collect_thread_events(ServerNotification::TurnCompleted(
+            codex_app_server_protocol::TurnCompletedNotification {
+                thread_id: "thread-1".to_string(),
+                turn,
+            },
+        ));
+    };
+    complete(&mut processor, "orphan-turn");
+    start_bridge_turn(&mut processor, "orphan-turn");
+    assert!(schedule_and_collect_bridge_result(&mut processor, "orphan-turn").is_empty());
+    assert_eq!(
+        processor
+            .collect_thread_events(ServerNotification::BridgeToolActivity(
+                bridge_result_fixture(),
+            ))
+            .events
+            .len(),
+        1,
+        "orphan completion does not displace the genuine active turn"
+    );
+    // Orphan completions share the lifetime bound, without eviction on overflow.
+    for index in 2..=128 {
+        complete(&mut processor, &format!("orphan-{index}"));
+    }
+    assert!(processor.native_turn_overflow);
+    assert_eq!(processor.seen_native_turns.len(), 128);
+    processor.configure_native_thread("thread-1".to_string());
+    for id in ["orphan-turn", "orphan-128", "new-turn"] {
+        start_bridge_turn(&mut processor, id);
+        assert!(schedule_and_collect_bridge_result(&mut processor, id).is_empty());
+    }
+}
+
 #[test]
 fn native_result_keeps_failures_nonzero_exits_and_unknown_command_metadata_explicit() {
     for success in [true, false] {
