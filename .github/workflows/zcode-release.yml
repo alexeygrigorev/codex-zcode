@@ -170,13 +170,13 @@ jobs:
       - name: Test changed runtime project
         run: |
           set -o pipefail
-          just test -p codex-core --cargo-profile dev-small --build-jobs 2 --test-threads 2 2>&1 | tee ci-evidence/core-tests.log
+          just test -p codex-core --features codex-core/bedrock --cargo-profile dev-small --build-jobs 2 --test-threads 2 2>&1 | tee ci-evidence/core-tests.log
           cp "$CARGO_TARGET_DIR/nextest/local/junit.xml" ci-evidence/core-junit.xml
 
       - name: Test full runtime workspace
         run: |
           set -o pipefail
-          just test --workspace --cargo-profile dev-small --build-jobs 2 --test-threads 2 2>&1 | tee ci-evidence/workspace-tests.log
+          just test --workspace --features codex-core/bedrock --cargo-profile dev-small --build-jobs 2 --test-threads 2 2>&1 | tee ci-evidence/workspace-tests.log
           cp "$CARGO_TARGET_DIR/nextest/local/junit.xml" ci-evidence/workspace-junit.xml
 
       - name: Apply required scoped lint fixes

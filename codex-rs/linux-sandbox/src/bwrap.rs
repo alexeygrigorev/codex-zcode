@@ -815,7 +815,20 @@ fn expand_unreadable_globs_with_ripgrep(
     // metacharacter. That keeps scans narrow, avoids searching from `/`, and
     // lets one `rg --files` call handle all patterns under the same root.
     let mut patterns_by_search_root: BTreeMap<AbsolutePathBuf, Vec<String>> = BTreeMap::new();
+    let mut expanded_paths = BTreeSet::new();
     for pattern in patterns {
+        // A pattern without glob metacharacters names one concrete path, so
+        // mask it directly instead of scanning for matches.
+        if !pattern.contains(['*', '?', '[', ']']) {
+            let literal = AbsolutePathBuf::resolve_path_against_base(pattern, cwd);
+            if literal.as_path().exists() {
+                if let Some(target) = canonical_target_if_symlinked_path(literal.as_path()) {
+                    expanded_paths.insert(AbsolutePathBuf::from_absolute_path_checked(target)?);
+                }
+                expanded_paths.insert(literal);
+            }
+            continue;
+        }
         let Some((search_root, glob)) = split_pattern_for_ripgrep(pattern, cwd) else {
             return Err(CodexErr::Fatal(format!(
                 "unreadable glob `{pattern}` cannot be safely expanded; use a pattern with a non-root directory prefix"
@@ -832,7 +845,6 @@ fn expand_unreadable_globs_with_ripgrep(
     // Record both the logical match and any canonical symlink target. The bwrap
     // overlay needs the resolved target to prevent a readable symlink path from
     // bypassing an unreadable glob match.
-    let mut expanded_paths = BTreeSet::new();
     for (search_root, globs) in patterns_by_search_root {
         for path in ripgrep_files(search_root.as_path(), &globs, max_depth)? {
             if let Some(target) = canonical_target_if_symlinked_path(path.as_path()) {
@@ -2820,6 +2832,19 @@ mod tests {
         .expect("filesystem args");
 
         assert_file_masked(&args.args, &real_secret);
+    }
+
+    #[test]
+    fn unreadable_literal_patterns_mask_the_existing_path() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let secret = temp_dir.path().join("secret.env");
+        std::fs::write(&secret, "secret").expect("write secret");
+        let policy = default_policy_with_unreadable_glob(path_to_string(&secret));
+
+        let args = create_filesystem_args(&policy, temp_dir.path(), BwrapOptions::default())
+            .expect("filesystem args");
+
+        assert_file_masked(&args.args, &secret);
     }
 
     #[test]
