@@ -24,6 +24,7 @@ pub use crate::event_processor::CodexStatus;
 use crate::event_processor::EventProcessor;
 use crate::event_processor::handle_last_message;
 use crate::exec_events::AgentMessageItem;
+use crate::exec_events::BridgeToolResultEvent;
 use crate::exec_events::CollabAgentState;
 use crate::exec_events::CollabAgentStatus;
 use crate::exec_events::CollabTool;
@@ -68,6 +69,11 @@ pub struct EventProcessorWithJsonOutput {
     last_critical_error: Option<ThreadErrorEvent>,
     final_message: Option<String>,
     emit_final_message_on_shutdown: bool,
+    active_thread_id: Option<String>,
+    active_turn_id: Option<String>,
+    native_identity: Option<(String, String)>,
+    native_calls: HashMap<String, Option<String>>,
+    native_overflow: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -93,6 +99,11 @@ impl EventProcessorWithJsonOutput {
             last_critical_error: None,
             final_message: None,
             emit_final_message_on_shutdown: false,
+            active_thread_id: None,
+            active_turn_id: None,
+            native_identity: None,
+            native_calls: HashMap::new(),
+            native_overflow: false,
         }
     }
 
@@ -449,6 +460,107 @@ impl EventProcessorWithJsonOutput {
     ) -> CollectedThreadEvents {
         let mut events = Vec::new();
         let status = match notification {
+            ServerNotification::BridgeToolActivity(notification) => {
+                if self.active_thread_id.as_deref() == Some(notification.thread_id.as_str())
+                    && self.active_turn_id.as_deref() == Some(notification.turn_id.as_str())
+                    && !notification.call_id.is_empty()
+                    && notification.call_id.len() <= 128
+                    && !notification.tool.is_empty()
+                    && notification.tool.len() <= 128
+                {
+                    if notification.status
+                        == codex_app_server_protocol::BridgeToolActivityStatus::Started
+                    {
+                        if self.native_calls.contains_key(&notification.call_id) {
+                            self.native_calls.insert(notification.call_id, None);
+                        } else if self.native_calls.len() >= 128 {
+                            self.native_overflow = true;
+                        } else {
+                            self.native_calls
+                                .insert(notification.call_id, Some(notification.tool));
+                        }
+                        return CollectedThreadEvents {
+                            events,
+                            status: CodexStatus::Running,
+                        };
+                    }
+                    let scheduled = self
+                        .native_calls
+                        .get_mut(&notification.call_id)
+                        .and_then(Option::take);
+                    let Some(result) = notification.native_result else {
+                        return CollectedThreadEvents {
+                            events,
+                            status: CodexStatus::Running,
+                        };
+                    };
+                    if self.native_overflow
+                        || scheduled.as_deref() != Some(notification.tool.as_str())
+                    {
+                        return CollectedThreadEvents {
+                            events,
+                            status: CodexStatus::Running,
+                        };
+                    }
+                    let identity = (
+                        result.native_session_id.clone(),
+                        result.native_turn_id.clone(),
+                    );
+                    let terminal = match result.source_event.as_str() {
+                        "tool_call_result" => {
+                            if result.native_success {
+                                codex_app_server_protocol::BridgeToolActivityStatus::Completed
+                            } else {
+                                codex_app_server_protocol::BridgeToolActivityStatus::Failed
+                            }
+                        }
+                        "tool_call_error" if !result.native_success => {
+                            codex_app_server_protocol::BridgeToolActivityStatus::Failed
+                        }
+                        _ => {
+                            return CollectedThreadEvents {
+                                events,
+                                status: CodexStatus::Running,
+                            };
+                        }
+                    };
+                    let valid = notification.status == terminal
+                        && !identity.0.is_empty()
+                        && identity.0.len() <= 128
+                        && !identity.1.is_empty()
+                        && identity.1.len() <= 128
+                        && self
+                            .native_identity
+                            .as_ref()
+                            .is_none_or(|prior| prior == &identity)
+                        && result.output.len() <= 16 * 1024
+                        && result.output.len() == result.output_bytes as usize
+                        && result.observed_bytes >= result.output_bytes
+                        && result.output_truncated == (result.observed_bytes > result.output_bytes)
+                        && result
+                            .source_returned_bytes
+                            .is_none_or(|count| count == result.observed_bytes)
+                        && result
+                            .source_original_bytes
+                            .is_none_or(|count| count >= result.observed_bytes)
+                        && (result.source_truncated != Some(false)
+                            || result
+                                .source_original_bytes
+                                .is_none_or(|count| count == result.observed_bytes));
+                    if valid {
+                        self.native_identity = Some(identity);
+                        events.push(ThreadEvent::BridgeToolResult(BridgeToolResultEvent {
+                            version: 1,
+                            thread_id: notification.thread_id,
+                            turn_id: notification.turn_id,
+                            call_id: notification.call_id,
+                            tool: notification.tool,
+                            native_result: result,
+                        }));
+                    }
+                }
+                CodexStatus::Running
+            }
             ServerNotification::ConfigWarning(notification) => {
                 let message = match notification.details {
                     Some(details) if !details.is_empty() => {
@@ -536,6 +648,12 @@ impl EventProcessorWithJsonOutput {
                 CodexStatus::Running
             }
             ServerNotification::TurnCompleted(notification) => {
+                if self.active_thread_id.as_deref() == Some(notification.thread_id.as_str())
+                    && self.active_turn_id.as_deref() == Some(notification.turn.id.as_str())
+                {
+                    self.active_turn_id = None;
+                    self.native_identity = None;
+                }
                 if let Some(running) = self.running_todo_list.take() {
                     events.push(ThreadEvent::ItemCompleted(ItemCompletedEvent {
                         item: ExecThreadItem {
@@ -616,7 +734,15 @@ impl EventProcessorWithJsonOutput {
                 }
                 CodexStatus::Running
             }
-            ServerNotification::TurnStarted(_) => {
+            ServerNotification::TurnStarted(notification) => {
+                if self.active_thread_id.as_deref() == Some(notification.thread_id.as_str())
+                    && self.active_turn_id.as_deref() != Some(notification.turn.id.as_str())
+                {
+                    self.active_turn_id = Some(notification.turn.id);
+                    self.native_identity = None;
+                    self.native_calls.clear();
+                    self.native_overflow = false;
+                }
                 events.push(ThreadEvent::TurnStarted(TurnStartedEvent {}));
                 CodexStatus::Running
             }
@@ -634,6 +760,11 @@ impl EventProcessor for EventProcessorWithJsonOutput {
         _: &str,
         session_configured: &SessionConfiguredEvent,
     ) {
+        self.active_thread_id = Some(session_configured.thread_id.to_string());
+        self.active_turn_id = None;
+        self.native_identity = None;
+        self.native_calls.clear();
+        self.native_overflow = false;
         self.emit(Self::thread_started_event(session_configured));
     }
 

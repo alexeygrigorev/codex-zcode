@@ -8039,9 +8039,90 @@
         },
         "type": "object"
       },
+      "BridgeNativeToolResult": {
+        "description": "Bounded native tool-result evidence. This is observational data only: it never becomes a model-visible ResponseItem or an executable function call.",
+        "properties": {
+          "commandStatus": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "exitCode": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "nativeSessionId": {
+            "type": "string"
+          },
+          "nativeSuccess": {
+            "description": "The provider's explicit result boolean, or false for a typed tool error. Tool success does not imply a successful shell exit.",
+            "type": "boolean"
+          },
+          "nativeTurnId": {
+            "type": "string"
+          },
+          "observedBytes": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "output": {
+            "type": "string"
+          },
+          "outputBytes": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "outputTruncated": {
+            "type": "boolean"
+          },
+          "sourceEvent": {
+            "type": "string"
+          },
+          "sourceOriginalBytes": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "sourceReturnedBytes": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "sourceTruncated": {
+            "description": "Missing provider metadata stays unknown, never \"not truncated\".",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "nativeSessionId",
+          "nativeSuccess",
+          "nativeTurnId",
+          "observedBytes",
+          "output",
+          "outputBytes",
+          "outputTruncated",
+          "sourceEvent"
+        ],
+        "type": "object"
+      },
       "BridgeToolActivityNotification": {
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "description": "Live status of one tool call executing inside a bridged external agent core (the ZCode warm bridge). Display only: the tool ran on the far side of the bridge, so it has no matching item in the thread history.",
+        "description": "Live status of one tool call executing inside a bridged external agent core (the ZCode warm bridge). Observational only: the tool ran on the far side of the bridge, so it has no matching item in the thread history.",
         "properties": {
           "callId": {
             "description": "The external core's id for the tool call.",
@@ -8053,6 +8134,17 @@
               "string",
               "null"
             ]
+          },
+          "nativeResult": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/BridgeNativeToolResult"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional native result; older display-only activity omits this field."
           },
           "status": {
             "$ref": "#/definitions/v2/BridgeToolActivityStatus"

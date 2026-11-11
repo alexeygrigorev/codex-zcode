@@ -435,6 +435,37 @@ class AutoReviewRequirements(BaseModel):
     required_on_models: Annotated[list[str] | None, Field(alias="requiredOnModels")] = None
 
 
+class BridgeNativeToolResult(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    command_status: Annotated[str | None, Field(alias="commandStatus")] = None
+    exit_code: Annotated[int | None, Field(alias="exitCode")] = None
+    native_session_id: Annotated[str, Field(alias="nativeSessionId")]
+    native_success: Annotated[
+        bool,
+        Field(
+            alias="nativeSuccess",
+            description="The provider's explicit result boolean, or false for a typed tool error. Tool success does not imply a successful shell exit.",
+        ),
+    ]
+    native_turn_id: Annotated[str, Field(alias="nativeTurnId")]
+    observed_bytes: Annotated[int, Field(alias="observedBytes", ge=0)]
+    output: str
+    output_bytes: Annotated[int, Field(alias="outputBytes", ge=0)]
+    output_truncated: Annotated[bool, Field(alias="outputTruncated")]
+    source_event: Annotated[str, Field(alias="sourceEvent")]
+    source_original_bytes: Annotated[int | None, Field(alias="sourceOriginalBytes", ge=0)] = None
+    source_returned_bytes: Annotated[int | None, Field(alias="sourceReturnedBytes", ge=0)] = None
+    source_truncated: Annotated[
+        bool | None,
+        Field(
+            alias="sourceTruncated",
+            description='Missing provider metadata stays unknown, never "not truncated".',
+        ),
+    ] = None
+
+
 class BridgeToolActivityStatus(Enum):
     started = "started"
     completed = "completed"
@@ -6703,6 +6734,13 @@ class BridgeToolActivityNotification(BaseModel):
         str | None,
         Field(
             description="Bounded human-readable detail (input summary, output preview, or error message), capped by the bridge before emission."
+        ),
+    ] = None
+    native_result: Annotated[
+        BridgeNativeToolResult | None,
+        Field(
+            alias="nativeResult",
+            description="Optional native result; older display-only activity omits this field.",
         ),
     ] = None
     status: BridgeToolActivityStatus

@@ -56,6 +56,7 @@ use crate::client::ZcodeRuntime;
 use crate::client::zcode_failure_message;
 use crate::client::zcode_stderr_tail;
 use crate::zcode_process;
+use crate::zcode_warm_events::NativeResultTracker;
 use crate::zcode_warm_events::bridge_tool_activity_from_notification;
 use crate::zcode_warm_permissions::PermissionRequest;
 use crate::zcode_warm_permissions::PermissionRequestLog;
@@ -835,6 +836,7 @@ impl ZcodeWarmBridge {
             let mut reply = String::new();
             let mut started_output = false;
             let mut tool_names = HashMap::new();
+            let mut native_results = NativeResultTracker::new(collector_session.clone());
             loop {
                 let notification =
                     match tokio::time::timeout(collector_timeout, events.recv()).await {
@@ -870,6 +872,7 @@ impl ZcodeWarmBridge {
                 {
                     continue;
                 }
+                let native_result = native_results.observe(&notification);
                 match notification.get("type").and_then(serde_json::Value::as_str) {
                     Some("model.streaming") => {
                         let payload = notification.get("payload");
@@ -911,15 +914,18 @@ impl ZcodeWarmBridge {
                         // Display-only tool activity from the core's own
                         // agent loop (issue #38): surfaced as an event, never
                         // as a ResponseItem the ToolCallRuntime would run.
-                        if let Some(activity) =
+                        if let Some(mut activity) =
                             bridge_tool_activity_from_notification(&notification, &mut tool_names)
-                            && tx
+                        {
+                            activity.native_result = native_result;
+                            if tx
                                 .send(Ok(codex_api::ResponseEvent::BridgeToolActivity(activity)))
                                 .await
                                 .is_err()
-                        {
-                            stop_turn(&collector_bridge, &collector_session).await;
-                            return;
+                            {
+                                stop_turn(&collector_bridge, &collector_session).await;
+                                return;
+                            }
                         }
                     }
                     Some("turn.failed") => {

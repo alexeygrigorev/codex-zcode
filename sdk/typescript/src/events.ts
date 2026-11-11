@@ -72,6 +72,37 @@ export type ThreadErrorEvent = {
   message: string;
 };
 
+/** Observed native result. Tool success alone never proves a successful shell exit. */
+export type BridgeNativeToolResult = {
+  nativeSessionId: string;
+  nativeTurnId: string;
+  nativeSuccess: boolean;
+  sourceEvent: "tool_call_result" | "tool_call_error";
+  exitCode: number | null;
+  commandStatus: string | null;
+  /** At most 16 KiB of UTF-8 native result content, never a display preview. */
+  output: string;
+  /** Bytes observed before the projection's own bound. */
+  observedBytes: number;
+  outputBytes: number;
+  outputTruncated: boolean;
+  /** Null preserves unknown provider truncation and byte accounting. */
+  sourceTruncated: boolean | null;
+  sourceOriginalBytes: number | null;
+  sourceReturnedBytes: number | null;
+};
+
+/** Additive native tool result; never a command_execution or model-history item. */
+export type BridgeToolResultEvent = {
+  type: "bridge_tool_result";
+  version: 1;
+  thread_id: string;
+  turn_id: string;
+  call_id: string;
+  tool: string;
+  native_result: BridgeNativeToolResult;
+};
+
 /** Top-level JSONL events emitted by codex exec. */
 export type ThreadEvent =
   | ThreadStartedEvent
@@ -81,4 +112,5 @@ export type ThreadEvent =
   | ItemStartedEvent
   | ItemUpdatedEvent
   | ItemCompletedEvent
+  | BridgeToolResultEvent
   | ThreadErrorEvent;

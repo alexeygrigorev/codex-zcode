@@ -2,6 +2,7 @@ use super::TurnError;
 use crate::JsonSchema;
 use crate::RequestId;
 use crate::TS;
+use codex_protocol::protocol::BridgeNativeToolResult;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -19,7 +20,7 @@ pub enum BridgeToolActivityStatus {
 }
 
 /// Live status of one tool call executing inside a bridged external agent
-/// core (the ZCode warm bridge). Display only: the tool ran on the far side
+/// core (the ZCode warm bridge). Observational only: the tool ran on the far side
 /// of the bridge, so it has no matching item in the thread history.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
@@ -34,6 +35,10 @@ pub struct BridgeToolActivityNotification {
     /// Bounded human-readable detail (input summary, output preview, or
     /// error message), capped by the bridge before emission.
     pub detail: Option<String>,
+    /// Optional native result; older display-only activity omits this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional = nullable)]
+    pub native_result: Option<BridgeNativeToolResult>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]

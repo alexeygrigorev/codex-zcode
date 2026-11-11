@@ -9,6 +9,8 @@ export type {
   ItemCompletedEvent,
   ThreadError,
   ThreadErrorEvent,
+  BridgeNativeToolResult,
+  BridgeToolResultEvent,
   Usage,
 } from "./events";
 export type {

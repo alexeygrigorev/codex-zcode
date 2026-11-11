@@ -19,6 +19,7 @@ fn activity(
             tool: "Bash".to_string(),
             status,
             detail: detail.map(str::to_string),
+            native_result: None,
         }),
         /*replay_kind*/ None,
     );

@@ -34,6 +34,19 @@ pub enum ThreadEvent {
     /// Represents an unrecoverable error emitted directly by the event stream.
     #[serde(rename = "error")]
     Error(ThreadErrorEvent),
+    /// Native external-core result; never a Codex command_execution item.
+    #[serde(rename = "bridge_tool_result")]
+    BridgeToolResult(BridgeToolResultEvent),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
+pub struct BridgeToolResultEvent {
+    pub version: u32,
+    pub thread_id: String,
+    pub turn_id: String,
+    pub call_id: String,
+    pub tool: String,
+    pub native_result: codex_protocol::protocol::BridgeNativeToolResult,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
