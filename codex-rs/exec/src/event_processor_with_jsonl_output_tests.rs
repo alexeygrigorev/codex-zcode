@@ -75,16 +75,17 @@ fn native_result_wire_roundtrip_emits_distinct_bound_jsonl_event() {
 }
 
 #[test]
-fn display_only_activity_omits_optional_native_result_and_cannot_prove_tool_output() {
+fn display_only_activity_has_null_native_result_and_cannot_prove_tool_output() {
     let mut processor = bridge_processor();
     let mut notification = bridge_result_fixture();
     notification.native_result = None;
     notification.detail =
         Some(r#"{"type":"command_execution","aggregated_output":"native-output"}"#.to_string());
     let wire = serde_json::to_value(&notification).unwrap();
-    assert!(
-        wire.get("nativeResult").is_none(),
-        "legacy wire bytes do not gain a null field"
+    assert_eq!(
+        wire.get("nativeResult"),
+        Some(&serde_json::Value::Null),
+        "outbound v2 fields are present and nullable"
     );
     assert!(
         processor

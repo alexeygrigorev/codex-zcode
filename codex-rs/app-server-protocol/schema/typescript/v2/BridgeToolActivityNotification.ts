@@ -20,6 +20,6 @@ callId: string, tool: string, status: BridgeToolActivityStatus,
  */
 detail: string | null,
 /**
- * Optional native result; older display-only activity omits this field.
+ * Native result, or null for display-only activity.
  */
-nativeResult?: BridgeNativeToolResult | null, };
+nativeResult: BridgeNativeToolResult | null, };

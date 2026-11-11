@@ -1539,7 +1539,7 @@
               "type": "null"
             }
           ],
-          "description": "Optional native result; older display-only activity omits this field."
+          "description": "Native result, or null for display-only activity."
         },
         "status": {
           "$ref": "#/definitions/BridgeToolActivityStatus"

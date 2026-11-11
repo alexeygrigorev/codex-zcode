@@ -6739,8 +6739,7 @@ class BridgeToolActivityNotification(BaseModel):
     native_result: Annotated[
         BridgeNativeToolResult | None,
         Field(
-            alias="nativeResult",
-            description="Optional native result; older display-only activity omits this field.",
+            alias="nativeResult", description="Native result, or null for display-only activity."
         ),
     ] = None
     status: BridgeToolActivityStatus

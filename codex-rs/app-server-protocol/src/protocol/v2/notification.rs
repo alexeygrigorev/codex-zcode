@@ -35,9 +35,7 @@ pub struct BridgeToolActivityNotification {
     /// Bounded human-readable detail (input summary, output preview, or
     /// error message), capped by the bridge before emission.
     pub detail: Option<String>,
-    /// Optional native result; older display-only activity omits this field.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional = nullable)]
+    /// Native result, or null for display-only activity.
     pub native_result: Option<BridgeNativeToolResult>,
 }
 
