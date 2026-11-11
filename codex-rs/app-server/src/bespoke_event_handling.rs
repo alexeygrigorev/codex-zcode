@@ -429,6 +429,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 tool: event.tool,
                 status,
                 detail: event.detail,
+                native_result: event.native_result,
             };
             outgoing
                 .send_server_notification(ServerNotification::BridgeToolActivity(notification))

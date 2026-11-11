@@ -1984,7 +1984,7 @@ pub enum BridgeToolActivityStatus {
 }
 
 /// Live status of one tool call executing inside a bridged external agent
-/// core (the ZCode warm bridge). Display only: the tool ran on the far side
+/// core (the ZCode warm bridge). Observational only: the tool ran on the far side
 /// of the bridge, so this never becomes a `ResponseItem` and must not enter
 /// model-visible history.
 #[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema, PartialEq, Eq)]
@@ -1997,6 +1997,33 @@ pub struct BridgeToolActivityEvent {
     /// error message), capped by the bridge before emission.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// Qualified native result, never inferred from the display preview.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_result: Option<BridgeNativeToolResult>,
+}
+
+/// Bounded native tool-result evidence. This is observational data only: it
+/// never becomes a model-visible ResponseItem or an executable function call.
+#[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct BridgeNativeToolResult {
+    pub native_session_id: String,
+    pub native_turn_id: String,
+    /// The provider's explicit result boolean, or false for a typed tool error.
+    /// Tool success does not imply a successful shell exit.
+    pub native_success: bool,
+    pub source_event: String,
+    pub exit_code: Option<i32>,
+    pub command_status: Option<String>,
+    pub output: String,
+    pub observed_bytes: u32,
+    pub output_bytes: u32,
+    pub output_truncated: bool,
+    /// Missing provider metadata stays unknown, never "not truncated".
+    pub source_truncated: Option<bool>,
+    pub source_original_bytes: Option<u32>,
+    pub source_returned_bytes: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema)]
