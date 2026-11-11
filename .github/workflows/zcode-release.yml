@@ -59,6 +59,11 @@ jobs:
           key: zcode-release-${{ matrix.target }}
           cache-on-failure: true
 
+      - name: Use checksum-verified prebuilt rusty_v8
+        uses: ./.github/actions/setup-rusty-v8
+        with:
+          target: ${{ matrix.target }}
+
       - name: Build Codex CLI with ZCode integration
         run: cargo build --locked --release --target ${{ matrix.target }} -p codex-cli --bin zcodex
 
@@ -147,6 +152,11 @@ jobs:
           cargo nextest --version > ci-evidence/nextest.txt
           df -h
           free -m
+
+      - name: Use checksum-verified prebuilt rusty_v8
+        uses: ./.github/actions/setup-rusty-v8
+        with:
+          target: x86_64-unknown-linux-gnu
 
       - name: Build workspace executables required by integration tests
         working-directory: codex-rs
