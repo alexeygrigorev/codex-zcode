@@ -4840,6 +4840,20 @@ impl ThreadRequestProcessor {
                 "`permissions` cannot be combined with `sandbox`",
             ));
         }
+        // Requests are serialized per thread id or per path. An interrupting fork must be
+        // addressed by the canonical thread id alone, so every interrupting fork of a thread
+        // shares one serialization key and cannot race another one's goal claim.
+        if interrupt_turn_id.is_some()
+            && (path.is_some()
+                || ThreadId::from_string(&thread_id)
+                    .map(|id| id.to_string())
+                    .ok()
+                    != Some(thread_id.clone()))
+        {
+            return Err(invalid_request(
+                "`interruptTurnId` requires the canonical `threadId` and cannot be combined with `path`",
+            ));
+        }
         let source_thread = self
             .read_stored_thread_for_resume(
                 &thread_id,

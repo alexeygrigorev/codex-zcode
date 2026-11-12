@@ -310,3 +310,46 @@ async fn fork_interrupt_of_a_turn_that_is_not_running_does_not_interrupt_the_sou
     assert_eq!(Some(before), source.goal(&thread_id).await?);
     Ok(())
 }
+
+#[tokio::test]
+async fn fork_interrupt_requires_the_canonical_thread_id_and_no_path() -> Result<()> {
+    skip_if_remote!(
+        Ok(()),
+        "uses a host-local command and cwd fixture unavailable to remote executors"
+    );
+    let mut source = RunningGoalTurn::start().await?;
+    let thread_id = source.thread_id.clone();
+    let before = source.goal(&thread_id).await?.expect("source goal");
+    let expected = JSONRPCErrorError {
+        code: INVALID_REQUEST_ERROR_CODE,
+        message:
+            "`interruptTurnId` requires the canonical `threadId` and cannot be combined with `path`"
+                .to_string(),
+        data: None,
+    };
+
+    for params in [
+        ThreadForkParams {
+            path: Some(std::path::PathBuf::from("rollout.jsonl")),
+            ..source.fork_params(&source.turn_id.clone())
+        },
+        ThreadForkParams {
+            thread_id: thread_id.to_uppercase(),
+            ..source.fork_params(&source.turn_id.clone())
+        },
+    ] {
+        let request = source.mcp.send_thread_fork_request(params).await?;
+        let error = timeout(
+            DEFAULT_READ_TIMEOUT,
+            source
+                .mcp
+                .read_stream_until_error_message(RequestId::Integer(request)),
+        )
+        .await??;
+        assert_eq!(expected, error.error);
+    }
+
+    // Nothing was claimed or interrupted: the turn is still running and the goal untouched.
+    assert_eq!(Some(before), source.goal(&thread_id).await?);
+    Ok(())
+}
