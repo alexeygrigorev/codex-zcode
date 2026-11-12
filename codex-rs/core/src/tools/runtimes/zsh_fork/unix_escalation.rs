@@ -10,6 +10,7 @@ use crate::tools::runtimes::exec_env_for_sandbox_permissions;
 use crate::tools::sandboxing::SandboxAttempt;
 use crate::tools::sandboxing::ToolCtx;
 use crate::tools::sandboxing::ToolError;
+use crate::tools::sandboxing::sandbox_permissions_preserving_denied_reads;
 use crate::tools::sandboxing::unsandboxed_execution_allowed;
 use codex_execpolicy::Decision;
 use codex_execpolicy::Evaluation;
@@ -144,6 +145,13 @@ pub(crate) async fn prepare_unified_exec_zsh_fork(
         codex_linux_sandbox_exe: ctx.step_context.turn.config.codex_linux_sandbox_exe.clone(),
         use_legacy_landlock: req.turn_environment.config().use_legacy_landlock,
     };
+    // Intercepted commands must use the same effective permissions as their
+    // parent launch. A denied-read policy keeps even an approved parent inside
+    // the sandbox; retaining RequireEscalated here would request approval again.
+    let sandbox_permissions = sandbox_permissions_preserving_denied_reads(
+        req.sandbox_permissions,
+        &exec_request.permission_profile.file_system_sandbox_policy(),
+    );
     let escalation_policy = CoreShellActionProvider {
         policy: Arc::clone(&exec_policy),
         session: Arc::clone(&ctx.session),
@@ -154,9 +162,9 @@ pub(crate) async fn prepare_unified_exec_zsh_fork(
         tool_name: ctx.tool_name.clone(),
         approval_policy: ctx.step_context.settings.approval_policy(),
         permission_profile: exec_request.permission_profile.clone(),
-        sandbox_permissions: req.sandbox_permissions,
+        sandbox_permissions,
         approval_sandbox_permissions: approval_sandbox_permissions(
-            req.sandbox_permissions,
+            sandbox_permissions,
             req.additional_permissions_preapproved,
         ),
         prompt_permissions: req.additional_permissions.clone(),

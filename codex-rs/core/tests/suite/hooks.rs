@@ -374,7 +374,10 @@ import time
 
 prompt = json.load(sys.stdin).get("prompt")
 Path(r"{started_path}").write_text(prompt, encoding="utf-8")
-while {gated} and not Path(r"{release_path}").exists():
+while {gated} and (
+    not Path(r"{release_path}").exists()
+    or Path(r"{release_path}").read_text(encoding="utf-8") != prompt
+):
     time.sleep(0.01)
 print(json.dumps({{
     "continue": False,
@@ -1939,7 +1942,7 @@ async fn async_hook_finishing_while_idle_waits_for_the_next_turn(
     fs::write(
         test.codex_home_path()
             .join("async_user_prompt_submit_release"),
-        "ready",
+        "finish before the async hook",
     )
     .context("release gated async hook")?;
 

@@ -819,13 +819,18 @@ fn expand_unreadable_globs_with_ripgrep(
     for pattern in patterns {
         // A pattern without glob metacharacters names one concrete path, so
         // mask it directly instead of scanning for matches.
-        if !pattern.contains(['*', '?', '[', ']']) {
+        if !pattern.contains(['*', '?', '[', ']', '{', '}', '\\']) {
             let literal = AbsolutePathBuf::resolve_path_against_base(pattern, cwd);
-            if literal.as_path().exists() {
-                if let Some(target) = canonical_target_if_symlinked_path(literal.as_path()) {
-                    expanded_paths.insert(AbsolutePathBuf::from_absolute_path_checked(target)?);
-                }
-                expanded_paths.insert(literal);
+            if let Some(target) = canonical_target_if_symlinked_path(literal.as_path()) {
+                expanded_paths.insert(AbsolutePathBuf::from_absolute_path_checked(target)?);
+            }
+            // Missing literals still need the existing missing-path masks and
+            // writable-symlink validation in append_unreadable_root_args.
+            expanded_paths.insert(literal);
+            if expanded_paths.len() > MAX_UNREADABLE_GLOB_MATCHES {
+                return Err(CodexErr::Fatal(format!(
+                    "unreadable glob expansion for {pattern} matched more than {MAX_UNREADABLE_GLOB_MATCHES} paths"
+                )));
             }
             continue;
         }
@@ -2845,6 +2850,78 @@ mod tests {
             .expect("filesystem args");
 
         assert_file_masked(&args.args, &secret);
+    }
+
+    #[test]
+    fn unreadable_literal_fast_path_rejects_glob_alternatives_and_escapes() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        for suffix in ["{private,credentials}.env", r"private\.env"] {
+            let pattern = format!("{}/{suffix}", temp_dir.path().display());
+            let error = expand_unreadable_globs_with_ripgrep(
+                &[pattern],
+                temp_dir.path(),
+                /*max_depth*/ None,
+            )
+            .expect_err("unsupported glob syntax must fail closed");
+            assert!(error.to_string().contains("cannot be safely expanded"));
+        }
+    }
+
+    #[test]
+    fn unreadable_literals_enforce_the_expansion_limit() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let patterns = (0..=MAX_UNREADABLE_GLOB_MATCHES)
+            .map(|index| path_to_string(&temp_dir.path().join(format!("secret-{index}"))))
+            .collect::<Vec<_>>();
+        let error = expand_unreadable_globs_with_ripgrep(
+            &patterns,
+            temp_dir.path(),
+            /*max_depth*/ None,
+        )
+        .expect_err("literal paths must obey the expansion bound");
+        assert!(error.to_string().contains("matched more than 8192 paths"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_literal_symlinks_retain_logical_and_canonical_paths() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let secret = temp_dir.path().join("secret.env");
+        let link = temp_dir.path().join("link.env");
+        std::fs::write(&secret, "secret").expect("write secret");
+        std::os::unix::fs::symlink(&secret, &link).expect("create symlink");
+        let paths = expand_unreadable_globs_with_ripgrep(
+            &[path_to_string(&link)],
+            temp_dir.path(),
+            /*max_depth*/ None,
+        )
+        .expect("expand literal symlink");
+        let mut expected = vec![
+            AbsolutePathBuf::from_absolute_path(&link).expect("absolute link"),
+            AbsolutePathBuf::from_absolute_path(&secret).expect("absolute secret"),
+        ];
+        expected.sort();
+        assert_eq!(paths, expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_missing_literal_under_writable_symlink_fails_closed() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let link = temp_dir.path().join("link");
+        std::os::unix::fs::symlink(temp_dir.path().join("missing"), &link)
+            .expect("create dangling symlink");
+        let mut policy = default_policy_with_unreadable_glob(path_to_string(&link.join("secret")));
+        policy.entries.push(FileSystemSandboxEntry {
+            path: AbsolutePathBuf::from_absolute_path(temp_dir.path())
+                .expect("absolute writable root")
+                .into(),
+            access: FileSystemAccessMode::Write,
+            missing_path_behavior: None,
+        });
+        let error = create_filesystem_args(&policy, temp_dir.path(), BwrapOptions::default())
+            .expect_err("dangling writable symlink must fail closed");
+        assert!(error.to_string().contains("crosses writable symlink"));
     }
 
     #[test]
