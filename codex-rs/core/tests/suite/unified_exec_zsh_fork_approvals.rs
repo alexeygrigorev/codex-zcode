@@ -449,9 +449,18 @@ async fn unified_exec_zsh_fork_guardian_reviews_intercepted_execve() -> Result<(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum PersistentTerminalContext {
+    Compatible,
+    ChangedDeniedReads,
+}
+
+#[test_case::test_case(PersistentTerminalContext::Compatible; "compatible_permissions")]
+#[test_case::test_case(PersistentTerminalContext::ChangedDeniedReads; "changed_denied_reads_refused")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn unified_exec_zsh_fork_guardian_reviews_persistent_terminal_in_current_turn() -> Result<()>
-{
+async fn unified_exec_zsh_fork_guardian_reviews_persistent_terminal_in_current_turn(
+    context: PersistentTerminalContext,
+) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let approval_policy = AskForApproval::OnRequest;
@@ -460,7 +469,15 @@ async fn unified_exec_zsh_fork_guardian_reviews_persistent_terminal_in_current_t
         .path()
         .join("unified-exec-zsh-fork-current-turn.txt");
     let initial_denied_path = outside_dir.path().join("original-environment-private");
-    let permission_profile = denied_read_permission_profile(&initial_denied_path)?;
+    let initial_secret = "original-terminal-private-test-secret";
+    let next_secret = "next-terminal-private-test-secret";
+    let permission_profile = match context {
+        PersistentTerminalContext::Compatible => restrictive_workspace_write_profile(),
+        PersistentTerminalContext::ChangedDeniedReads => {
+            fs::write(&initial_denied_path, initial_secret)?;
+            denied_read_permission_profile(&initial_denied_path)?
+        }
+    };
     let rules = r#"prefix_rule(pattern=["touch"], decision="prompt")"#.to_string();
 
     let outside_path_for_hook = outside_path.clone();
@@ -480,6 +497,8 @@ async fn unified_exec_zsh_fork_guardian_reviews_persistent_terminal_in_current_t
         return Ok(());
     };
 
+    let next_cwd = test.config.cwd.join("next-turn");
+    let next_denied_path = next_cwd.join("next-environment-private");
     let open_call_id = "uexec-zsh-fork-cross-turn-open";
     let open_command = "while IFS= read -r command; do eval \"$command\"; done";
     let open_args = json!({
@@ -490,37 +509,44 @@ async fn unified_exec_zsh_fork_guardian_reviews_persistent_terminal_in_current_t
         "justification": "start an interactive terminal for the next turn",
     });
     let write_call_id = "uexec-zsh-fork-cross-turn-write";
+    let input = match context {
+        PersistentTerminalContext::Compatible => format!("touch {outside_path:?}\nexit\n"),
+        PersistentTerminalContext::ChangedDeniedReads => format!(
+            "cat {initial_denied_path:?} {next_denied_path:?}\ntouch {outside_path:?}\nexit\n"
+        ),
+    };
     let write_args = json!({
-        "chars": format!("touch {outside_path:?}\nexit\n"),
+        "chars": input,
         "session_id": 1000,
         "yield_time_ms": 5_000,
     });
-    let responses = mount_sse_sequence(
-        &server,
-        vec![
-            sse(vec![
-                ev_response_created("resp-cross-turn-open"),
-                ev_function_call(
-                    open_call_id,
-                    "exec_command",
-                    &serde_json::to_string(&open_args)?,
-                ),
-                ev_completed("resp-cross-turn-open"),
-            ]),
-            sse(vec![
-                ev_response_created("resp-cross-turn-first-done"),
-                ev_assistant_message("msg-cross-turn-first-done", "terminal is running"),
-                ev_completed("resp-cross-turn-first-done"),
-            ]),
-            sse(vec![
-                ev_response_created("resp-cross-turn-write"),
-                ev_function_call(
-                    write_call_id,
-                    "write_stdin",
-                    &serde_json::to_string(&write_args)?,
-                ),
-                ev_completed("resp-cross-turn-write"),
-            ]),
+    let mut response_frames = vec![
+        sse(vec![
+            ev_response_created("resp-cross-turn-open"),
+            ev_function_call(
+                open_call_id,
+                "exec_command",
+                &serde_json::to_string(&open_args)?,
+            ),
+            ev_completed("resp-cross-turn-open"),
+        ]),
+        sse(vec![
+            ev_response_created("resp-cross-turn-first-done"),
+            ev_assistant_message("msg-cross-turn-first-done", "terminal is running"),
+            ev_completed("resp-cross-turn-first-done"),
+        ]),
+        sse(vec![
+            ev_response_created("resp-cross-turn-write"),
+            ev_function_call(
+                write_call_id,
+                "write_stdin",
+                &serde_json::to_string(&write_args)?,
+            ),
+            ev_completed("resp-cross-turn-write"),
+        ]),
+    ];
+    if matches!(context, PersistentTerminalContext::Compatible) {
+        response_frames.extend([
             sse(vec![
                 ev_response_created("resp-cross-turn-write-guardian"),
                 ev_assistant_message("msg-cross-turn-write-guardian", r#"{"outcome":"allow"}"#),
@@ -531,14 +557,14 @@ async fn unified_exec_zsh_fork_guardian_reviews_persistent_terminal_in_current_t
                 ev_assistant_message("msg-cross-turn-execve-guardian", r#"{"outcome":"allow"}"#),
                 ev_completed("resp-cross-turn-execve-guardian"),
             ]),
-            sse(vec![
-                ev_response_created("resp-cross-turn-second-done"),
-                ev_assistant_message("msg-cross-turn-second-done", "done"),
-                ev_completed("resp-cross-turn-second-done"),
-            ]),
-        ],
-    )
-    .await;
+        ]);
+    }
+    response_frames.push(sse(vec![
+        ev_response_created("resp-cross-turn-second-done"),
+        ev_assistant_message("msg-cross-turn-second-done", "done"),
+        ev_completed("resp-cross-turn-second-done"),
+    ]));
+    let responses = mount_sse_sequence(&server, response_frames).await;
 
     submit_turn_with_session_permissions(
         &test,
@@ -556,13 +582,16 @@ async fn unified_exec_zsh_fork_guardian_reviews_persistent_terminal_in_current_t
         unreachable!("completion wait only returns turn-complete events");
     };
 
-    let next_cwd = test.config.cwd.join("next-turn");
     fs::create_dir(&next_cwd)?;
-    let next_denied_path = next_cwd.join("next-environment-private");
-    let (sandbox_policy, permission_profile) = turn_permission_fields(
-        denied_read_permission_profile(next_denied_path.as_path())?,
-        next_cwd.as_path(),
-    );
+    let next_profile = match context {
+        PersistentTerminalContext::Compatible => restrictive_workspace_write_profile(),
+        PersistentTerminalContext::ChangedDeniedReads => {
+            fs::write(&next_denied_path, next_secret)?;
+            denied_read_permission_profile(next_denied_path.as_path())?
+        }
+    };
+    let (sandbox_policy, permission_profile) =
+        turn_permission_fields(next_profile, next_cwd.as_path());
     test.codex
         .start_or_steer_turn(
             TurnInputRequest::user_input(vec![UserInput::Text {
@@ -570,7 +599,7 @@ async fn unified_exec_zsh_fork_guardian_reviews_persistent_terminal_in_current_t
                 text_elements: Vec::new(),
             }])
             .with_thread_settings(ThreadSettingsOverrides {
-                environments: Some(local_selections(next_cwd)),
+                environments: Some(local_selections(next_cwd.clone())),
                 approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
                 sandbox_policy: Some(sandbox_policy),
                 permission_profile,
@@ -614,6 +643,38 @@ async fn unified_exec_zsh_fork_guardian_reviews_persistent_terminal_in_current_t
 
     let current_turn_id = current_turn_id.context("expected the second turn to start")?;
     assert_ne!(current_turn_id, first_completion.turn_id);
+    if matches!(context, PersistentTerminalContext::ChangedDeniedReads) {
+        // Review cannot retrofit denied reads onto a retained process. Verify
+        // rejection before either Guardian review or delivery of any stdin.
+        assert!(stdin_assessment.is_none());
+        assert!(intercepted_assessment.is_none());
+        let requests = responses.requests();
+        assert_eq!(requests.len(), 4);
+        assert!(requests.iter().all(|request| {
+            request.body_json()["client_metadata"]["x-openai-subagent"].as_str() != Some("guardian")
+        }));
+        let output = requests
+            .iter()
+            .find_map(|request| request.function_call_output_text(write_call_id))
+            .context("expected rejected stdin tool output")?;
+        assert_eq!(
+            output,
+            "write_stdin rejected: this terminal cannot enforce the current denied-read restrictions; start a new terminal"
+        );
+        assert!(!output.contains(initial_secret));
+        assert!(!output.contains(next_secret));
+        assert!(
+            !outside_path.exists(),
+            "rejected stdin must not execute touch"
+        );
+        test.codex.submit(Op::Shutdown).await?;
+        wait_for_event(&test.codex, |event| {
+            matches!(event, EventMsg::ShutdownComplete)
+        })
+        .await;
+        return Ok(());
+    }
+
     let stdin_assessment =
         stdin_assessment.context("expected an approved Guardian assessment for stdin")?;
     assert_eq!(
@@ -652,8 +713,8 @@ async fn unified_exec_zsh_fork_guardian_reviews_persistent_terminal_in_current_t
         .and_then(|(_, text)| text.split_once("PARENT TURN PERMISSION CONTEXT END"))
         .map(|(permissions, _)| permissions)
         .context("intercepted command's Guardian permissions")?;
-    assert!(permissions.contains(initial_denied_path.to_string_lossy().as_ref()));
-    assert!(!permissions.contains(next_denied_path.to_string_lossy().as_ref()));
+    assert!(permissions.contains(test.config.cwd.to_string_lossy().as_ref()));
+    assert!(!permissions.contains(next_cwd.to_string_lossy().as_ref()));
 
     Ok(())
 }
