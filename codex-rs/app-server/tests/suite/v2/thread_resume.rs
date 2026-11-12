@@ -3623,12 +3623,22 @@ async fn thread_goal_keeps_original_root_until_external_objective_edit() -> Resu
         .as_str()
         .expect("second continuation turn ID");
 
-    let reopened_request = serde_json::from_slice::<serde_json::Value>(&requests[6])?;
-    assert_eq!(
-        reopened_request["client_metadata"]["turn_id"].as_str(),
-        Some(edited_turn_id)
+    // Goal objective edits wait for the next turn boundary instead of rewriting
+    // the running turn, so the edited turn finishes without reopening. The edit
+    // also drops the original root: the next continuation owns its own lineage
+    // and carries the edited objective.
+    let edited_objective_request = serde_json::from_slice::<serde_json::Value>(&requests[6])?;
+    let edited_objective_turn_id = edited_objective_request["client_metadata"]["turn_id"]
+        .as_str()
+        .expect("edited objective continuation turn ID");
+    assert_ne!(edited_objective_turn_id, edited_turn_id);
+    responses::assert_root_turn(&edited_objective_request, Some(edited_objective_turn_id))?;
+    responses::assert_parent_turn(&edited_objective_request, /*expected*/ None)?;
+    assert!(
+        edited_objective_request
+            .to_string()
+            .contains("externally updated goal")
     );
-    responses::assert_root_turn(&reopened_request, Some(original_turn.turn.id.as_str()))?;
     let continuation_request = serde_json::from_slice::<serde_json::Value>(&requests[7])?;
     let continuation_turn_id = continuation_request["client_metadata"]["turn_id"]
         .as_str()
