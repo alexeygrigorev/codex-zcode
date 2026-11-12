@@ -66,7 +66,10 @@ impl Session {
         Ok(())
     }
 
-    /// Preserves trusted client provenance while items wait for an active turn.
+    /// Preserves trusted client provenance while items wait for a running turn.
+    ///
+    /// Without a running task, the active turn may already have drained its
+    /// pending input before emitting `TurnComplete`; record those items now.
     #[expect(
         clippy::await_holding_invalid_type,
         reason = "active turn checks and turn state updates must remain atomic"
@@ -81,7 +84,9 @@ impl Session {
             .map(|item| self.annotate_client_response_item(item))
             .collect::<Vec<_>>();
         let mut active = self.active_turn.lock().await;
-        if let Some(active_turn) = active.as_mut() {
+        if let Some(active_turn) = active.as_mut()
+            && active_turn.task.is_some()
+        {
             self.input_queue
                 .extend_pending_input_and_accept_mailbox_delivery_for_turn_state(
                     active_turn.turn_state.as_ref(),
