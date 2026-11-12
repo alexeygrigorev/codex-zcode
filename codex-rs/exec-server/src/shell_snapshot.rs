@@ -239,14 +239,21 @@ impl ShellSnapshotCache {
         let shell_start = prepared.command.len() - params.argv.len();
         // Automatic startup files run before the restoration script and could
         // reintroduce environment variables that the snapshot already filtered.
-        let (shell_flag, startup) = match shell_type {
-            ShellType::Bash => ("-pc", "set +o privileged\n"),
-            ShellType::Zsh => ("-fc", "setopt RCS\n"),
-            ShellType::Sh => ("-c", ""),
+        // Non-interactive bash still sources ~/.bashrc when it believes stdin
+        // is a remote-shell connection; the Linux network seccomp filter makes
+        // getpeername fail with EPERM, which bash reads as exactly that, so
+        // bash needs `--norc` in addition to `-p` (which skips BASH_ENV).
+        let (shell_flags, startup): (&[&str], &str) = match shell_type {
+            ShellType::Bash => (&["--norc", "-pc"], "set +o privileged\n"),
+            ShellType::Zsh => (&["-fc"], "setopt RCS\n"),
+            ShellType::Sh => (&["-c"], ""),
             ShellType::PowerShell | ShellType::Cmd => unreachable!(),
         };
-        prepared.command[shell_start + 1] = shell_flag.to_string();
-        prepared.command[shell_start + 2] = format!(
+        prepared.command.splice(
+            shell_start + 1..shell_start + 2,
+            shell_flags.iter().map(ToString::to_string),
+        );
+        prepared.command[shell_start + shell_flags.len() + 1] = format!(
             "{startup}if ! eval \"unset {state_variables}\n{state_expansion}\" >/dev/null; then printf 'failed to restore shell snapshot\\n' >&2; fi\n{}",
             params.argv[2]
         );
