@@ -69,7 +69,7 @@ jobs:
           python3 --version; cat --version | head -2; zsh --version; bwrap --version
           bwrap --unshare-all --ro-bind / / --dev /dev true; echo "bwrap rc=$?"
           sysctl kernel.apparmor_restrict_unprivileged_userns kernel.unprivileged_userns_clone
-          which rg zsh python3
+          which rg zsh python3; true
 
       - name: Use checksum-verified prebuilt rusty_v8
         uses: ./.github/actions/setup-rusty-v8
