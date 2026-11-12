@@ -129,7 +129,10 @@ jobs:
             gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good
           pkg-config --atleast-version=1.28 gstreamer-1.0 gstreamer-app-1.0 gstreamer-audio-1.0
           # The voice host's playout pipeline needs these runtime elements, not just headers.
-          gst-inspect-1.0 rtpjitterbuffer rtpopusdepay opusdec audioconvert audioresample capsfilter >/dev/null
+          # gst-inspect-1.0 only inspects its last argument, so check each element separately.
+          for element in rtpjitterbuffer rtpopusdepay opusdec audioconvert audioresample capsfilter; do
+            gst-inspect-1.0 --exists "${element}" || { echo "missing GStreamer element: ${element}" >&2; exit 1; }
+          done
 
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
         with:
