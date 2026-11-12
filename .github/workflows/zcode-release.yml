@@ -173,6 +173,21 @@ jobs:
           ln -s zcodex "$CARGO_TARGET_DIR/dev-small/codex"
           echo "CARGO_BIN_EXE_codex=$CARGO_TARGET_DIR/dev-small/zcodex" >> "$GITHUB_ENV"
 
+      # Run the previously failing PR62 tests and the unified-exec producer
+      # regressions first, so their evidence exists before the long suites.
+      # This only selects tests; the unchanged suites below still run them all.
+      - name: Test focused PR62 regressions
+        run: |
+          set -o pipefail
+          just test -p codex-core -p codex-app-server -p codex-exec-server -p codex-tui \
+            --features codex-core/bedrock --cargo-profile dev-small --build-jobs 2 --test-threads 2 \
+            -E '(binary_id(codex-core) & (test(=unified_exec::async_watcher::tests::transcript_is_exact_after_delayed_subscription_and_watcher_lag) | test(=unified_exec::process_tests::local_output_backpressures_a_stalled_consumer_without_losing_chunks)))
+              | (binary_id(codex-app-server::all) & (test(=suite::v2::command_exec::command_exec_process_ids_are_connection_scoped_and_disconnect_terminates_process) | test(=suite::v2::thread_resume::thread_goal_keeps_original_root_until_external_objective_edit) | test(=suite::v2::turn_interrupt::turn_interrupt_with_pending_steer_aborts_and_thread_stays_usable) | test(=suite::v2::turn_steer::turn_steer_and_interrupt_work_on_resumed_thread)))
+              | (binary_id(codex-exec-server::exec_process) & (test(=shell_snapshot_v2_capture_failure_falls_back_and_retries::remote_pipe_recovery) | test(=shell_snapshot_v2_capture_failure_falls_back_and_retries::remote_tty_recovery) | test(=shell_snapshot_v2_filters_profile_exports_and_stays_in_memory::remote_sandbox)))
+              | (binary_id(codex-tui) & test(/^app::tests::safety_buffering::safety_retry_(can_retry_a_first_turn_a_second_time|forks_after_the_previous_turn_and_uses_faster_settings|forks_first_turn_and_continues_without_duplicating_prompt|preserves_a_committed_steer_from_the_interrupted_turn|replays_older_interruption_notices)$/))' \
+            2>&1 | tee ci-evidence/focused-tests.log
+          cp codex-rs/target/nextest/local/junit.xml ci-evidence/focused-junit.xml
+
       - name: Test changed runtime project
         run: |
           set -o pipefail
