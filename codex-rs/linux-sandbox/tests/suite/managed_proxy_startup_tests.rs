@@ -11,7 +11,14 @@ async fn cancelled_bridge_before_inner_start_prevents_command_execution() {
     // Close the bridge endpoint before execing the inner helper. This models
     // cancellation before the helper can rearm PDEATHSIG, without a timing race.
     let script = r#"
-import json, os, socket, sys
+import ctypes, json, os, socket, sys
+# Match bwrap's capability-free inner stage, including on root test runners.
+libc = ctypes.CDLL(None, use_errno=True)
+header = (ctypes.c_uint32 * 2)(0x20080522, 0)
+capabilities = (ctypes.c_uint32 * 6)()
+if (libc.prctl(38, 1, 0, 0, 0) != 0
+        or libc.capset(ctypes.byref(header), ctypes.byref(capabilities)) != 0):
+    raise OSError(ctypes.get_errno(), 'drop inner-stage capabilities')
 control, bridge = socket.socketpair()
 bridge.close()
 os.set_inheritable(control.fileno(), True)
