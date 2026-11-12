@@ -20,21 +20,33 @@ async fn client_items_after_task_finish_are_recorded_not_queued() {
     let finished_turn = ActiveTurn::default();
     let turn_state = Arc::clone(&finished_turn.turn_state);
     *session.active_turn.lock().await = Some(finished_turn);
+    let content = vec![ContentItem::InputText {
+        text: "injected after turn completion".to_owned(),
+    }];
     let item = ResponseItem::Message {
         id: None,
         role: "user".to_owned(),
-        content: vec![ContentItem::InputText {
-            text: "injected after turn completion".to_owned(),
-        }],
+        content: content.clone(),
         phase: None,
         internal_chat_message_metadata_passthrough: None,
     };
 
     session
-        .inject_client_response_items(vec![item.clone()], &turn_context)
+        .inject_client_response_items(vec![item], &turn_context)
         .await;
 
-    assert_eq!(session.clone_history().await.into_raw_items(), vec![item]);
+    // Recording assigns an item id and turn metadata; compare the message itself.
+    let recorded = session
+        .clone_history()
+        .await
+        .into_raw_items()
+        .into_iter()
+        .map(|item| match item {
+            ResponseItem::Message { role, content, .. } => (role, content),
+            other => panic!("unexpected history item: {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(recorded, vec![("user".to_owned(), content)]);
     assert_eq!(
         session
             .input_queue
