@@ -8,11 +8,13 @@ use app_test_support::create_final_assistant_message_sse_response;
 use app_test_support::create_mock_responses_server_sequence;
 use app_test_support::create_mock_responses_server_sequence_unchecked;
 use codex_app_server_protocol::ClientRequest;
+use codex_app_server_protocol::ItemStartedNotification;
 use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::ServerRequestResolvedNotification;
+use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::TurnCompletedNotification;
@@ -402,6 +404,27 @@ async fn turn_interrupt_with_pending_steer_aborts_and_thread_stays_usable() -> R
         DEFAULT_READ_TIMEOUT,
         mcp.read_stream_until_notification_message("turn/started"),
     )
+    .await??;
+
+    // Prove the scripted `call_sleep` tool call is actually running before the
+    // steer and interrupt, so the recovery turn cannot consume its response.
+    timeout(DEFAULT_READ_TIMEOUT, async {
+        loop {
+            let notification = mcp
+                .read_stream_until_notification_message("item/started")
+                .await?;
+            let params = notification.params.expect("item/started params");
+            let item_started: ItemStartedNotification =
+                serde_json::from_value(params).expect("deserialize item/started notification");
+            if matches!(
+                item_started.item,
+                ThreadItem::CommandExecution { ref id, .. } if id == "call_sleep"
+            ) {
+                break;
+            }
+        }
+        anyhow::Ok(())
+    })
     .await??;
 
     // Accept a steer while the long tool call is still in flight; it sits in

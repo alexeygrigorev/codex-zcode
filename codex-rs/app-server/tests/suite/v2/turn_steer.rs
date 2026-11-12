@@ -721,6 +721,27 @@ async fn turn_steer_and_interrupt_work_on_resumed_thread() -> Result<()> {
     )
     .await??;
 
+    // Prove the scripted `call_sleep` tool call is actually running before the
+    // steer and interrupt, so the recovery turn cannot consume its response.
+    timeout(DEFAULT_READ_TIMEOUT, async {
+        loop {
+            let notification = mcp
+                .read_stream_until_notification_message("item/started")
+                .await?;
+            let params = notification.params.expect("item/started params");
+            let item_started: ItemStartedNotification =
+                serde_json::from_value(params).expect("deserialize item/started notification");
+            if matches!(
+                item_started.item,
+                ThreadItem::CommandExecution { ref id, .. } if id == "call_sleep"
+            ) {
+                break;
+            }
+        }
+        anyhow::Ok(())
+    })
+    .await??;
+
     let steer: TurnSteerResponse = mcp
         .request(|request_id| ClientRequest::TurnSteer {
             request_id,
