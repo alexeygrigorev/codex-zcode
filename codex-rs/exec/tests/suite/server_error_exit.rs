@@ -11,13 +11,14 @@ async fn exits_non_zero_when_server_reports_error() -> anyhow::Result<()> {
     let test = test_codex_exec();
 
     // Mock a simple Responses API SSE stream that immediately reports a
-    // `response.failed` event with an error message.
+    // `response.failed` event with a non-retryable error. Rate-limit codes are
+    // deliberately waited out with a long backoff, so they would not exit promptly.
     let server = responses::start_mock_server().await;
     let body = responses::sse(vec![serde_json::json!({
         "type": "response.failed",
         "response": {
             "id": "resp_err_1",
-            "error": {"code": "rate_limit_exceeded", "message": "synthetic server error"}
+            "error": {"code": "invalid_prompt", "message": "synthetic server error"}
         }
     })]);
     responses::mount_sse_once(&server, body).await;
