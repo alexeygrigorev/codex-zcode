@@ -28,10 +28,36 @@ runs:
       if: runner.os == 'Linux'
       shell: bash
       run: |
+        set -euo pipefail
         sudo sysctl -w kernel.unprivileged_userns_clone=1
-        if sudo sysctl -a 2>/dev/null | grep -q '^kernel.apparmor_restrict_unprivileged_userns'; then
-          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-        fi
+        # Probe only this optional key. ENOENT is absence; other stat/read errors
+        # must fail CI rather than silently skip the existing prerequisite.
+        apparmor_key_status=0
+        python3 -I -S -c '
+        import os
+        import sys
+        try:
+            os.stat("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
+        except FileNotFoundError:
+            sys.exit(3)
+        ' || apparmor_key_status=$?
+        case "$apparmor_key_status" in
+          0)
+            apparmor_value="$(sudo sysctl --values kernel.apparmor_restrict_unprivileged_userns)"
+            case "$apparmor_value" in
+              0|1) ;;
+              *) echo "Unexpected AppArmor user-namespace sysctl value" >&2; exit 1 ;;
+            esac
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+            apparmor_readback="$(sudo sysctl --values kernel.apparmor_restrict_unprivileged_userns)"
+            if [[ "$apparmor_readback" != 0 ]]; then
+              echo "AppArmor user-namespace sysctl readback mismatch" >&2
+              exit 1
+            fi
+            ;;
+          3) echo "Optional AppArmor user-namespace sysctl unavailable" ;;
+          *) exit "$apparmor_key_status" ;;
+        esac
 
     - name: Configure CI build paths
       id: configure_ci_build_paths
