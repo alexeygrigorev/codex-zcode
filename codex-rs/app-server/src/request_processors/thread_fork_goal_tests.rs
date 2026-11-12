@@ -96,7 +96,7 @@ async fn goal_paused_by_the_owned_interrupt_is_inherited_as_active() -> anyhow::
     let claim = fixture.claim(TURN_ID).await?.expect("active goal claim");
     fixture.interrupt_pause(&goal, TURN_ID).await?;
 
-    let (source, target) = fixture.inherit(claim.as_ref()).await?;
+    let (source, target) = fixture.inherit(Some(&claim)).await?;
 
     assert_eq!(ThreadGoalStatus::Paused, source.status);
     assert_eq!(
