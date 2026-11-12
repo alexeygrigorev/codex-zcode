@@ -175,7 +175,8 @@ jobs:
 
       # Run the previously failing PR62 tests and the unified-exec producer
       # regressions first, so their evidence exists before the long suites.
-      # This only selects tests; the unchanged suites below still run them all.
+      # This only selects tests. When it passes, the unchanged suites below run
+      # everything; when it fails, they are skipped and the job fails early.
       - name: Test focused PR62 regressions
         run: |
           set -o pipefail
