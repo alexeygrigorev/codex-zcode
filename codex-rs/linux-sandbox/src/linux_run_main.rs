@@ -191,16 +191,6 @@ pub fn run_main() -> ! {
     // Inner stage: apply seccomp/no_new_privs after bubblewrap has already
     // established the filesystem view.
     if apply_seccomp_then_exec {
-        // AppArmor exec transitions can clear bubblewrap's parent-death signal.
-        // Restore it before the proxy handoff or any untrusted process starts.
-        // In managed-network mode, the subsequent bridge handshake also rejects
-        // cancellation that happened before this inner helper could rearm it.
-        if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) } != 0 {
-            panic!(
-                "failed to restore sandbox parent-death signal: {}",
-                std::io::Error::last_os_error()
-            );
-        }
         if let Err(err) = crate::fd_mount::verify_fd_mounts(&verify_fd_mounts) {
             panic!("failed to verify descriptor-backed bubblewrap mount: {err}");
         }
@@ -230,6 +220,17 @@ pub fn run_main() -> ! {
         }
 
         if allow_network_for_proxy {
+            // Exec transitions can clear bubblewrap's parent-death signal. Rearm
+            // it before handing off the listener. The fresh bridge acknowledgment
+            // below also rejects a parent that died before this rearm: its bridge
+            // workers die with it and cannot acknowledge the new listener.
+            // SAFETY: prctl takes integer arguments and installs SIGKILL for this process.
+            if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) } != 0 {
+                panic!(
+                    "failed to restore sandbox parent-death signal: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
             let spec = proxy_route_spec
                 .as_deref()
                 .unwrap_or_else(|| panic!("managed proxy mode requires --proxy-route-spec"));

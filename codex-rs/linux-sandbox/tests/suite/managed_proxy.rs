@@ -36,6 +36,9 @@ use tempfile::NamedTempFile;
 use tokio::process::Command;
 use url::Url;
 
+#[path = "managed_proxy_startup_tests.rs"]
+mod startup;
+
 #[path = "managed_proxy_unix_sockets_tests.rs"]
 mod unix_sockets;
 
