@@ -863,19 +863,34 @@ impl MessageProcessor {
             .disconnect_user_verification_connection(connection_id)
             .await;
         session_state.mcp_event_streams.clear().await;
-        if timeout(
+        let drain_started_at = std::time::Instant::now();
+        tracing::debug!(
+            target: "codex_app_server::connection_lifecycle",
+            ?connection_id,
+            inflight_rpcs = session_state.rpc_gate.inflight_count(),
+            "connection RPC drain entered"
+        );
+        let drained = timeout(
             CONNECTION_RPC_DRAIN_TIMEOUT,
             session_state.rpc_gate.shutdown(),
         )
         .await
-        .is_err()
-        {
+        .is_ok();
+        if !drained {
             tracing::warn!(
                 ?connection_id,
                 timeout_seconds = CONNECTION_RPC_DRAIN_TIMEOUT.as_secs(),
                 "timed out waiting for connection RPCs to drain"
             );
         }
+        tracing::debug!(
+            target: "codex_app_server::connection_lifecycle",
+            ?connection_id,
+            drained,
+            inflight_rpcs = session_state.rpc_gate.inflight_count(),
+            elapsed_ms = drain_started_at.elapsed().as_millis(),
+            "connection RPC drain exited"
+        );
         self.outgoing.connection_closed(connection_id).await;
         self.fs_processor.connection_closed(connection_id).await;
         self.command_exec_processor

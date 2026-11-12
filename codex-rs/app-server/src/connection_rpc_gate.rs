@@ -65,8 +65,8 @@ impl ConnectionRpcGate {
         *self.accepting.lock().await
     }
 
-    #[cfg(test)]
-    fn inflight_count(&self) -> usize {
+    /// Number of started handlers that have not finished yet.
+    pub(crate) fn inflight_count(&self) -> usize {
         self.tasks.len()
     }
 }

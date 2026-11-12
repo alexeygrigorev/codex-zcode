@@ -1138,6 +1138,12 @@ pub async fn run_main_with_transport_options(
                                     continue;
                                 };
                                 let stdio_closed = connection_state.origin == ConnectionOrigin::Stdio;
+                                tracing::debug!(
+                                    target: "codex_app_server::connection_lifecycle",
+                                    ?connection_id,
+                                    inflight_rpcs = connection_state.session.rpc_gate.inflight_count(),
+                                    "connection close received"
+                                );
                                 connection_state.session.rpc_gate.close().await;
                                 let outbound_closed = outbound_control_tx
                                     .send(OutboundControlEvent::Closed { connection_id })

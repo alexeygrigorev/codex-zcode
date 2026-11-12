@@ -48,6 +48,19 @@ pub(crate) fn exit_code_from_status(status: ExitStatus) -> i32 {
     -1
 }
 
+/// Outcome of [`ProcessHandle::request_terminate`], reported for diagnostics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminateRequest {
+    /// The kill was delivered to the child.
+    Sent,
+    /// An earlier request already consumed the child's terminator.
+    AlreadyRequested,
+    /// The terminator lock was poisoned, so no kill was attempted.
+    Unavailable,
+    /// Delivering the kill failed with this error kind.
+    Failed(io::ErrorKind),
+}
+
 pub(crate) trait ChildTerminator: Send + Sync {
     fn signal(&mut self, signal: ProcessSignal) -> io::Result<()>;
 
@@ -218,11 +231,17 @@ impl ProcessHandle {
 
     /// Attempts to kill the child while leaving the reader/writer tasks alive
     /// so callers can still drain output until EOF.
-    pub fn request_terminate(&self) {
-        if let Ok(mut killer_opt) = self.killer.lock()
-            && let Some(mut killer) = killer_opt.take()
-        {
-            let _ = killer.kill();
+    /// Delivers a kill to the child once and reports what happened.
+    pub fn request_terminate(&self) -> TerminateRequest {
+        let Ok(mut killer_opt) = self.killer.lock() else {
+            return TerminateRequest::Unavailable;
+        };
+        let Some(mut killer) = killer_opt.take() else {
+            return TerminateRequest::AlreadyRequested;
+        };
+        match killer.kill() {
+            Ok(()) => TerminateRequest::Sent,
+            Err(err) => TerminateRequest::Failed(err.kind()),
         }
     }
 

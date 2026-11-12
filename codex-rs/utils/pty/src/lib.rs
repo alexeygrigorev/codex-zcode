@@ -35,6 +35,8 @@ pub use process::ProcessSignal;
 pub use process::SpawnedProcess;
 /// Terminal size in character cells used for PTY spawn and resize operations.
 pub use process::TerminalSize;
+/// Outcome of a terminate request on a spawned-process handle.
+pub use process::TerminateRequest;
 /// Combine stdout/stderr receivers into a single broadcast receiver.
 pub use process::combine_output_receivers;
 /// Adapt an externally-driven process into the standard spawned-process handle.

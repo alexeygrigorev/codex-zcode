@@ -507,7 +507,11 @@ pub(super) async fn spawn_websocket_server_with_args(
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .env("CODEX_HOME", codex_home)
-        .env("RUST_LOG", "warn");
+        // Metadata-only connection lifecycle stages for disconnect cleanup failures.
+        .env(
+            "RUST_LOG",
+            "warn,codex_app_server::connection_lifecycle=debug",
+        );
 
     let mut process = cmd
         .kill_on_drop(true)

@@ -402,16 +402,27 @@ impl CommandExecManager {
             controls
         };
 
+        let owned_sessions = controls.len();
+        let mut termination_queued = 0usize;
         for control in controls {
             if let CommandExecSession::Active { control_tx } = control {
-                let _ = control_tx
+                let queued = control_tx
                     .send(CommandControlRequest {
                         control: CommandControl::Terminate,
                         response_tx: None,
                     })
-                    .await;
+                    .await
+                    .is_ok();
+                termination_queued += usize::from(queued);
             }
         }
+        tracing::debug!(
+            target: "codex_app_server::connection_lifecycle",
+            ?connection_id,
+            owned_sessions,
+            termination_queued,
+            "command/exec termination queued for closed connection"
+        );
     }
 
     async fn send_control(
@@ -517,7 +528,13 @@ async fn run_command(params: RunCommandParams) {
                                 handle_process_resize(&session, size)
                             }
                             CommandControl::Terminate => {
-                                session.request_terminate();
+                                let outcome = session.request_terminate();
+                                tracing::debug!(
+                                    target: "codex_app_server::connection_lifecycle",
+                                    connection_id = ?request_id.connection_id,
+                                    ?outcome,
+                                    "command/exec termination dequeued"
+                                );
                                 Ok(())
                             }
                         };
@@ -527,7 +544,13 @@ async fn run_command(params: RunCommandParams) {
                     },
                     None => {
                         control_open = false;
-                        session.request_terminate();
+                        let outcome = session.request_terminate();
+                        tracing::debug!(
+                            target: "codex_app_server::connection_lifecycle",
+                            connection_id = ?request_id.connection_id,
+                            ?outcome,
+                            "command/exec control closed; termination requested"
+                        );
                     }
                 }
             }
@@ -536,6 +559,12 @@ async fn run_command(params: RunCommandParams) {
                 session.request_terminate();
             }
             exit = &mut exit_rx => {
+                tracing::debug!(
+                    target: "codex_app_server::connection_lifecycle",
+                    connection_id = ?request_id.connection_id,
+                    exit_code = ?exit.as_ref().ok(),
+                    "command/exec child exited"
+                );
                 if matches!(expiration_outcome, Some(ExecExpirationOutcome::TimedOut)) {
                     break EXEC_TIMEOUT_EXIT_CODE;
                 } else {
