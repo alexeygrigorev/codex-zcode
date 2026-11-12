@@ -384,6 +384,10 @@ pub(crate) async fn emit_exec_end_for_unified_exec(
         .await;
 }
 
+/// Emit a failed ExecCommandEnd event. A nonempty `fallback_output` is the
+/// output already returned to the model for the initial call, so the failed
+/// item must report that same text; only an empty fallback (the background
+/// watcher path) defers to the producer-owned transcript.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn emit_failed_exec_end_for_unified_exec(
     session_ref: Arc<Session>,
@@ -399,7 +403,11 @@ pub(crate) async fn emit_failed_exec_end_for_unified_exec(
     message: String,
     duration: Duration,
 ) {
-    let stdout = resolve_aggregated_output(&transcript, fallback_output).await;
+    let stdout = if fallback_output.is_empty() {
+        resolve_aggregated_output(&transcript, fallback_output).await
+    } else {
+        fallback_output
+    };
     let aggregated_output = if stdout.is_empty() {
         message.clone()
     } else {
