@@ -180,7 +180,7 @@ jobs:
           cp "$CARGO_TARGET_DIR/nextest/local/junit.xml" ci-evidence/workspace-junit.xml
 
       - name: Apply required scoped lint fixes
-        run: just fix -p codex-core --profile dev-small --jobs 2
+        run: just fix -p codex-core -p codex-linux-sandbox --profile dev-small --jobs 2
 
       - name: Apply final formatting and require an unchanged source tree
         run: |
