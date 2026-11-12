@@ -12,7 +12,7 @@ env:
 jobs:
   diag:
     name: Diag
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 240
     env:
       CARGO_INCREMENTAL: "0"
@@ -59,6 +59,12 @@ jobs:
           cargo nextest --version > ci-evidence/nextest.txt
           df -h
           free -m
+
+      - name: Try GNU coreutils
+        run: |
+          apt-cache policy coreutils-from-gnu | head -3
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y coreutils-from-gnu zsh || true
+          ls -l /usr/bin/cat; cat --version | head -1
 
       - name: Environment probes
         run: |
