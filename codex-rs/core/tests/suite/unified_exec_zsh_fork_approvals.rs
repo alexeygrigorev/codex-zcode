@@ -708,13 +708,13 @@ async fn unified_exec_zsh_fork_guardian_reviews_persistent_terminal_in_current_t
     assert!(guardian_requests[0].body_contains_text("The `cwd` field is its launch directory"));
     assert!(guardian_requests[1].body_contains_text(&outside_path.to_string_lossy()));
     let guardian_text = guardian_requests[1].message_input_texts("user").join("");
-    let permissions = guardian_text
-        .split_once("PARENT TURN PERMISSION CONTEXT START")
-        .and_then(|(_, text)| text.split_once("PARENT TURN PERMISSION CONTEXT END"))
-        .map(|(permissions, _)| permissions)
-        .context("intercepted command's Guardian permissions")?;
-    assert!(permissions.contains(test.config.cwd.to_string_lossy().as_ref()));
-    assert!(!permissions.contains(next_cwd.to_string_lossy().as_ref()));
+    // Compatible permissions have no denied paths/globs to render in this section.
+    assert!(!guardian_text.contains("PARENT TURN PERMISSION CONTEXT START"));
+    let GuardianAssessmentAction::Execve { cwd, .. } = &assessment.action else {
+        unreachable!("intercepted assessment contains an execve action");
+    };
+    let expected_cwd = test.config.cwd.canonicalize()?;
+    assert_eq!(cwd, &expected_cwd);
 
     Ok(())
 }
