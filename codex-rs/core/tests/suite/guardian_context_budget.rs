@@ -145,6 +145,19 @@ async fn review_preserves_user_instructions_until_request_budgeting(
         .iter()
         .filter(|request| request.body_json()["client_metadata"]["x-openai-subagent"] == "guardian")
         .collect::<Vec<_>>();
+    for (index, review) in reviews.iter().enumerate() {
+        let groups = review.message_input_text_groups("user");
+        eprintln!(
+            "GDIAG test window={window} review={index} thread={} user_groups={} last_has_initial={} last_has_followup={} any_has_followup={} last_len={} compact_requests={}",
+            review.body_json()["client_metadata"]["thread_id"],
+            groups.len(),
+            groups.last().is_some_and(|g| g.concat().contains(&initial)),
+            groups.last().is_some_and(|g| g.concat().contains(&followup)),
+            groups.iter().any(|g| g.concat().contains(&followup)),
+            groups.last().map_or(0, |g| g.concat().len()),
+            compact_requests.len(),
+        );
+    }
     assert_eq!(reviews.len(), compactions_per_turn.len());
     let initial_inputs = reviews[0].message_input_text_groups("user");
     let initial_context = initial_inputs.last().expect("first review input").concat();

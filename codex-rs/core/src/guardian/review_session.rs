@@ -470,6 +470,11 @@ async fn run_review_on_session(
             });
         (prompt_mode, state.last_admitted_node_repl_response_sequence)
     };
+    eprintln!(
+        "GDIAG run parent={} reviewer={} kind={guardian_session_kind:?} prior_reviews={prior_review_count} had_prior_context={had_prior_context} has_full_transcript={reviewer_has_full_transcript} mode={prompt_mode:?}",
+        params.parent_session.thread_id(),
+        review_session.session.thread_id()
+    );
     analytics_result.had_prior_review_context = Some(had_prior_review_context(&prompt_mode));
 
     let prompt_items = run_before_review_deadline(

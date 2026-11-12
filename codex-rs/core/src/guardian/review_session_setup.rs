@@ -71,6 +71,17 @@ impl PreparedGuardianContext {
             // only remaining authorization or restriction from parent history.
             key.parent_history_version = previous.reuse_key.parent_history_version;
         }
+        if let Some(previous) = previous
+            && previous.reuse_key != key
+        {
+            eprintln!(
+                "GDIAG reuse_key mismatch parent={} policy={:?}\nGDIAG OLD {:?}\nGDIAG NEW {:?}",
+                self.parent.thread_id(),
+                self.context_policy,
+                previous.reuse_key,
+                key
+            );
+        }
         key
     }
 

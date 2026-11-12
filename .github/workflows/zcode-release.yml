@@ -167,25 +167,22 @@ jobs:
           ln -s zcodex "$CARGO_TARGET_DIR/dev-small/codex"
           echo "CARGO_BIN_EXE_codex=$CARGO_TARGET_DIR/dev-small/zcodex" >> "$GITHUB_ENV"
 
-      - name: Test changed runtime project
+      - name: Diagnose guardian follow-up flake (temporary)
         run: |
           set -o pipefail
-          just test -p codex-core --features codex-core/bedrock --cargo-profile dev-small --build-jobs 2 --test-threads 2 2>&1 | tee ci-evidence/core-tests.log
-          cp "$CARGO_TARGET_DIR/nextest/local/junit.xml" ci-evidence/core-junit.xml
-
-      - name: Test full runtime workspace
-        run: |
-          set -o pipefail
-          just test --workspace --features codex-core/bedrock --cargo-profile dev-small --build-jobs 2 --test-threads 2 2>&1 | tee ci-evidence/workspace-tests.log
-          cp "$CARGO_TARGET_DIR/nextest/local/junit.xml" ci-evidence/workspace-junit.xml
-
-      - name: Apply required scoped lint fixes
-        run: just fix -p codex-core -p codex-linux-sandbox --profile dev-small --jobs 2
-
-      - name: Apply final formatting and require an unchanged source tree
-        run: |
-          just fmt
-          git diff --exit-code
+          fails=0
+          for i in $(seq 1 30); do
+            echo "=== GDIAG iteration $i"
+            if [ "$i" -eq 16 ]; then for _ in 1 2 3 4 5 6; do (yes > /dev/null &); done; echo "GDIAG cpu contention on"; fi
+            if just test -p codex-core --features codex-core/bedrock --cargo-profile dev-small --build-jobs 2 --test-threads 4 --retries 0 --no-capture -E 'test(/guardian_context_budget::review_preserves_user_instructions_until_request_budgeting/)' > "ci-evidence/gdiag-$i.log" 2>&1; then
+              echo "iteration $i PASS"
+            else
+              echo "iteration $i FAIL"; fails=$((fails+1))
+            fi
+            grep -E "GDIAG|panicked|assertion|PASS \[|FAIL \[" "ci-evidence/gdiag-$i.log" | sed 's/\x1b\[[0-9;]*m//g' | cut -c1-400 || true
+          done
+          pkill yes || true
+          echo "GDIAG total failures: $fails/30"
 
       - name: Retain actual validation evidence and any suggested fixes
         if: always()

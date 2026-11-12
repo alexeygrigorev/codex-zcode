@@ -10,7 +10,7 @@ use crate::context::GuardianContextMode;
 use crate::context_manager::ContextManager;
 use crate::session::session::Session;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ReviewContextPolicy {
     Legacy,
     LegacyWithCheckpointReuse,

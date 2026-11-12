@@ -136,6 +136,7 @@ impl<S: ReviewerSession> ReviewerPool<S> {
 
     /// Prepares the first reviewer without replacing a review that won the startup race.
     pub async fn prewarm(&self, setup: Arc<S::Setup>, context: S::Context) -> anyhow::Result<()> {
+        eprintln!("GDIAG pool: prewarm start");
         let cancellation = self.runtime.cancellation.child_token();
         let guard = cancellation.clone().drop_guard();
         let session = (self.spawn)(
@@ -147,6 +148,11 @@ impl<S: ReviewerSession> ReviewerPool<S> {
         )
         .await?;
         let mut trunk = self.trunk.lock().await;
+        eprintln!(
+            "GDIAG pool: prewarm done cancelled={} trunk_present={}",
+            cancellation.is_cancelled(),
+            trunk.is_some()
+        );
         if !cancellation.is_cancelled() && trunk.is_none() {
             *trunk = Some(Arc::new(Trunk {
                 session: Arc::new(session),
@@ -191,9 +197,15 @@ impl<S: ReviewerSession> ReviewerPool<S> {
                     && (trunk.cancellation.is_cancelled() || trunk.session.context() != &context)
                     && trunk.review_lock.try_acquire().is_ok()
                 {
+                    eprintln!(
+                        "GDIAG pool: drop trunk cancelled={} context_mismatch={}",
+                        trunk.cancellation.is_cancelled(),
+                        trunk.session.context() != &context
+                    );
                     state.take();
                 }
                 if state.is_none() {
+                    eprintln!("GDIAG pool: spawning new trunk");
                     let cancellation = self.runtime.cancellation.child_token();
                     let lifetime = cancellation.clone().drop_guard();
                     let session = match run_before_review_deadline(
@@ -240,11 +252,13 @@ impl<S: ReviewerSession> ReviewerPool<S> {
             );
         };
         if trunk.session.context() != &context {
+            eprintln!("GDIAG pool: ephemeral because trunk context mismatch (busy trunk)");
             return Box::pin(self.review_ephemeral(&request, context, /*snapshot*/ None)).await;
         }
         let guard = match trunk.review_lock.try_acquire() {
             Ok(guard) => guard,
             Err(_) => {
+                eprintln!("GDIAG pool: ephemeral because trunk busy");
                 return Box::pin(self.review_ephemeral(
                     &request,
                     context,
@@ -276,6 +290,10 @@ impl<S: ReviewerSession> ReviewerPool<S> {
             drop(review_lifetime);
         }
         drop(guard);
+        eprintln!(
+            "GDIAG pool: review done disposition={disposition:?} completed={}",
+            matches!(outcome, GuardianReviewSessionOutcome::Completed(_))
+        );
         if disposition == SessionDisposition::Discard {
             let mut state = self.trunk.lock().await;
             if state
