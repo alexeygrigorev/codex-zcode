@@ -63,7 +63,8 @@ jobs:
       - name: Try GNU coreutils
         run: |
           apt-cache policy coreutils-from-gnu | head -3
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y coreutils-from-gnu zsh || true
+          sudo apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y coreutils-from-gnu coreutils-from-uutils- zsh || true
           ls -l /usr/bin/cat; cat --version | head -1
 
       - name: Environment probes
