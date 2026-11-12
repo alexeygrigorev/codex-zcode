@@ -77,6 +77,15 @@ jobs:
           bwrap --unshare-all --ro-bind / / --dev /dev true; echo "bwrap rc=$?"
           sysctl kernel.apparmor_restrict_unprivileged_userns kernel.unprivileged_userns_clone
           which rg zsh python3; true
+          bwrap --new-session --die-with-parent --unshare-user --unshare-pid --as-pid-1 \
+            --ro-bind / / --dev /dev --proc /proc -- /usr/bin/python3 -c '
+          import ctypes
+          from pathlib import Path
+          signal = ctypes.c_int()
+          result = ctypes.CDLL(None).prctl(2, ctypes.byref(signal), 0, 0, 0)
+          print("inner parent-death signal:", signal.value, "prctl result:", result)
+          print("inner AppArmor label:", Path("/proc/self/attr/current").read_text().strip())
+          '
 
       - name: Use checksum-verified prebuilt rusty_v8
         uses: ./.github/actions/setup-rusty-v8
@@ -95,7 +104,7 @@ jobs:
       - name: Diagnose failing tests
         run: |
           set -o pipefail
-          just test -p codex-core --features codex-core/bedrock --cargo-profile dev-small --build-jobs 2 --test-threads 2 --no-capture -E 'test(/zsh_fork/) | test(/network_rejection_preserves/) | test(/async_hook_finishing_while_idle/) | test(/snapshot_discovers_and_redacts/)' 2>&1 | tee ci-evidence/diag.log | tail -c 400000
+          just test -p codex-core --features codex-core/bedrock --cargo-profile dev-small --build-jobs 2 --test-threads 2 --no-capture -E 'test(/zsh_fork/) | test(/network_rejection_preserves/) | test(/async_hook_finishing_while_idle/) | test(/snapshot_discovers_and_redacts/) | test(/snapshot_hostless_credentials/)' 2>&1 | tee ci-evidence/diag.log | tail -c 400000
 
       - uses: actions/upload-artifact@v4
         if: always()
