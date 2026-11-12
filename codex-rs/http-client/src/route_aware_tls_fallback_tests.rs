@@ -22,16 +22,15 @@ use super::Method;
 use super::OutboundProxyPolicy;
 use super::OutboundProxyRoute;
 use super::RouteAwareClientPool;
-use super::RouteAwareRequestError;
+use super::RouteFailureClass;
 use super::SelectedTlsBackend;
-use crate::tls_backend_fallback::should_retry_with_rustls;
 
 const PROTOCOL_VERSION_TLS_ALERT: &[u8] = &[21, 3, 3, 0, 2, 2, 70];
 
 type SuccessfulTlsFallbackServer = (String, HttpClient, mpsc::Receiver<io::Result<Vec<String>>>);
 
 #[tokio::test]
-async fn default_pool_does_not_retry_a_native_tls_protocol_failure() {
+async fn default_pool_does_not_retry_a_tls_protocol_failure() {
     let (url, attempts, stop_server) =
         spawn_protocol_version_rejection_server(/*maximum_attempts*/ 2)
             .expect("TLS rejection server should start");
@@ -47,7 +46,7 @@ async fn default_pool_does_not_retry_a_native_tls_protocol_failure() {
     let error = pool
         .send_with_resolver(request, |_| async { Ok(OutboundProxyRoute::Direct) })
         .await
-        .expect_err("ordinary traffic should preserve the native TLS failure");
+        .expect_err("ordinary traffic should preserve the TLS failure");
 
     let _ = stop_server.send(());
     assert!(error.is_connect());
@@ -61,7 +60,7 @@ async fn default_pool_does_not_retry_a_native_tls_protocol_failure() {
 }
 
 #[tokio::test]
-async fn retries_a_native_tls_protocol_failure_once_with_rustls() {
+async fn rustls_protocol_failure_is_typed_and_not_replayed() {
     let (url, attempts, stop_server) =
         spawn_protocol_version_rejection_server(/*maximum_attempts*/ 2)
             .expect("TLS rejection server should start");
@@ -77,17 +76,20 @@ async fn retries_a_native_tls_protocol_failure_once_with_rustls() {
     let error = pool
         .send_with_resolver(request, |_| async { Ok(OutboundProxyRoute::Direct) })
         .await
-        .expect_err("both TLS handshakes should be rejected");
+        .expect_err("the TLS handshake should be rejected");
 
     let _ = stop_server.send(());
     assert!(error.is_connect());
+    // The transport default is already rustls in this build, so there is no other backend to
+    // fall back to: the protocol failure is surfaced once, typed, and never replayed.
+    assert_eq!(error.failure_class(), Some(RouteFailureClass::TlsError));
     assert_eq!(
         attempts
             .recv()
             .expect("TLS server should finish")
-            .expect("TLS server should reject both connections"),
-        2,
-        "native TLS protocol failure should retry with rustls: {error:?}"
+            .expect("TLS server should reject one connection"),
+        1,
+        "a rustls protocol failure must not be replayed: {error:?}"
     );
     let rustls_clients = pool.rustls_clients.as_ref().expect("TLS fallback cache");
     assert_eq!(
@@ -102,7 +104,7 @@ async fn retries_a_native_tls_protocol_failure_once_with_rustls() {
 }
 
 #[tokio::test]
-async fn retries_a_native_tls_failure_after_another_request_caches_rustls() {
+async fn concurrent_cache_update_does_not_make_a_rustls_request_retry_itself() {
     let (url, attempts, stop_server) =
         spawn_protocol_version_rejection_server(/*maximum_attempts*/ 2)
             .expect("TLS rejection server should start");
@@ -112,20 +114,20 @@ async fn retries_a_native_tls_failure_after_another_request_caches_rustls() {
     )
     .with_tls_backend_fallback();
     let destination = reqwest::Url::parse(&url).expect("valid HTTPS URL");
-    let (route, native_client, selected_tls_backend) = pool
+    let (route, default_client, selected_tls_backend) = pool
         .client_for_url_with_resolver(destination.as_str(), |_| async {
             Ok(OutboundProxyRoute::Direct)
         })
         .await
-        .expect("native TLS client should resolve");
+        .expect("transport-default client should resolve");
     assert_eq!(selected_tls_backend, SelectedTlsBackend::TransportDefault);
 
     let request = reqwest::Request::new(Method::POST, destination.clone());
     let replay = request.try_clone().expect("request should be replayable");
-    let error = native_client
+    let error = default_client
         .execute_without_request_logging(request)
         .await
-        .expect_err("native TLS handshake should fail");
+        .expect_err("TLS handshake should fail");
     let rustls_client = pool
         .rustls_client_for_route(&route)
         .expect("rustls fallback client should build");
@@ -144,7 +146,7 @@ async fn retries_a_native_tls_failure_after_another_request_caches_rustls() {
             /*timeout_deadline*/ None,
         )
         .await
-        .expect_err("both TLS handshakes should be rejected");
+        .expect_err("the TLS handshake should stay rejected");
 
     let _ = stop_server.send(());
     assert!(error.is_connect());
@@ -152,9 +154,9 @@ async fn retries_a_native_tls_failure_after_another_request_caches_rustls() {
         attempts
             .recv()
             .expect("TLS server should finish")
-            .expect("TLS server should reject both connections"),
-        2,
-        "an in-flight native TLS failure should retry despite a concurrent cache update"
+            .expect("TLS server should reject one connection"),
+        1,
+        "a concurrent cache update must not make a rustls request retry itself"
     );
 }
 
@@ -196,71 +198,61 @@ async fn does_not_retry_a_cached_rustls_tls_protocol_failure() {
 }
 
 #[tokio::test]
-async fn successful_rustls_fallback_replays_the_request_and_reuses_the_destination() {
+async fn protocol_failure_is_not_replayed_and_later_requests_reuse_the_trusted_destination() {
     let (url, trusted_rustls_client, observed_requests) =
-        spawn_successful_tls_fallback_server().expect("TLS fallback server should start");
+        spawn_successful_tls_fallback_server().expect("TLS server should start");
     let pool = RouteAwareClientPool::new(
         HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
         ClientRouteClass::Other,
     )
     .with_tls_backend_fallback();
     let destination = reqwest::Url::parse(&url).expect("valid HTTPS URL");
-    let existing_destination =
-        reqwest::Url::parse("https://another-mcp.example.com/mcp").expect("valid HTTPS URL");
     let rustls_clients = pool.rustls_clients.as_ref().expect("TLS fallback cache");
-
-    // Another destination may already have established a trusted rustls client on this route.
-    // The test destination must still attempt native TLS before reusing that route-level client.
     rustls_clients.remember(
-        &existing_destination,
+        &destination,
         &OutboundProxyRoute::Direct,
         trusted_rustls_client,
     );
-    assert!(!rustls_clients.requires_rustls(&destination, &OutboundProxyRoute::Direct));
+    assert!(rustls_clients.requires_rustls(&destination, &OutboundProxyRoute::Direct));
 
-    let mut initialize_request = reqwest::Request::new(Method::POST, destination.clone());
-    *initialize_request.body_mut() = Some(Bytes::from_static(b"mcp-initialize").into());
-    let initialize_response = pool
-        .send_with_resolver(initialize_request, |_| async {
+    // The server answers its first connection with a protocol-version alert.
+    let mut rejected_request = reqwest::Request::new(Method::POST, destination.clone());
+    *rejected_request.body_mut() = Some(Bytes::from_static(b"mcp-rejected").into());
+    let error = pool
+        .send_with_resolver(rejected_request, |_| async {
             Ok(OutboundProxyRoute::Direct)
         })
         .await
-        .expect("native TLS protocol failure should recover with rustls");
+        .expect_err("the protocol failure should be surfaced, not replayed");
+    assert_eq!(error.failure_class(), Some(RouteFailureClass::TlsError));
 
-    assert_eq!(
-        initialize_response
-            .text()
+    for body in [&b"mcp-initialize"[..], &b"mcp-tool-call"[..]] {
+        let mut request = reqwest::Request::new(Method::POST, destination.clone());
+        *request.body_mut() = Some(Bytes::copy_from_slice(body).into());
+        let response = pool
+            .send_with_resolver(request, |_| async { Ok(OutboundProxyRoute::Direct) })
             .await
-            .expect("fallback response body should be readable"),
-        "ok"
-    );
+            .expect("explicit requests should use the trusted rustls client");
+        assert_eq!(
+            response
+                .text()
+                .await
+                .expect("response body should be readable"),
+            "ok"
+        );
+    }
     assert!(rustls_clients.requires_rustls(&destination, &OutboundProxyRoute::Direct));
-
-    let mut tool_request = reqwest::Request::new(Method::POST, destination);
-    *tool_request.body_mut() = Some(Bytes::from_static(b"mcp-tool-call").into());
-    let tool_response = pool
-        .send_with_resolver(tool_request, |_| async { Ok(OutboundProxyRoute::Direct) })
-        .await
-        .expect("remembered destination should reuse rustls without another native TLS attempt");
-
-    assert_eq!(
-        tool_response
-            .text()
-            .await
-            .expect("cached rustls response body should be readable"),
-        "ok"
-    );
     assert_eq!(
         observed_requests
             .recv_timeout(Duration::from_secs(5))
-            .expect("TLS fallback server should finish")
-            .expect("TLS fallback server should capture both requests"),
+            .expect("TLS server should finish")
+            .expect("TLS server should capture both explicit requests"),
         vec!["mcp-initialize".to_string(), "mcp-tool-call".to_string()]
     );
 }
 
 #[tokio::test]
-async fn retries_a_tls_protocol_failure_when_request_url_contains_certificate_markers() {
+async fn certificate_markers_in_the_request_url_do_not_change_tls_classification() {
     let (url, attempts, stop_server) =
         spawn_protocol_version_rejection_server(/*maximum_attempts*/ 2)
             .expect("TLS rejection server should start");
@@ -276,17 +268,18 @@ async fn retries_a_tls_protocol_failure_when_request_url_contains_certificate_ma
     let error = pool
         .send_with_resolver(request, |_| async { Ok(OutboundProxyRoute::Direct) })
         .await
-        .expect_err("both TLS handshakes should be rejected");
+        .expect_err("the TLS handshake should be rejected");
 
     let _ = stop_server.send(());
     assert!(error.is_connect());
+    assert_eq!(error.failure_class(), Some(RouteFailureClass::TlsError));
     assert_eq!(
         attempts
             .recv()
             .expect("TLS server should finish")
-            .expect("TLS server should reject both connections"),
-        2,
-        "request URL text should not prevent TLS backend fallback: {error:?}"
+            .expect("TLS server should reject one connection"),
+        1,
+        "request URL text must not cause a replay: {error:?}"
     );
 }
 
@@ -310,21 +303,16 @@ async fn does_not_retry_a_non_replayable_streaming_request() {
     >(
         Bytes::from_static(b"streaming body"),
     )])));
+    assert!(request.try_clone().is_none());
 
     let error = pool
         .send_with_resolver(request, |_| async { Ok(OutboundProxyRoute::Direct) })
         .await
-        .expect_err("non-replayable request should preserve the native TLS failure");
+        .expect_err("non-replayable request should preserve the TLS failure");
 
     let _ = stop_server.send(());
     assert!(error.is_connect());
-    let RouteAwareRequestError::Request(ref request_error) = error else {
-        panic!("expected native TLS request error, got {error:?}");
-    };
-    assert!(
-        should_retry_with_rustls(request_error),
-        "native TLS protocol failure should be retryable: {request_error:?}"
-    );
+    assert_eq!(error.failure_class(), Some(RouteFailureClass::TlsError));
     assert_eq!(
         attempts
             .recv()
@@ -392,7 +380,7 @@ fn spawn_successful_tls_fallback_server() -> io::Result<SuccessfulTlsFallbackSer
                     if stream.read(&mut client_hello)? == 0 {
                         return Err(io::Error::new(
                             io::ErrorKind::UnexpectedEof,
-                            "native TLS peer closed before sending a ClientHello",
+                            "TLS peer closed before sending a ClientHello",
                         ));
                     }
                     stream.write_all(PROTOCOL_VERSION_TLS_ALERT)?;
