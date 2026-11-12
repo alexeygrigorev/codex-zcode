@@ -3,11 +3,14 @@ use std::sync::Arc;
 use super::Buffer;
 use super::Emitter;
 use super::TRAILING_OUTPUT_GRACE;
+use super::resolve_aggregated_output;
 use super::spawn_exit_watcher;
 use super::start_streaming_output;
 use super::utf8_boundary;
 use crate::session::tests::make_session_and_context_with_rx;
+use crate::unified_exec::UNIFIED_EXEC_OUTPUT_MAX_BYTES;
 use crate::unified_exec::UnifiedExecContext;
+use crate::unified_exec::format_output_omission_marker;
 use crate::unified_exec::head_tail_buffer::HeadTailBuffer;
 use crate::unified_exec::process::NoopSpawnLifecycle;
 use crate::unified_exec::process::UnifiedExecProcess;
@@ -32,7 +35,9 @@ struct StreamingOutputHarness {
     rx_event: async_channel::Receiver<Event>,
 }
 
-async fn streaming_output_harness() -> anyhow::Result<StreamingOutputHarness> {
+/// Spawn the process and its output producer without starting the live-delta
+/// watcher, so a test can control when the watcher subscribes.
+async fn unstarted_output_harness() -> anyhow::Result<StreamingOutputHarness> {
     let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
     let (stdout_tx, stdout_rx) = tokio::sync::broadcast::channel::<Vec<u8>>(8);
     let (exit_tx, exit_rx) = tokio::sync::oneshot::channel::<i32>();
@@ -58,8 +63,7 @@ async fn streaming_output_harness() -> anyhow::Result<StreamingOutputHarness> {
         tokio_util::sync::CancellationToken::new(),
         "streaming-output-test".to_string(),
     );
-    let transcript = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::default()));
-    start_streaming_output(&process, &context, Arc::clone(&transcript));
+    let transcript = process.transcript();
 
     Ok(StreamingOutputHarness {
         process,
@@ -69,6 +73,12 @@ async fn streaming_output_harness() -> anyhow::Result<StreamingOutputHarness> {
         context,
         rx_event,
     })
+}
+
+async fn streaming_output_harness() -> anyhow::Result<StreamingOutputHarness> {
+    let harness = unstarted_output_harness().await?;
+    start_streaming_output(&harness.process, &harness.context);
+    Ok(harness)
 }
 
 #[tokio::test]
@@ -311,12 +321,10 @@ fn utf8_boundary_batches_malformed_output() {
 }
 
 #[tokio::test]
-async fn streaming_output_bounds_invalid_bytes_and_keeps_the_full_transcript() {
+async fn streaming_output_bounds_invalid_bytes_in_deltas() {
     let (session, turn, rx_event) = make_session_and_context_with_rx().await;
-    let transcript = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::default()));
     let mut output = Buffer::<8> {
         pending: Vec::new(),
-        transcript: Arc::clone(&transcript),
         emitter: Emitter {
             remaining_deltas: 2,
             session,
@@ -345,11 +353,148 @@ async fn streaming_output_bounds_invalid_bytes_and_keeps_the_full_transcript() {
             b"\xf0\x9f\x98\x80\xff\xff\xff".to_vec(),
         ]
     );
+}
 
-    let mut expected_transcript = bytes.to_vec();
-    expected_transcript.extend([0xfe, 0xfe]);
-    assert_eq!(
-        transcript.lock().await.to_bytes_with_omission_marker(),
-        expected_transcript
+/// The live-delta watcher subscribes only after more than a broadcast
+/// channel's worth of chunks and later falls behind again. Both lags must cost
+/// only live deltas: the aggregated transcript keeps the exact head, tail and
+/// omission count, with no duplicated bytes.
+#[test]
+fn transcript_is_exact_after_delayed_subscription_and_watcher_lag() -> anyhow::Result<()> {
+    // Capacity of the process output broadcast channel.
+    const BROADCAST_CAPACITY: usize = 64;
+    // More chunks than the broadcast channel holds, published per phase.
+    const CHUNKS_PER_PHASE: usize = 100;
+    // Eight-byte records, so every chunk is distinct ASCII and fits one delta.
+    const RECORDS_PER_CHUNK: usize = 1024;
+    const CHUNK_BYTES: usize = RECORDS_PER_CHUNK * 8;
+
+    // The producer side runs on worker threads that always make progress. The
+    // watcher runs on a runtime that advances only while this test drives it,
+    // so its lag is forced rather than raced.
+    let producer_rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?;
+    let watcher_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+
+    let chunks: Vec<Vec<u8>> = (0..2 * CHUNKS_PER_PHASE)
+        .map(|index| {
+            format!("{index:07}\n")
+                .repeat(RECORDS_PER_CHUNK)
+                .into_bytes()
+        })
+        .collect();
+    let StreamingOutputHarness {
+        process,
+        stdout_tx,
+        exit_tx,
+        transcript,
+        context,
+        rx_event,
+    } = producer_rt.block_on(unstarted_output_harness())?;
+    let output = process.output_handles().clone();
+    // Publish one chunk at a time and wait until the producer has recorded it,
+    // so the producer itself never lags its input.
+    let publish = |batch: &[Vec<u8>]| {
+        producer_rt.block_on(async {
+            for chunk in batch {
+                let published = output.output_notify.notified();
+                tokio::pin!(published);
+                published.as_mut().enable();
+                stdout_tx.send(chunk.clone())?;
+                published.await;
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+    };
+
+    // Delayed subscription: the first phase is published before the watcher
+    // exists, overflowing the receiver retained for it.
+    publish(&chunks[..CHUNKS_PER_PHASE])?;
+    {
+        let _watcher_runtime = watcher_rt.enter();
+        start_streaming_output(&process, &context);
+    }
+    let mut deltas = Vec::new();
+    watcher_rt.block_on(async {
+        while deltas.len() < BROADCAST_CAPACITY {
+            if let EventMsg::ExecCommandOutputDelta(delta) = rx_event.recv().await?.msg {
+                deltas.push(delta.chunk);
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    })?;
+
+    // Subsequent lag: the caught-up watcher is not driven while the second
+    // phase overflows the channel again.
+    publish(&chunks[CHUNKS_PER_PHASE..])?;
+    drop(stdout_tx);
+    exit_tx
+        .send(0)
+        .map_err(|_| anyhow::anyhow!("exit receiver dropped"))?;
+    producer_rt.block_on(async {
+        output.cancellation_token.cancelled().await;
+        loop {
+            let closed = output.output_closed_notify.notified();
+            tokio::pin!(closed);
+            closed.as_mut().enable();
+            if output
+                .output_closed
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                break;
+            }
+            closed.await;
+        }
+    });
+    let output_drained = process.output_drained_notify();
+    watcher_rt.block_on(output_drained.notified());
+    while let Ok(event) = rx_event.try_recv() {
+        if let EventMsg::ExecCommandOutputDelta(delta) = event.msg {
+            deltas.push(delta.chunk);
+        }
+    }
+
+    // Both lags really happened: the watcher saw only what each overflowed
+    // channel still held.
+    let delta_indices: Vec<Option<usize>> = deltas
+        .iter()
+        .map(|delta| chunks.iter().position(|chunk| chunk == delta))
+        .collect();
+    let expected_indices: Vec<Option<usize>> = (CHUNKS_PER_PHASE - BROADCAST_CAPACITY
+        ..CHUNKS_PER_PHASE)
+        .chain(2 * CHUNKS_PER_PHASE - BROADCAST_CAPACITY..2 * CHUNKS_PER_PHASE)
+        .map(Some)
+        .collect();
+    assert_eq!(delta_indices, expected_indices);
+
+    let mut expected_transcript = HeadTailBuffer::default();
+    for chunk in &chunks {
+        expected_transcript.push_chunk(chunk);
+    }
+    // One mebibyte keeps 64 head and 64 tail chunks; the middle 72 are omitted.
+    let head_chunks = UNIFIED_EXEC_OUTPUT_MAX_BYTES / 2 / CHUNK_BYTES;
+    let tail_start = chunks.len() - head_chunks;
+    let expected_output = format!(
+        "{}\n{}\n{}",
+        String::from_utf8(chunks[..head_chunks].concat())?,
+        format_output_omission_marker((tail_start - head_chunks) * CHUNK_BYTES),
+        String::from_utf8(chunks[tail_start..].concat())?,
     );
+    producer_rt.block_on(async {
+        assert_eq!(*transcript.lock().await, expected_transcript);
+        // The complete transcript wins over a partial independently collected
+        // fallback.
+        assert_eq!(
+            resolve_aggregated_output(&transcript, "partial fallback".to_string()).await,
+            expected_output
+        );
+    });
+
+    let _producer_runtime = producer_rt.enter();
+    drop((process, context, rx_event, transcript));
+    Ok(())
 }

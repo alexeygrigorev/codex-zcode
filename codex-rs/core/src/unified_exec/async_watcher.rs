@@ -50,18 +50,18 @@ struct Emitter {
 
 struct Buffer<const MAX_BYTES: usize = UNIFIED_EXEC_OUTPUT_DELTA_MAX_BYTES> {
     pending: Vec<u8>,
-    transcript: Arc<Mutex<HeadTailBuffer>>,
     emitter: Emitter,
 }
 
-/// Spawn a background task that continuously reads from the PTY, appends to the
-/// shared transcript, and emits ExecCommandOutputDelta events on UTF‑8
-/// boundaries.
-pub(crate) fn start_streaming_output(
-    process: &UnifiedExecProcess,
-    context: &UnifiedExecContext,
-    transcript: Arc<Mutex<HeadTailBuffer>>,
-) {
+/// Spawn a background task that follows the process output broadcast and emits
+/// ExecCommandOutputDelta events on UTF‑8 boundaries.
+///
+/// The deltas are a bounded, best-effort live view: if this task falls behind
+/// the broadcast channel it skips the chunks it missed. The aggregated
+/// transcript is owned by the output producer (see
+/// `UnifiedExecProcess::transcript`), so lag here never loses or duplicates
+/// transcript bytes.
+pub(crate) fn start_streaming_output(process: &UnifiedExecProcess, context: &UnifiedExecContext) {
     let mut receiver = process.output_receiver();
     let output_drained = process.output_drained_notify();
     let exit_token = process.cancellation_token();
@@ -83,7 +83,6 @@ pub(crate) fn start_streaming_output(
 
         let mut output: Buffer = Buffer {
             pending: Vec::new(),
-            transcript,
             emitter,
         };
 
@@ -122,6 +121,8 @@ pub(crate) fn start_streaming_output(
                 received = receiver.recv() => {
                     let chunk = match received {
                         Ok(chunk) => chunk,
+                        // Missed live deltas only; the producer-owned
+                        // transcript still holds these bytes.
                         Err(RecvError::Lagged(_)) => {
                             continue;
                         },
@@ -256,13 +257,7 @@ impl<const MAX_BYTES: usize> Buffer<MAX_BYTES> {
                 "a frame must fit one UTF-8 scalar"
             )
         };
-        let Self {
-            pending,
-            transcript,
-            emitter,
-        } = self;
-
-        transcript.lock().await.push_chunk(&bytes);
+        let Self { pending, emitter } = self;
 
         // Reuse a producer chunk when it fits, retaining only an incomplete
         // UTF-8 suffix for the next push.
@@ -297,7 +292,6 @@ impl<const MAX_BYTES: usize> Buffer<MAX_BYTES> {
     async fn finish(self) {
         let Self {
             pending,
-            transcript: _,
             mut emitter,
         } = self;
         debug_assert!(
@@ -337,9 +331,9 @@ impl Emitter {
     }
 }
 
-/// Emit an ExecCommandEnd event for a unified exec session, using the transcript
-/// as the primary source of aggregated_output and falling back to the provided
-/// text when the transcript is empty.
+/// Emit an ExecCommandEnd event for a unified exec session, using the
+/// producer-owned transcript as the source of aggregated_output and falling
+/// back to the provided text only when the transcript observed no output.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn emit_exec_end_for_unified_exec(
     session_ref: Arc<Session>,
@@ -405,11 +399,7 @@ pub(crate) async fn emit_failed_exec_end_for_unified_exec(
     message: String,
     duration: Duration,
 ) {
-    let stdout = if fallback_output.is_empty() {
-        resolve_aggregated_output(&transcript, fallback_output).await
-    } else {
-        fallback_output
-    };
+    let stdout = resolve_aggregated_output(&transcript, fallback_output).await;
     let aggregated_output = if stdout.is_empty() {
         message.clone()
     } else {
@@ -465,12 +455,15 @@ fn utf8_boundary(bytes: &[u8]) -> usize {
     bytes.len()
 }
 
+/// The producer appends every published chunk to the transcript before any
+/// poll can collect it, so a nonempty transcript is always a superset of the
+/// independently collected fallback and carries the true omission count.
 async fn resolve_aggregated_output(
     transcript: &Arc<Mutex<HeadTailBuffer>>,
     fallback: String,
 ) -> String {
     let guard = transcript.lock().await;
-    if guard.retained_bytes() == 0 {
+    if guard.total_bytes() == 0 {
         return fallback;
     }
 
