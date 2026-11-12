@@ -486,9 +486,21 @@ async fn shell_snapshot_v2_capture_failure_falls_back_and_retries(
         "zsh" => ("/bin/zsh", ".zshrc"),
         name => anyhow::bail!("unsupported test shell {name}"),
     };
+    // Diagnostic trace owned by this fixture: each profile run appends one
+    // fixed-label line saying which profile ran, whether the shell was
+    // interactive (snapshot capture) and whether snapshot restore state was
+    // present (restored command). It records no commands or environment values.
+    let profile_trace = |profile: &str| {
+        format!(
+            "case $- in *i*) printf '{profile} interactive=1 restore=%d\\n' \"${{__CODEX_SHELL_SNAPSHOT_STATE_0+1}}\";; *) printf '{profile} interactive=0 restore=%d\\n' \"${{__CODEX_SHELL_SNAPSHOT_STATE_0+1}}\";; esac >> \"$HOME/snapshot-trace\" 2>/dev/null\n"
+        )
+    };
     std::fs::write(
         home.path().join(profile_name),
-        "printf x >> \"$HOME/captures\"\nexit 7\n",
+        format!(
+            "{}printf x >> \"$HOME/captures\"\nexit 7\n",
+            profile_trace("failing-profile")
+        ),
     )?;
     let policy = ExecEnvPolicy {
         inherit: ShellEnvironmentPolicyInherit::All,
@@ -551,13 +563,17 @@ async fn shell_snapshot_v2_capture_failure_falls_back_and_retries(
 
     std::fs::write(
         home.path().join(profile_name),
-        "printf x >> \"$HOME/captures\"\nprofile_helper() { printf recovered; }\n",
+        format!(
+            "{}printf x >> \"$HOME/captures\"\nprofile_helper() {{ printf recovered; }}\n",
+            profile_trace("repaired-profile")
+        ),
     )?;
     let (expected_output, expected_captures) = if failures_before_repair == 3 {
         ("original", "xxx")
     } else {
         ("recovered", "xx")
     };
+    let mut captures_after_repaired_starts = Vec::new();
     for attempt in 0..2 {
         params.process_id = ProcessId::from(format!("snapshot-after-repair-{attempt}"));
         let started = context.backend.start(params.clone()).await?;
@@ -565,10 +581,15 @@ async fn shell_snapshot_v2_capture_failure_falls_back_and_retries(
             collect_process_output_from_events(started.process).await?,
             (expected_output.to_string(), String::new(), Some(0), true)
         );
+        captures_after_repaired_starts
+            .push(std::fs::read_to_string(home.path().join("captures"))?.len());
     }
+    let snapshot_trace =
+        std::fs::read_to_string(home.path().join("snapshot-trace")).unwrap_or_default();
     assert_eq!(
         std::fs::read_to_string(home.path().join("captures"))?,
-        expected_captures
+        expected_captures,
+        "captures after each repaired start: {captures_after_repaired_starts:?}; profile runs:\n{snapshot_trace}"
     );
     Ok(())
 }
