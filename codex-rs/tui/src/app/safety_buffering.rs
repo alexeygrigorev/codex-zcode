@@ -92,15 +92,6 @@ impl App {
             )
         });
 
-        // Interrupting the source turn pauses an active goal, but this interrupt
-        // only replays the turn on a faster model in a fork that inherits the goal.
-        let keep_goal_active = app_server
-            .thread_goal_get(thread_id)
-            .await
-            .ok()
-            .and_then(|response| response.goal)
-            .is_some_and(|goal| goal.status == codex_app_server_protocol::ThreadGoalStatus::Active);
-
         if let Err(err) = app_server.turn_interrupt(thread_id, turn_id.clone()).await {
             self.chat_widget
                 .add_error_message(format!("Failed to retry with a faster model: {err}"));
@@ -208,21 +199,6 @@ impl App {
             }
         };
         let retry_thread_id = started.session.thread_id;
-        // The fork defers goal continuation until the retried turn, so keeping its
-        // inherited goal active resumes the goal after that turn instead of leaving
-        // it paused by the source interrupt.
-        if keep_goal_active
-            && let Err(err) = app_server
-                .thread_goal_set(
-                    retry_thread_id,
-                    /*objective*/ None,
-                    Some(codex_app_server_protocol::ThreadGoalStatus::Active),
-                    /*token_budget*/ None,
-                )
-                .await
-        {
-            tracing::warn!("failed to keep the inherited goal active for a safety retry: {err}");
-        }
 
         self.shutdown_current_thread(app_server).await;
         if let Err(err) = self
