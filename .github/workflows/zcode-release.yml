@@ -171,13 +171,13 @@ jobs:
         run: |
           set -o pipefail
           just test -p codex-core --features codex-core/bedrock --cargo-profile dev-small --build-jobs 2 --test-threads 2 2>&1 | tee ci-evidence/core-tests.log
-          cp "$CARGO_TARGET_DIR/nextest/local/junit.xml" ci-evidence/core-junit.xml
+          cp codex-rs/target/nextest/local/junit.xml ci-evidence/core-junit.xml
 
       - name: Test full runtime workspace
         run: |
           set -o pipefail
           just test --workspace --features codex-core/bedrock --cargo-profile dev-small --build-jobs 2 --test-threads 2 2>&1 | tee ci-evidence/workspace-tests.log
-          cp "$CARGO_TARGET_DIR/nextest/local/junit.xml" ci-evidence/workspace-junit.xml
+          cp codex-rs/target/nextest/local/junit.xml ci-evidence/workspace-junit.xml
 
       - name: Apply required scoped lint fixes
         run: just fix -p codex-core -p codex-linux-sandbox --profile dev-small --jobs 2
@@ -192,8 +192,8 @@ jobs:
         run: |
           mkdir -p ci-evidence
           git diff --binary > ci-evidence/suggested-fixes.patch
-          if [[ -f "$CARGO_TARGET_DIR/nextest/local/junit.xml" ]]; then
-            cp "$CARGO_TARGET_DIR/nextest/local/junit.xml" ci-evidence/latest-junit.xml
+          if [[ -f codex-rs/target/nextest/local/junit.xml ]]; then
+            cp codex-rs/target/nextest/local/junit.xml ci-evidence/latest-junit.xml
           fi
 
       - uses: actions/upload-artifact@v4
