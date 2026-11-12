@@ -64,7 +64,7 @@ jobs:
         run: |
           apt-cache policy coreutils-from-gnu | head -3
           sudo apt-get update -y
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-remove-essential coreutils-from-gnu coreutils-from-uutils- zsh build-essential
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-remove-essential coreutils-from-gnu coreutils-from-uutils- zsh build-essential-
           ls -l /usr/bin/cat; cat --version | head -1
 
       - name: Environment probes
