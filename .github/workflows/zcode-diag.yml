@@ -12,7 +12,7 @@ env:
 jobs:
   diag:
     name: Diag
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 240
     env:
       CARGO_INCREMENTAL: "0"
