@@ -91,6 +91,10 @@ enum ProcessHandle {
 pub(crate) struct UnifiedExecProcess {
     process_handle: ProcessHandle,
     output_tx: broadcast::Sender<Vec<u8>>,
+    /// Receiver created together with the channel so chunks produced before the
+    /// streaming watcher subscribes are retained instead of dropped; the first
+    /// `output_receiver` call takes it.
+    initial_output_rx: std::sync::Mutex<Option<broadcast::Receiver<Vec<u8>>>>,
     output: OutputHandles,
     output_drained: Arc<Notify>,
     interaction_lock: Arc<Mutex<()>>,
@@ -128,12 +132,13 @@ impl UnifiedExecProcess {
             cancellation_token: CancellationToken::new(),
         };
         let output_drained = Arc::new(Notify::new());
-        let (output_tx, _) = broadcast::channel(64);
+        let (output_tx, initial_output_rx) = broadcast::channel(64);
         let (state_tx, state_rx) = watch::channel(ProcessState::default());
 
         Self {
             process_handle,
             output_tx,
+            initial_output_rx: std::sync::Mutex::new(Some(initial_output_rx)),
             output,
             output_drained,
             interaction_lock: Arc::new(Mutex::new(())),
@@ -177,7 +182,12 @@ impl UnifiedExecProcess {
     }
 
     pub(super) fn output_receiver(&self) -> tokio::sync::broadcast::Receiver<Vec<u8>> {
-        self.output_tx.subscribe()
+        let initial = self
+            .initial_output_rx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        initial.unwrap_or_else(|| self.output_tx.subscribe())
     }
 
     pub(super) fn cancellation_token(&self) -> CancellationToken {
