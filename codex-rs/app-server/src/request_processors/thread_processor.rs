@@ -4832,6 +4832,7 @@ impl ThreadRequestProcessor {
             thread_source,
             exclude_turns,
             defer_goal_continuation,
+            interrupt_turn_id,
         } = params;
         let include_turns = !exclude_turns;
         if sandbox.is_some() && permissions.is_some() {
@@ -4874,6 +4875,15 @@ impl ThreadRequestProcessor {
             .name
             .as_deref()
             .and_then(codex_core::util::normalize_thread_name);
+        // The fork owns this interrupt so the goal pause it causes can be told apart from a
+        // user's own interrupt; every request validation above has already passed.
+        let interrupted_goal = match interrupt_turn_id.as_deref() {
+            Some(turn_id) => {
+                self.interrupt_turn_for_fork(source_thread_id, turn_id, defer_goal_continuation)
+                    .await?
+            }
+            None => None,
+        };
         let mut prepared_fork = if paginated_source {
             let boundary = match (last_turn_id.as_deref(), before_turn_id.as_deref()) {
                 (Some(turn_id), None) => {
@@ -5198,11 +5208,16 @@ impl ThreadRequestProcessor {
                     .map_err(|err| {
                         internal_error(format!("failed to flush source thread goal: {err}"))
                     })?;
-                inherit_thread_goal_snapshot(&state_db, source_thread_id, thread_id)
-                    .await
-                    .map_err(|err| {
-                        internal_error(format!("failed to inherit source thread goal: {err}"))
-                    })?
+                inherit_thread_goal_snapshot(
+                    &state_db,
+                    source_thread_id,
+                    thread_id,
+                    interrupted_goal.as_ref(),
+                )
+                .await
+                .map_err(|err| {
+                    internal_error(format!("failed to inherit source thread goal: {err}"))
+                })?
             } else {
                 false
             }

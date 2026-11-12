@@ -332,6 +332,7 @@ impl GoalRuntimeHandle {
             return Ok(());
         }
 
+        let interrupted = matches!(reason, ActiveGoalStopReason::TurnInterrupted);
         let (event_name, status, expected_goal_id) = match reason {
             ActiveGoalStopReason::TurnError => {
                 ("turn-error", codex_state::ThreadGoalStatus::Blocked, None)
@@ -414,22 +415,31 @@ impl GoalRuntimeHandle {
             return Ok(());
         }
         let previous_status = Some(active_goal.status);
-        let Some(goal) = self
-            .inner
-            .state_dbs
-            .thread_goals()
-            .update_thread_goal(
-                self.thread_id(),
-                codex_state::GoalUpdate {
-                    objective: None,
-                    status: Some(status),
-                    token_budget: None,
-                    expected_goal_id: Some(active_goal.goal_id),
-                },
-            )
-            .await
-            .map_err(|err| err.to_string())?
-        else {
+        let goals = self.inner.state_dbs.thread_goals();
+        let stopped_goal = if interrupted {
+            // Record that this interrupt paused the goal so a fork that owns the interrupt can
+            // prove the pause is untouched; any other write to the goal invalidates the record.
+            goals
+                .pause_active_thread_goal_for_interrupted_turn(
+                    self.thread_id(),
+                    &active_goal.goal_id,
+                    turn_id,
+                )
+                .await
+        } else {
+            goals
+                .update_thread_goal(
+                    self.thread_id(),
+                    codex_state::GoalUpdate {
+                        objective: None,
+                        status: Some(status),
+                        token_budget: None,
+                        expected_goal_id: Some(active_goal.goal_id),
+                    },
+                )
+                .await
+        };
+        let Some(goal) = stopped_goal.map_err(|err| err.to_string())? else {
             return Ok(());
         };
         self.inner

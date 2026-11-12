@@ -1635,7 +1635,9 @@ impl TurnRequestProcessor {
                         return Err(invalid_request("no active turn to interrupt"));
                     }
                 }
-                thread_state.pending_interrupts.push(request_id.clone());
+                thread_state
+                    .pending_interrupts
+                    .push(PendingInterrupt::Request(request_id.clone()));
             }
 
             self.outgoing
@@ -1657,7 +1659,12 @@ impl TurnRequestProcessor {
                     let mut thread_state = thread_state.lock().await;
                     thread_state
                         .pending_interrupts
-                        .retain(|pending_request_id| pending_request_id != request_id);
+                        .retain(|pending| match pending {
+                            PendingInterrupt::Request(pending_request_id) => {
+                                pending_request_id != request_id
+                            }
+                            PendingInterrupt::Waiter(_) => true,
+                        });
                 }
                 let interrupt_target = if is_startup_interrupt {
                     "startup"

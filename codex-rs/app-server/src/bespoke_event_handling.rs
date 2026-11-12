@@ -3,6 +3,7 @@ use crate::outgoing_message::ClientRequestResult;
 use crate::outgoing_message::ThreadScopedOutgoingMessageSender;
 use crate::request_processors::thread_settings_from_config_snapshot;
 use crate::server_request_error::is_turn_transition_server_request_error;
+use crate::thread_state::PendingInterrupt;
 use crate::thread_state::ThreadState;
 use crate::thread_state::TurnSummary;
 use crate::thread_state::resolve_server_request_on_thread_listener;
@@ -1588,10 +1589,17 @@ async fn respond_to_pending_interrupts(
         std::mem::take(&mut state.pending_interrupts)
     };
 
-    for request_id in pending {
-        outgoing
-            .send_response(request_id, TurnInterruptResponse {})
-            .await;
+    for pending in pending {
+        match pending {
+            PendingInterrupt::Request(request_id) => {
+                outgoing
+                    .send_response(request_id, TurnInterruptResponse {})
+                    .await;
+            }
+            PendingInterrupt::Waiter(waiter) => {
+                let _ = waiter.send(());
+            }
+        }
     }
 }
 

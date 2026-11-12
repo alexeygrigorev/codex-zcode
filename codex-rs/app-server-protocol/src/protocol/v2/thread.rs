@@ -624,6 +624,15 @@ pub struct ThreadForkParams {
     #[experimental("thread/fork.deferGoalContinuation")]
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub defer_goal_continuation: bool,
+    /// Optional running turn of the source thread that the server interrupts before forking.
+    ///
+    /// The request fails unless this turn is the source thread's currently running turn and no
+    /// other interrupt of it is pending. With `deferGoalContinuation`, a goal that was active
+    /// when the interrupt began and that the interrupt itself paused is carried into the fork
+    /// as active; the source goal stays paused. Any other goal state is carried unchanged.
+    #[experimental("thread/fork.interruptTurnId")]
+    #[ts(optional = nullable)]
+    pub interrupt_turn_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS, ExperimentalApi)]

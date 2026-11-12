@@ -1015,6 +1015,11 @@ goals = true
         .expect("retry goal");
     let expected_source_tokens = if committed_steer.is_some() { 150 } else { 50 };
     assert_eq!(source_goal.objective, RETRY_GOAL);
+    // Only the retry continues the goal; the interrupted source stays paused.
+    assert_eq!(
+        source_goal.status,
+        codex_app_server_protocol::ThreadGoalStatus::Paused
+    );
     assert_eq!(source_goal.tokens_used, expected_source_tokens);
     assert!(source_goal.time_used_seconds >= 12);
     assert_eq!(retry_goal.objective, RETRY_GOAL);

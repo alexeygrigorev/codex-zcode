@@ -894,6 +894,7 @@ impl AppServerSession {
             thread_id,
             /*last_turn_id*/ None,
             /*before_turn_id*/ None,
+            /*interrupt_turn_id*/ None,
             ForkGoalContinuation::StartIfIdle,
             ForkPresentation::Regular,
             /*selected_profile*/ None,
@@ -923,7 +924,36 @@ impl AppServerSession {
             thread_id,
             last_turn_id,
             before_turn_id,
+            /*interrupt_turn_id*/ None,
             goal_continuation,
+            ForkPresentation::Regular,
+            selected_profile,
+            ForkPermissionMode::InheritSaved,
+            ForkConfigSource::Session,
+        )
+        .await
+    }
+
+    /// Forks the thread just before `turn_id`, letting the server interrupt that running turn.
+    ///
+    /// The server owns the interrupt so that only a goal paused by this very interrupt is
+    /// carried into the fork as active; the source thread keeps its goal paused.
+    pub(crate) async fn fork_thread_before_interrupted_turn(
+        &mut self,
+        local_settings: &LocalSettings,
+        config: Config,
+        thread_id: ThreadId,
+        turn_id: String,
+        selected_profile: Option<&PermissionProfileSelection>,
+    ) -> Result<AppServerStartedThread> {
+        self.fork_thread_at_with_presentation(
+            local_settings,
+            config,
+            thread_id,
+            /*last_turn_id*/ None,
+            Some(turn_id.clone()),
+            Some(turn_id),
+            ForkGoalContinuation::DeferUntilNextTurn,
             ForkPresentation::Regular,
             selected_profile,
             ForkPermissionMode::InheritSaved,
@@ -944,6 +974,7 @@ impl AppServerSession {
             thread_id,
             /*last_turn_id*/ None,
             /*before_turn_id*/ None,
+            /*interrupt_turn_id*/ None,
             ForkGoalContinuation::StartIfIdle,
             ForkPresentation::SideConversation,
             /*selected_profile*/ None,
@@ -964,6 +995,7 @@ impl AppServerSession {
         thread_id: ThreadId,
         last_turn_id: Option<String>,
         before_turn_id: Option<String>,
+        interrupt_turn_id: Option<String>,
         goal_continuation: ForkGoalContinuation,
         presentation: ForkPresentation,
         selected_profile: Option<&PermissionProfileSelection>,
@@ -992,6 +1024,7 @@ impl AppServerSession {
         let mut params = ThreadForkParams {
             last_turn_id,
             before_turn_id,
+            interrupt_turn_id,
             defer_goal_continuation: goal_continuation == ForkGoalContinuation::DeferUntilNextTurn,
             exclude_turns,
             ..thread_fork_params_from_config(

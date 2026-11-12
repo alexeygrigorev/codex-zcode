@@ -2,7 +2,6 @@
 
 use super::session_lifecycle::ThreadAttachPresentation;
 use super::*;
-use crate::app_server_session::ForkGoalContinuation;
 use crate::app_server_session::HISTORY_ITEM_PAGE_LIMIT;
 use crate::app_server_session::turn_permissions_overrides;
 use crate::chatwidget::ThreadInputState;
@@ -92,11 +91,28 @@ impl App {
             )
         });
 
-        if let Err(err) = app_server.turn_interrupt(thread_id, turn_id.clone()).await {
-            self.chat_widget
-                .add_error_message(format!("Failed to retry with a faster model: {err}"));
-            return;
-        }
+        self.config = retry_config.clone();
+        let selected_profile = self.confirmed_server_profile(thread_id);
+        // The server interrupts the running turn as part of the fork, so a goal that this
+        // interrupt pauses can be carried into the retry as active. A separate client-side
+        // interrupt could not be told apart from the user's own and would leave it paused.
+        let started = app_server
+            .fork_thread_before_interrupted_turn(
+                &self.local_settings,
+                retry_config,
+                thread_id,
+                turn_id.clone(),
+                selected_profile.as_ref(),
+            )
+            .await;
+        let started = match started {
+            Ok(started) => started,
+            Err(err) => {
+                self.fail_safety_buffered_branch(input_state, prompt, err);
+                return;
+            }
+        };
+        let retry_thread_id = started.session.thread_id;
 
         let thread = match async {
             let mut thread = app_server
@@ -177,28 +193,6 @@ impl App {
                 }),
         );
         let retry_display = ChatWidget::user_message_display_from_inputs(items);
-
-        self.config = retry_config.clone();
-        let selected_profile = self.confirmed_server_profile(thread_id);
-        let started = app_server
-            .fork_thread_at(
-                &self.local_settings,
-                retry_config,
-                thread_id,
-                /*last_turn_id*/ None,
-                /*before_turn_id*/ Some(turn_id),
-                ForkGoalContinuation::DeferUntilNextTurn,
-                selected_profile.as_ref(),
-            )
-            .await;
-        let started = match started {
-            Ok(started) => started,
-            Err(err) => {
-                self.fail_safety_buffered_branch(input_state, prompt, err);
-                return;
-            }
-        };
-        let retry_thread_id = started.session.thread_id;
 
         self.shutdown_current_thread(app_server).await;
         if let Err(err) = self

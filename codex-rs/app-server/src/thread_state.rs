@@ -33,7 +33,15 @@ use tokio::sync::oneshot;
 use tokio::sync::watch;
 use tracing::error;
 
-type PendingInterruptQueue = Vec<ConnectionRequestId>;
+/// Someone waiting for the running turn to finish aborting.
+pub(crate) enum PendingInterrupt {
+    /// A `turn/interrupt` request, answered when the turn aborts.
+    Request(ConnectionRequestId),
+    /// An internal caller that submitted the interrupt itself, such as `thread/fork`.
+    Waiter(oneshot::Sender<()>),
+}
+
+type PendingInterruptQueue = Vec<PendingInterrupt>;
 
 pub(crate) struct PendingThreadResumeRequest {
     pub(crate) request_id: ConnectionRequestId,
