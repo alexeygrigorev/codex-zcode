@@ -1130,15 +1130,23 @@ async fn bridge_fast_fails_runtime_header_callbacks_with_host_fallback_shapes() 
 
     let stats_text = std::fs::read_to_string(stats_path(&fixture)).expect("stats written");
     let lines: Vec<&str> = stats_text.lines().collect();
-    assert!(
-        lines.contains(
-            &"headers:{\"errorMessage\":\"Provider request auth is unavailable\",\"headersApplied\":false}"
-        ),
-        "stats: {stats_text}"
+    let recorded_json = |prefix: &str| -> serde_json::Value {
+        let line = lines
+            .iter()
+            .find_map(|line| line.strip_prefix(prefix))
+            .unwrap_or_else(|| panic!("missing {prefix} line in stats: {stats_text}"));
+        serde_json::from_str(line).expect("stats line is JSON")
+    };
+    assert_eq!(
+        recorded_json("headers:"),
+        serde_json::json!({
+            "errorMessage": "Provider request auth is unavailable",
+            "headersApplied": false,
+        })
     );
-    assert!(
-        lines.contains(&"mcpauth:{\"ok\":false,\"reason\":\"official_auth_unavailable\"}"),
-        "stats: {stats_text}"
+    assert_eq!(
+        recorded_json("mcpauth:"),
+        serde_json::json!({"ok": false, "reason": "official_auth_unavailable"})
     );
     bridge.kill("test end");
 }

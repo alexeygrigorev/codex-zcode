@@ -217,6 +217,12 @@ pub(super) async fn make_chatwidget_manual_with_auth(
     widget.transcript.active_cell = None;
     widget.transcript.active_cell_revision = 0;
     widget.set_model(&resolved_model);
+    // The queued-edit hint follows the real terminal (tmux gets Shift+Left, others Alt+Up).
+    // Pin it so rendered output does not depend on the environment running the tests.
+    widget.queued_message_edit_hint_binding = Some(crate::key_hint::shift(KeyCode::Left).into());
+    widget
+        .bottom_pane
+        .set_queued_message_edit_binding(widget.queued_message_edit_hint_binding);
     (widget, rx, op_rx)
 }
 
