@@ -109,6 +109,21 @@ fn probe_native_tls_error(error: &(dyn std::error::Error + 'static)) -> bool {
     }
 }
 
+/// Reports whether `error` is, or wraps, a TLS library error.
+///
+/// `io::Error::source` skips the payload it wraps, so a TLS error carried as the
+/// payload of an `io::Error` (as hyper's connector does) is only reachable through
+/// `get_ref`.
+fn is_tls_library_error(error: &(dyn std::error::Error + 'static)) -> bool {
+    if error.downcast_ref::<rustls::Error>().is_some() || probe_native_tls_error(error) {
+        return true;
+    }
+    error
+        .downcast_ref::<std::io::Error>()
+        .and_then(std::io::Error::get_ref)
+        .is_some_and(|inner| is_tls_library_error(inner))
+}
+
 impl RouteAwareRequestError {
     /// Classifies transport, proxy, and certificate failures without exposing request details.
     pub fn failure_class(&self) -> Option<RouteFailureClass> {
@@ -127,7 +142,7 @@ impl RouteAwareRequestError {
 
         let mut source: Option<&(dyn std::error::Error + 'static)> = Some(self);
         while let Some(error) = source {
-            if error.downcast_ref::<rustls::Error>().is_some() || probe_native_tls_error(error) {
+            if is_tls_library_error(error) {
                 return Some(RouteFailureClass::TlsError);
             }
             if error.to_string() == "tunnel error: proxy authorization required" {
