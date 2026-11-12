@@ -369,3 +369,61 @@ async fn interrupt_persists_turn_aborted_marker_in_next_request() {
     );
     codex.submit(Op::CleanBackgroundTerminals).await.unwrap();
 }
+
+/// A turn-targeted interrupt must only ever affect the turn it names: a stale or foreign id
+/// leaves the running turn alone, and the named turn can be interrupted exactly once, even
+/// after a successor turn has taken its place.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interrupt_turn_if_active_only_interrupts_the_named_running_turn() {
+    let server = start_mock_server().await;
+    // Waiting on the mocked responses keeps each turn active on local and remote executors
+    // without requiring an OS-specific command or a working sandboxed child process.
+    for response_id in ["first-response", "second-response"] {
+        mount_response_once(
+            &server,
+            sse_response(sse(vec![
+                ev_response_created(response_id),
+                ev_completed(response_id),
+            ]))
+            .set_delay(Duration::from_secs(60)),
+        )
+        .await;
+    }
+    let fixture = test_codex()
+        .with_model("gpt-5.4")
+        .build_with_auto_env(&server)
+        .await
+        .unwrap();
+    let codex = Arc::clone(&fixture.codex);
+
+    let mut turn_ids = Vec::new();
+    for text in ["first turn", "second turn"] {
+        codex
+            .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+                text: text.into(),
+                text_elements: Vec::new(),
+            }]))
+            .await
+            .unwrap();
+        let EventMsg::TurnStarted(started) =
+            wait_for_event(&codex, |event| matches!(event, EventMsg::TurnStarted(_))).await
+        else {
+            panic!("expected a started turn");
+        };
+        turn_ids.push(started.turn_id);
+
+        if turn_ids.len() == 1 {
+            let first_turn_id = &turn_ids[0];
+            assert!(!codex.interrupt_turn_if_active("not-the-running-turn").await);
+            assert!(codex.active_turn_root(first_turn_id).await.is_some());
+            assert!(codex.interrupt_turn_if_active(first_turn_id).await);
+            wait_for_event(&codex, |event| matches!(event, EventMsg::TurnAborted(_))).await;
+            assert!(!codex.interrupt_turn_if_active(first_turn_id).await);
+        }
+    }
+
+    let (first_turn_id, second_turn_id) = (&turn_ids[0], &turn_ids[1]);
+    assert!(!codex.interrupt_turn_if_active(first_turn_id).await);
+    assert!(codex.active_turn_root(second_turn_id).await.is_some());
+    assert!(codex.interrupt_turn_if_active(second_turn_id).await);
+}

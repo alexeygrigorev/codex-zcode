@@ -48,7 +48,7 @@ impl Fixture {
     }
 
     async fn claim(&self, turn_id: &str) -> anyhow::Result<Option<InterruptedActiveGoal>> {
-        InterruptedActiveGoal::capture(&self.state_db, self.source, turn_id).await
+        InterruptedActiveGoal::claim(&self.state_db, self.source, turn_id).await
     }
 
     async fn interrupt_pause(&self, goal: &ThreadGoal, turn_id: &str) -> anyhow::Result<()> {
@@ -236,6 +236,34 @@ async fn pause_by_another_turns_interrupt_is_not_reactivated() -> anyhow::Result
     let fixture = Fixture::new().await?;
     let goal = fixture.set_goal(ThreadGoalStatus::Active).await?;
     let claim = fixture.claim("turn-2").await?.expect("active goal claim");
+    fixture.interrupt_pause(&goal, TURN_ID).await?;
+
+    let (source, target) = fixture.inherit(Some(&claim)).await?;
+
+    assert_eq!(ThreadGoalStatus::Paused, source.status);
+    assert_eq!(snapshot_of(&source, fixture.target), target);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_write_between_the_claim_and_the_pause_inherits_the_unchanged_snapshot()
+-> anyhow::Result<()> {
+    let fixture = Fixture::new().await?;
+    let goal = fixture.set_goal(ThreadGoalStatus::Active).await?;
+    let claim = fixture.claim(TURN_ID).await?.expect("active goal claim");
+    fixture
+        .state_db
+        .thread_goals()
+        .update_thread_goal(
+            fixture.source,
+            GoalUpdate {
+                objective: Some("edited after the claim".to_string()),
+                status: None,
+                token_budget: None,
+                expected_goal_id: Some(goal.goal_id.clone()),
+            },
+        )
+        .await?;
     fixture.interrupt_pause(&goal, TURN_ID).await?;
 
     let (source, target) = fixture.inherit(Some(&claim)).await?;

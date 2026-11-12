@@ -158,20 +158,23 @@ impl App {
                     turn.items_view = TurnItemsView::Full;
                 }
             }
+            safety_retry_fork_point(&thread.turns, &turn_id)?;
             Ok::<_, color_eyre::Report>(thread)
         }
         .await
         {
             Ok(thread) => thread,
             Err(err) => {
+                // Remove only the fork this retry just created; the source stays untouched.
+                if let Err(cleanup_err) = app_server.thread_delete(retry_thread_id).await {
+                    tracing::warn!(
+                        "failed to remove unused retry fork {retry_thread_id}: {cleanup_err}"
+                    );
+                }
                 self.fail_safety_buffered_branch(input_state, prompt, err);
                 return;
             }
         };
-        if let Err(err) = safety_retry_fork_point(&thread.turns, &turn_id) {
-            self.fail_safety_buffered_branch(input_state, prompt, err);
-            return;
-        }
         items.extend(
             thread
                 .turns

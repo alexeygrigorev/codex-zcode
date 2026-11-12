@@ -1,33 +1,44 @@
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::validate_thread_goal_objective;
 use codex_state::StateRuntime;
-use codex_state::ThreadGoalStatus;
 
-/// A goal that was active when a fork began to interrupt `turn_id`.
+/// The claim a fork holds on the goal that was active when it began to interrupt `turn_id`.
 ///
-/// This is only a claim: the source goal is carried into the fork as active only if the
-/// interrupt of exactly this turn is still recorded as the cause of its pause.
+/// The claim is recorded in the state database, which deletes it on every other write to the
+/// goal. The goal is carried into the fork as active only if the interrupt of exactly this turn
+/// then paused it and the record is still intact.
 pub(super) struct InterruptedActiveGoal {
     goal_id: String,
     turn_id: String,
 }
 
 impl InterruptedActiveGoal {
-    /// Returns the claim when the thread's goal is active right now, before the interrupt.
-    pub(super) async fn capture(
+    /// Claims the thread's goal if it is active right now, before the interrupt.
+    pub(super) async fn claim(
         state_db: &StateRuntime,
         thread_id: ThreadId,
         turn_id: &str,
     ) -> anyhow::Result<Option<Self>> {
         Ok(state_db
             .thread_goals()
-            .get_thread_goal(thread_id)
+            .claim_active_thread_goal_for_interrupt(thread_id, turn_id)
             .await?
-            .filter(|goal| goal.status == ThreadGoalStatus::Active)
-            .map(|goal| Self {
-                goal_id: goal.goal_id,
+            .map(|goal_id| Self {
+                goal_id,
                 turn_id: turn_id.to_string(),
             }))
+    }
+
+    /// Drops a claim that was not turned into a recorded pause.
+    pub(super) async fn release(
+        &self,
+        state_db: &StateRuntime,
+        thread_id: ThreadId,
+    ) -> anyhow::Result<()> {
+        state_db
+            .thread_goals()
+            .release_thread_goal_interrupt_claim(thread_id, &self.turn_id)
+            .await
     }
 }
 
@@ -74,6 +85,11 @@ pub(super) async fn inherit_thread_goal_snapshot(
         .thread_goals()
         .replace_thread_goal_snapshot(&goal)
         .await?;
+    if let Some(interrupted_goal) = interrupted_goal
+        && let Err(err) = interrupted_goal.release(state_db, source_thread_id).await
+    {
+        tracing::warn!(%source_thread_id, "failed to release goal interrupt claim: {err}");
+    }
     Ok(true)
 }
 

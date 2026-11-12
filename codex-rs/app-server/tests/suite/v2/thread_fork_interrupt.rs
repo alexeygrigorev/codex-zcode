@@ -130,6 +130,11 @@ impl RunningGoalTurn {
         let request = self.mcp.send_thread_fork_request(params).await?;
         let response: ThreadForkResponse =
             timeout(DEFAULT_READ_TIMEOUT, self.mcp.read_response(request)).await??;
+        // The response acknowledges exactly the interrupt this request performed.
+        assert_eq!(
+            Some(interrupt_turn_id.to_string()),
+            response.interrupted_turn_id
+        );
         Ok(response.thread.id)
     }
 

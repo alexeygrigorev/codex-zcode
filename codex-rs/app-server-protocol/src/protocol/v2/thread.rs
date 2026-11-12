@@ -626,10 +626,11 @@ pub struct ThreadForkParams {
     pub defer_goal_continuation: bool,
     /// Optional running turn of the source thread that the server interrupts before forking.
     ///
-    /// The request fails unless this turn is the source thread's currently running turn and no
-    /// other interrupt of it is pending. With `deferGoalContinuation`, a goal that was active
-    /// when the interrupt began and that the interrupt itself paused is carried into the fork
-    /// as active; the source goal stays paused. Any other goal state is carried unchanged.
+    /// The request fails unless this turn is the source thread's currently running turn.
+    /// With `deferGoalContinuation`, a goal that was active when the interrupt began and that
+    /// the interrupt itself paused is carried into the fork as active; the source goal stays
+    /// paused. Any other goal state is carried unchanged. The response's `interruptedTurnId`
+    /// acknowledges the interrupt.
     #[experimental("thread/fork.interruptTurnId")]
     #[ts(optional = nullable)]
     pub interrupt_turn_id: Option<String>,
@@ -672,6 +673,12 @@ pub struct ThreadForkResponse {
     #[experimental("thread/fork.multiAgentMode")]
     #[serde(default)]
     pub multi_agent_mode: MultiAgentMode,
+    /// Turn of the source thread that this request interrupted, echoing `interruptTurnId`.
+    /// Absent when no interrupt was performed, so a client that requested one must treat
+    /// its absence as an unsupported server and not assume the turn stopped.
+    #[experimental("thread/fork.interruptedTurnId")]
+    #[serde(default)]
+    pub interrupted_turn_id: Option<String>,
 }
 
 impl ThreadForkResponse {

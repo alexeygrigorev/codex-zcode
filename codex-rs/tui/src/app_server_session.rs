@@ -1057,6 +1057,7 @@ impl AppServerSession {
         }
         self.thread_tool_transport()
             .configure_mcp(&mut params.config);
+        let requested_interrupt_turn_id = params.interrupt_turn_id.clone();
         let response: ThreadForkResponse = match self
             .client
             .request_typed(ClientRequest::ThreadFork {
@@ -1086,6 +1087,20 @@ impl AppServerSession {
                 ));
             }
         };
+        if let Some(requested_turn_id) = requested_interrupt_turn_id.as_deref()
+            && !interrupt_acknowledged(requested_turn_id, response.interrupted_turn_id.as_deref())
+        {
+            // A server that ignores `interruptTurnId` forks a turn that is still running. Fail
+            // closed and remove only the fork this request just created.
+            if let Ok(forked_thread_id) = ThreadId::from_string(&response.thread.id)
+                && let Err(err) = self.thread_delete(forked_thread_id).await
+            {
+                tracing::warn!("failed to remove unacknowledged fork {forked_thread_id}: {err}");
+            }
+            return Err(color_eyre::eyre::eyre!(
+                "the app-server did not acknowledge interrupting turn {requested_turn_id}"
+            ));
+        }
         let mut response = response;
         if presentation == ForkPresentation::Regular
             && !response.thread.ephemeral
@@ -2217,6 +2232,14 @@ fn thread_resume_params_from_config(
         remove_permission_config_overrides(&mut params.config);
     }
     params
+}
+
+/// Whether a fork response confirms that the server itself interrupted `requested_turn_id`.
+///
+/// A server that predates `interruptTurnId` ignores it and leaves the turn running, so only an
+/// explicit acknowledgement of the exact requested turn counts.
+fn interrupt_acknowledged(requested_turn_id: &str, acknowledged_turn_id: Option<&str>) -> bool {
+    acknowledged_turn_id == Some(requested_turn_id)
 }
 
 fn thread_fork_params_from_config(
@@ -3853,6 +3876,16 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn only_an_exact_acknowledgement_confirms_the_requested_interrupt() {
+        assert!(interrupt_acknowledged("turn-1", Some("turn-1")));
+        // An older server ignores the field and answers without an acknowledgement.
+        assert!(!interrupt_acknowledged(
+            "turn-1", /*acknowledged_turn_id*/ None
+        ));
+        assert!(!interrupt_acknowledged("turn-1", Some("turn-2")));
     }
 
     #[tokio::test]

@@ -48,6 +48,7 @@ use codex_protocol::protocol::ThreadMemoryMode;
 use codex_protocol::protocol::ThreadSettingsSnapshot;
 use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TokenUsageInfo;
+use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_protocol::protocol::TurnEnvironmentSelections;
 use codex_protocol::protocol::W3cTraceContext;
@@ -555,6 +556,26 @@ impl CodexThread {
             return None;
         }
         task.turn_context.turn_metadata_state.root_turn_id()
+    }
+
+    /// Interrupts `turn_id` only if it is the currently running turn, and returns whether this
+    /// call interrupted it.
+    ///
+    /// Selecting the turn and taking it out of the active slot is one step under the session's
+    /// active-turn lock, so a successor turn is never touched, and exactly one of several
+    /// concurrent interrupts of the same turn can win. The turn's abort lifecycle, which includes
+    /// the goal extension's pause, has finished when this returns `true`.
+    pub async fn interrupt_turn_if_active(&self, turn_id: &str) -> bool {
+        let interrupted = self
+            .session
+            .abort_turn_if_active(turn_id, TurnAbortReason::Interrupted)
+            .await;
+        if interrupted {
+            self.session
+                .emit_thread_idle_lifecycle_if_idle(ThreadIdleCause::Interrupted)
+                .await;
+        }
+        interrupted
     }
 
     pub async fn set_app_server_client_info(

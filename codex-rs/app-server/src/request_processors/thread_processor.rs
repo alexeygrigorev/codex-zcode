@@ -4884,6 +4884,8 @@ impl ThreadRequestProcessor {
             }
             None => None,
         };
+        // Acknowledges the interrupt: only a server that performed it answers with the turn id.
+        let interrupted_turn_id = interrupt_turn_id;
         let mut prepared_fork = if paginated_source {
             let boundary = match (last_turn_id.as_deref(), before_turn_id.as_deref()) {
                 (Some(turn_id), None) => {
@@ -5341,6 +5343,7 @@ impl ThreadRequestProcessor {
             active_permission_profile,
             reasoning_effort: session_configured.reasoning_effort,
             multi_agent_mode: MultiAgentMode::ExplicitRequestOnly,
+            interrupted_turn_id,
         };
 
         let notif = thread_started_notification(thread);

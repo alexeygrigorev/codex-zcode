@@ -8,19 +8,19 @@ use super::thread_fork_goal::InterruptedActiveGoal;
 use super::thread_processor::ThreadRequestProcessor;
 use crate::error_code::internal_error;
 use crate::error_code::invalid_request;
-use crate::thread_state::PendingInterrupt;
 use codex_app_server_protocol::JSONRPCErrorError;
 use codex_protocol::ThreadId;
-use codex_protocol::protocol::Op;
 
 impl ThreadRequestProcessor {
-    /// Interrupts `turn_id` on behalf of a fork and waits until the turn has finished aborting,
-    /// including the goal extension's pause of the turn's goal.
+    /// Interrupts `turn_id` on behalf of a fork, but only if it is the source thread's currently
+    /// running turn, and returns once the turn's abort lifecycle (including the goal pause) is
+    /// complete.
     ///
-    /// Fails before interrupting unless `turn_id` is the source thread's currently running turn
-    /// and no other interrupt of it is already pending. When `track_goal` is set, the returned
-    /// value records the goal that was active when the interrupt began, which is what a fork
-    /// needs to later prove that the interrupt itself paused that goal.
+    /// The turn is selected and taken in one core step, so a successor turn is never touched and
+    /// a concurrent manual interrupt of the same turn either wins before this call, which then
+    /// fails without interrupting, or finds the turn already taken. When `track_goal` is set,
+    /// the returned claim is what a fork needs to later prove that this very interrupt paused
+    /// the goal that was active when it began.
     pub(super) async fn interrupt_turn_for_fork(
         &self,
         source_thread_id: ThreadId,
@@ -32,70 +32,28 @@ impl ThreadRequestProcessor {
             .get_thread(source_thread_id)
             .await
             .map_err(|_| invalid_request(format!("thread not found: {source_thread_id}")))?;
-        let thread_state = self
-            .thread_state_manager
-            .thread_state(source_thread_id)
-            .await;
-        let active_goal = if track_goal {
-            match thread.state_db().or_else(|| self.state_db.clone()) {
-                Some(state_db) => {
-                    InterruptedActiveGoal::capture(&state_db, source_thread_id, turn_id)
-                        .await
-                        .map_err(|err| {
-                            internal_error(format!("failed to read source thread goal: {err}"))
-                        })?
-                }
-                None => None,
+        let state_db = thread.state_db().or_else(|| self.state_db.clone());
+        let claim = match state_db.as_deref() {
+            Some(state_db) if track_goal => {
+                InterruptedActiveGoal::claim(state_db, source_thread_id, turn_id)
+                    .await
+                    .map_err(|err| {
+                        internal_error(format!("failed to read source thread goal: {err}"))
+                    })?
             }
-        } else {
-            None
+            _ => None,
         };
 
-        // Core's active turn is the source of truth. Query it before taking the thread-state
-        // lock, as `turn/interrupt` does, so no guard is held across the core query.
-        if thread.active_turn_root(turn_id).await.is_none() {
-            return Err(invalid_request(format!(
-                "turn {turn_id} is not the currently running turn"
-            )));
+        if thread.interrupt_turn_if_active(turn_id).await {
+            return Ok(claim);
         }
-        let (waiter, interrupted) = tokio::sync::oneshot::channel();
+        if let (Some(claim), Some(state_db)) = (claim.as_ref(), state_db.as_deref())
+            && let Err(err) = claim.release(state_db, source_thread_id).await
         {
-            let mut thread_state = thread_state.lock().await;
-            if let Some(tracked_turn_id) = thread_state.active_turn_id()
-                && tracked_turn_id != turn_id
-            {
-                return Err(invalid_request(format!(
-                    "expected active turn id {turn_id} but found {tracked_turn_id}"
-                )));
-            }
-            // Another pending interrupt means a pause of this turn may not be ours.
-            if !thread_state.pending_interrupts.is_empty() {
-                return Err(invalid_request(format!(
-                    "turn {turn_id} is already being interrupted"
-                )));
-            }
-            thread_state
-                .pending_interrupts
-                .push(PendingInterrupt::Waiter(waiter));
+            tracing::warn!(%source_thread_id, "failed to release goal interrupt claim: {err}");
         }
-
-        if let Err(err) = thread.submit(Op::Interrupt).await {
-            // Close our receiver so the retain below can recognize and drop our waiter.
-            drop(interrupted);
-            let mut thread_state = thread_state.lock().await;
-            thread_state
-                .pending_interrupts
-                .retain(|pending| match pending {
-                    PendingInterrupt::Request(_) => true,
-                    PendingInterrupt::Waiter(waiter) => !waiter.is_closed(),
-                });
-            return Err(internal_error(format!("failed to interrupt turn: {err}")));
-        }
-        interrupted.await.map_err(|_| {
-            internal_error(format!(
-                "turn {turn_id} was not acknowledged as interrupted before the thread closed"
-            ))
-        })?;
-        Ok(active_goal)
+        Err(invalid_request(format!(
+            "turn {turn_id} is not the currently running turn"
+        )))
     }
 }

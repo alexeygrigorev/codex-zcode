@@ -655,12 +655,13 @@ impl GoalRuntimeHandle {
             .inner
             .state_dbs
             .thread_goals()
-            .account_thread_goal_usage(
+            .account_thread_goal_usage_for_turn(
                 self.thread_id(),
                 snapshot.time_delta_seconds,
                 snapshot.token_delta,
                 mode,
-                Some(snapshot.expected_goal_id.as_str()),
+                snapshot.expected_goal_id.as_str(),
+                turn_id,
             )
             .await
             .map_err(|err| err.to_string())?;
