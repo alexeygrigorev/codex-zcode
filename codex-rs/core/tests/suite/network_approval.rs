@@ -1348,7 +1348,7 @@ PY"#
         })
         .await?;
     wait_for_completion_without_network_prompt(&test).await;
-    tokio::time::timeout(Duration::from_secs(5), async {
+    let terminated = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match process_lock.try_lock() {
                 Ok(()) => return Ok(()),
@@ -1359,8 +1359,17 @@ PY"#
             }
         }
     })
-    .await
-    .context("background process remained alive after network rejection")??;
+    .await;
+    if terminated.is_err() {
+        let processes = std::process::Command::new("ps")
+            .args(["-eo", "pid,ppid,pgid,sid,comm"])
+            .output()?;
+        eprintln!(
+            "remaining processes: {}",
+            String::from_utf8_lossy(&processes.stdout)
+        );
+    }
+    terminated.context("background process remained alive after network rejection")??;
     assert!(test.codex.list_background_terminals().await.is_empty());
 
     let output = responses

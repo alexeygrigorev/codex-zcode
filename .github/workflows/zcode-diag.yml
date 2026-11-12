@@ -95,4 +95,10 @@ jobs:
       - name: Diagnose failing tests
         run: |
           set -o pipefail
-          RUST_LOG=debug just test -p codex-core --features codex-core/bedrock --cargo-profile dev-small --build-jobs 2 --test-threads 2 --no-capture -E 'test(/zsh_fork/) | test(/network_rejection_preserves/) | test(/async_hook_finishing_while_idle/) | test(/snapshot_discovers_and_redacts/)' 2>&1 | tee ci-evidence/diag.log | tail -c 400000
+          just test -p codex-core --features codex-core/bedrock --cargo-profile dev-small --build-jobs 2 --test-threads 2 --no-capture -E 'test(/zsh_fork/) | test(/network_rejection_preserves/) | test(/async_hook_finishing_while_idle/) | test(/snapshot_discovers_and_redacts/)' 2>&1 | tee ci-evidence/diag.log | tail -c 400000
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: targeted-runtime-diagnostics
+          path: ci-evidence

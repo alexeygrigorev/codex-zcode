@@ -1979,12 +1979,14 @@ async fn async_hook_finishing_while_idle_waits_for_the_next_turn(
             text_elements: Vec::new(),
         }])
     };
-    test.codex.start_turn_if_idle(next_turn).await?;
+    let submission = test.codex.start_turn_if_idle(next_turn).await?;
+    eprintln!("next turn submission: {submission:?}");
 
     let mut warning_event = None;
     timeout(Duration::from_secs(5), async {
         loop {
             let event = test.codex.next_event().await?;
+            eprintln!("next turn event: {:?}", std::mem::discriminant(&event.msg));
             if matches!(
                 &event.msg,
                 EventMsg::Warning(warning)
