@@ -219,18 +219,22 @@ pub fn run_main() -> ! {
             panic!("Linux sandbox retained effective or permitted capabilities");
         }
 
+        // Exec transitions can clear bubblewrap's parent-death signal. This
+        // stage is the sandbox's PID 1 and reaps the command, so rearm it for
+        // every inner stage: when bubblewrap is killed (for example by a
+        // process-group kill that cannot reach the command's new session),
+        // this stage dies and the kernel kills the rest of the PID namespace.
+        // For managed proxy routing, the fresh bridge acknowledgment below also
+        // rejects a parent that died before this rearm: its bridge workers die
+        // with it and cannot acknowledge the new listener.
+        // SAFETY: prctl takes integer arguments and installs SIGKILL for this process.
+        if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) } != 0 {
+            panic!(
+                "failed to restore sandbox parent-death signal: {}",
+                std::io::Error::last_os_error()
+            );
+        }
         if allow_network_for_proxy {
-            // Exec transitions can clear bubblewrap's parent-death signal. Rearm
-            // it before handing off the listener. The fresh bridge acknowledgment
-            // below also rejects a parent that died before this rearm: its bridge
-            // workers die with it and cannot acknowledge the new listener.
-            // SAFETY: prctl takes integer arguments and installs SIGKILL for this process.
-            if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) } != 0 {
-                panic!(
-                    "failed to restore sandbox parent-death signal: {}",
-                    std::io::Error::last_os_error()
-                );
-            }
             let spec = proxy_route_spec
                 .as_deref()
                 .unwrap_or_else(|| panic!("managed proxy mode requires --proxy-route-spec"));
