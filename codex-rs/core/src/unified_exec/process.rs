@@ -66,6 +66,9 @@ pub(crate) struct OutputHandles<const MAX_BYTES: usize = UNIFIED_EXEC_OUTPUT_MAX
     pub(crate) output_closed: Arc<AtomicBool>,
     pub(crate) output_closed_notify: Arc<Notify>,
     pub(crate) cancellation_token: CancellationToken,
+    /// Complete process transcript for end events, appended by the output
+    /// producer before chunks are broadcast to lossy streaming subscribers.
+    pub(crate) transcript: Arc<Mutex<HeadTailBuffer>>,
 }
 
 struct OutputTaskGuard {
@@ -126,6 +129,7 @@ impl UnifiedExecProcess {
             output_closed: Arc::new(AtomicBool::new(false)),
             output_closed_notify: Arc::new(Notify::new()),
             cancellation_token: CancellationToken::new(),
+            transcript: Arc::new(Mutex::new(HeadTailBuffer::default())),
         };
         let output_drained = Arc::new(Notify::new());
         let (output_tx, _) = broadcast::channel(64);
@@ -446,6 +450,7 @@ impl UnifiedExecProcess {
             output_closed,
             output_closed_notify,
             cancellation_token,
+            transcript,
         } = output_handles;
         let process = started.process;
         let mut events = process.subscribe_events();
@@ -517,6 +522,7 @@ impl UnifiedExecProcess {
                     } = response;
                     for chunk in chunks.into_iter().filter(|chunk| chunk.seq > last_seq) {
                         let bytes = chunk.chunk.into_inner();
+                        transcript.lock().await.push_chunk(&bytes);
                         let mut guard = output_buffer.lock().await;
                         guard.push_chunk(&bytes);
                         drop(guard);
@@ -560,6 +566,7 @@ impl UnifiedExecProcess {
                         }
                         last_seq = chunk.seq;
                         let bytes = chunk.chunk.into_inner();
+                        transcript.lock().await.push_chunk(&bytes);
                         let mut guard = output_buffer.lock().await;
                         guard.push_chunk(&bytes);
                         drop(guard);
@@ -611,6 +618,7 @@ impl UnifiedExecProcess {
             output_notify,
             output_closed,
             output_closed_notify,
+            transcript,
             ..
         } = output_handles;
         tokio::spawn(async move {
@@ -621,6 +629,7 @@ impl UnifiedExecProcess {
             loop {
                 match receiver.recv().await {
                     Ok(chunk) => {
+                        transcript.lock().await.push_chunk(&chunk);
                         let mut guard = output_buffer.lock().await;
                         guard.push_chunk(&chunk);
                         drop(guard);

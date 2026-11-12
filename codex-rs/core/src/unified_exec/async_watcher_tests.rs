@@ -33,6 +33,13 @@ struct StreamingOutputHarness {
 }
 
 async fn streaming_output_harness() -> anyhow::Result<StreamingOutputHarness> {
+    streaming_output_harness_after(&[]).await
+}
+
+/// Starts streaming only after the producer has recorded `early_output`.
+async fn streaming_output_harness_after(
+    early_output: &[u8],
+) -> anyhow::Result<StreamingOutputHarness> {
     let (writer_tx, _writer_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
     let (stdout_tx, stdout_rx) = tokio::sync::broadcast::channel::<Vec<u8>>(8);
     let (exit_tx, exit_rx) = tokio::sync::oneshot::channel::<i32>();
@@ -58,8 +65,14 @@ async fn streaming_output_harness() -> anyhow::Result<StreamingOutputHarness> {
         tokio_util::sync::CancellationToken::new(),
         "streaming-output-test".to_string(),
     );
-    let transcript = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::default()));
-    start_streaming_output(&process, &context, Arc::clone(&transcript));
+    let transcript = Arc::clone(&process.output_handles().transcript);
+    if !early_output.is_empty() {
+        stdout_tx.send(early_output.to_vec())?;
+        while transcript.lock().await.retained_bytes() < early_output.len() {
+            tokio::task::yield_now().await;
+        }
+    }
+    start_streaming_output(&process, &context);
 
     Ok(StreamingOutputHarness {
         process,
@@ -110,6 +123,32 @@ async fn streaming_output_preserves_multibyte_characters_across_chunks() -> anyh
         "é".as_bytes()
     );
     assert!(rx_event.try_recv().is_err());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn transcript_keeps_output_produced_before_streaming_starts() -> anyhow::Result<()> {
+    let StreamingOutputHarness {
+        process,
+        stdout_tx,
+        exit_tx,
+        transcript,
+        ..
+    } = streaming_output_harness_after(b"HEAD\n").await?;
+    let output_drained = process.output_drained_notify();
+    let drained = output_drained.notified();
+    tokio::pin!(drained);
+
+    stdout_tx.send(b"TAIL\n".to_vec())?;
+    drop(stdout_tx);
+    exit_tx.send(0).expect("send exit");
+    (&mut drained).await;
+
+    assert_eq!(
+        transcript.lock().await.to_bytes_with_omission_marker(),
+        b"HEAD\nTAIL\n"
+    );
 
     Ok(())
 }
@@ -311,12 +350,10 @@ fn utf8_boundary_batches_malformed_output() {
 }
 
 #[tokio::test]
-async fn streaming_output_bounds_invalid_bytes_and_keeps_the_full_transcript() {
+async fn streaming_output_bounds_invalid_bytes() {
     let (session, turn, rx_event) = make_session_and_context_with_rx().await;
-    let transcript = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::default()));
     let mut output = Buffer::<8> {
         pending: Vec::new(),
-        transcript: Arc::clone(&transcript),
         emitter: Emitter {
             remaining_deltas: 2,
             session,
@@ -344,12 +381,5 @@ async fn streaming_output_bounds_invalid_bytes_and_keeps_the_full_transcript() {
             b"\xff\xff\xff\xff\xff\xff".to_vec(),
             b"\xf0\x9f\x98\x80\xff\xff\xff".to_vec(),
         ]
-    );
-
-    let mut expected_transcript = bytes.to_vec();
-    expected_transcript.extend([0xfe, 0xfe]);
-    assert_eq!(
-        transcript.lock().await.to_bytes_with_omission_marker(),
-        expected_transcript
     );
 }
