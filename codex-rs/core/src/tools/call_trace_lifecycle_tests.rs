@@ -243,7 +243,7 @@ fn paired_filter_collects_only_dedicated_info_keeps_errors_and_drops_broad_targe
         .with_ansi(false)
         .without_time()
         .with_env_filter(tracing_subscriber::EnvFilter::new(
-            "error,codex_tool_lifecycle=info",
+            "error,opentelemetry_sdk=off,opentelemetry_otlp=off,codex_tool_lifecycle=info",
         ))
         .with_writer(move || writer.clone())
         .finish();
@@ -260,6 +260,10 @@ fn paired_filter_collects_only_dedicated_info_keeps_errors_and_drops_broad_targe
                 message = "PAIRING_UNRELATED_INFO_NEVER_COLLECT");
             emit_lifecycle(fixture());
         }
+        // Preserve the exec default's explicit exporter suppression, even at
+        // ERROR level. This is ordinary fixed diagnostic policy, not env mutation.
+        tracing::error!(target: "opentelemetry_sdk", "SDK_EXPORTER_ERROR_MUST_STAY_OFF");
+        tracing::error!(target: "opentelemetry_otlp", "OTLP_EXPORTER_ERROR_MUST_STAY_OFF");
         // Preserve ERROR behavior outside the secret span; this does not
         // promise arbitrary preexisting ERROR text is redacted.
         tracing::error!(target: "existing_error_target", "PAIRING_EXISTING_ERROR_RETAINED");
@@ -268,6 +272,8 @@ fn paired_filter_collects_only_dedicated_info_keeps_errors_and_drops_broad_targe
     assert!(text.contains("codex_tool_lifecycle"));
     assert!(text.contains("codex.tool_lifecycle"));
     assert!(text.contains("PAIRING_EXISTING_ERROR_RETAINED"));
+    assert!(!text.contains("SDK_EXPORTER_ERROR_MUST_STAY_OFF"));
+    assert!(!text.contains("OTLP_EXPORTER_ERROR_MUST_STAY_OFF"));
     assert!(!text.contains("PAIRING_NETWORK_BODY_NEVER_COLLECT"));
     assert!(!text.contains("codex_otel.trace_safe"));
     assert!(!text.contains("PAIRING_UNRELATED_INFO_NEVER_COLLECT"));
