@@ -230,8 +230,8 @@ async fn wait_for_transcript_bytes(process: &UnifiedExecProcess, total: usize) {
 /// the bounded channels rather than skip chunks, and output must stay open
 /// until both stdout and stderr have ended.
 #[tokio::test]
-async fn local_output_backpressures_a_stalled_consumer_without_losing_chunks()
--> anyhow::Result<()> {
+async fn local_output_backpressures_a_stalled_consumer_without_losing_chunks() -> anyhow::Result<()>
+{
     use super::head_tail_buffer::HeadTailBuffer;
     use super::process::NoopSpawnLifecycle;
     use codex_sandboxing::SandboxType;
@@ -298,7 +298,10 @@ async fn local_output_backpressures_a_stalled_consumer_without_losing_chunks()
     for _ in 0..CHANNEL_CAPACITY {
         tokio::task::yield_now().await;
     }
-    assert!(!sender.is_finished(), "stalled consumer must hold the sender back");
+    assert!(
+        !sender.is_finished(),
+        "stalled consumer must hold the sender back"
+    );
     drop(stalled);
     sender.await??;
 
