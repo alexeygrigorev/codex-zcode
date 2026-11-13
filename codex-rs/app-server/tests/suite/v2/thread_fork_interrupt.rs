@@ -15,6 +15,7 @@ use codex_app_server_protocol::ThreadGoal;
 use codex_app_server_protocol::ThreadGoalGetResponse;
 use codex_app_server_protocol::ThreadGoalSetResponse;
 use codex_app_server_protocol::ThreadGoalStatus;
+use codex_app_server_protocol::ThreadGoalUpdatedNotification;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::TurnInterruptParams;
@@ -267,6 +268,21 @@ async fn fork_interrupt_after_a_manual_interrupt_of_the_same_turn_is_rejected_an
         )
         .await;
     let _: TurnInterruptResponse = request?;
+    // The interrupt response precedes the goal abort lifecycle hook. Wait for
+    // this exact turn's committed pause before checking the stale-turn fork.
+    timeout(DEFAULT_READ_TIMEOUT, async {
+        loop {
+            let notification: ThreadGoalUpdatedNotification =
+                source.mcp.read_notification("thread/goal/updated").await?;
+            if notification.thread_id == thread_id
+                && notification.turn_id.as_deref() == Some(turn_id.as_str())
+                && notification.goal.status == ThreadGoalStatus::Paused
+            {
+                return Ok::<_, anyhow::Error>(());
+            }
+        }
+    })
+    .await??;
     let paused = source.goal(&thread_id).await?.expect("source goal");
     assert_eq!(ThreadGoalStatus::Paused, paused.status);
 
