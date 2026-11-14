@@ -105,6 +105,8 @@ pub struct ThreadItem {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ThreadItemDetails {
+    /// Genuine native return observation; never a synthesized CommandExecution.
+    NativeToolResult(NativeToolResultItem),
     /// Response from the agent.
     /// Either a natural-language response or a JSON string when structured output is requested.
     AgentMessage(AgentMessageItem),
@@ -133,6 +135,14 @@ pub enum ThreadItemDetails {
     TodoList(TodoListItem),
     /// Describes a non-fatal error surfaced as an item.
     Error(ErrorItem),
+}
+
+/// Private owned exec JSON output only; not an AppServer v2 result field.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
+pub struct NativeToolResultItem {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub observation: codex_protocol::protocol::NativeToolObservation,
 }
 
 /// Response from the agent.

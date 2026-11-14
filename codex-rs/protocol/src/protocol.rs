@@ -1989,6 +1989,11 @@ pub enum BridgeToolActivityStatus {
 /// model-visible history.
 #[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema, PartialEq, Eq)]
 pub struct BridgeToolActivityEvent {
+    /// Rust-only owned exec output; never remote API, history or debug output.
+    #[serde(skip)]
+    #[ts(skip)]
+    #[schemars(skip)]
+    pub native_result: Option<NativeToolObservation>,
     /// The external core's id for the tool call.
     pub call_id: String,
     pub tool: String,
@@ -1997,6 +2002,52 @@ pub struct BridgeToolActivityEvent {
     /// error message), capped by the bridge before emission.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+}
+
+/// Internal transport of owned native observations. Not serialized on AppServer v2.
+#[derive(Clone, Deserialize, Serialize, TS, JsonSchema, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum NativeToolObservation {
+    Result(NativeToolResult),
+    /// Sticky loss of stream qualification. Earlier results are not final proof.
+    Invalidated {
+        reason: String,
+    },
+}
+
+impl std::fmt::Debug for NativeToolObservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("NativeToolObservation(<redacted>)")
+    }
+}
+
+/// Observation of an already-executed native Bash call, not an execution request.
+/// `content` is the native serialized tool result, NOT raw stdout. No artifact is read.
+#[derive(Clone, Deserialize, Serialize, TS, JsonSchema, PartialEq, Eq)]
+pub struct NativeToolResult {
+    pub native_event: String,
+    pub native_session_id: String,
+    pub native_turn_id: Option<String>,
+    pub call_id: String,
+    pub tool: String,
+    pub command: String,
+    pub content: String,
+    pub native_success: Option<bool>,
+    pub exit_code: Option<i32>,
+    pub status: Option<String>,
+    pub timed_out: Option<bool>,
+    pub native_truncated: Option<bool>,
+    pub native_original_bytes: Option<u64>,
+    pub native_returned_bytes: Option<u64>,
+    pub local_truncated: bool,
+    /// Sticky stream qualification, not shell success or a claim of raw stdout.
+    pub observation_complete: bool,
+}
+
+impl std::fmt::Debug for NativeToolResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("NativeToolResult(<redacted>)")
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema)]

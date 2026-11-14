@@ -33,6 +33,7 @@ fn scheduled_maps_to_started_with_input_detail() {
             &mut tool_names,
         ),
         BridgeToolActivityEvent {
+            native_result: None,
             call_id: "tc_1".to_string(),
             tool: "Bash".to_string(),
             status: BridgeToolActivityStatus::Started,
@@ -75,6 +76,7 @@ fn successful_result_falls_back_to_scheduled_tool_name() {
             &mut tool_names,
         ),
         BridgeToolActivityEvent {
+            native_result: None,
             call_id: "tc_1".to_string(),
             tool: "Bash".to_string(),
             status: BridgeToolActivityStatus::Completed,
@@ -92,6 +94,7 @@ fn failed_result_maps_to_failed_status() {
             &mut tool_names,
         ),
         BridgeToolActivityEvent {
+            native_result: None,
             call_id: "tc_1".to_string(),
             tool: "Edit".to_string(),
             status: BridgeToolActivityStatus::Failed,
@@ -109,6 +112,7 @@ fn tool_error_maps_to_failed_status() {
             &mut tool_names,
         ),
         BridgeToolActivityEvent {
+            native_result: None,
             call_id: "tc_1".to_string(),
             tool: "unknown".to_string(),
             status: BridgeToolActivityStatus::Failed,

@@ -897,3 +897,37 @@ fn sample_thread_start_response() -> ThreadStartResponse {
         multi_agent_mode: Default::default(),
     }
 }
+
+#[test]
+fn native_observation_filter_requires_exact_outer_thread_and_turn() {
+    let notification = ServerNotification::BridgeToolActivity(
+        codex_app_server_protocol::BridgeToolActivityNotification {
+            native_result: Some(
+                codex_protocol::protocol::NativeToolObservation::Invalidated {
+                    reason: "native_stream_unqualified".to_owned(),
+                },
+            ),
+            thread_id: "own-thread".to_owned(),
+            turn_id: "own-turn".to_owned(),
+            call_id: "native-observer".to_owned(),
+            tool: "observer".to_owned(),
+            status: codex_app_server_protocol::BridgeToolActivityStatus::Failed,
+            detail: None,
+        },
+    );
+    assert!(super::should_process_notification(
+        &notification,
+        "own-thread",
+        "own-turn"
+    ));
+    assert!(!super::should_process_notification(
+        &notification,
+        "foreign-thread",
+        "own-turn"
+    ));
+    assert!(!super::should_process_notification(
+        &notification,
+        "own-thread",
+        "foreign-turn"
+    ));
+}

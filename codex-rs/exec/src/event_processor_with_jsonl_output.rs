@@ -449,6 +449,23 @@ impl EventProcessorWithJsonOutput {
     ) -> CollectedThreadEvents {
         let mut events = Vec::new();
         let status = match notification {
+            ServerNotification::BridgeToolActivity(notification) => {
+                if let Some(observation) = notification.native_result {
+                    events.push(ThreadEvent::ItemCompleted(ItemCompletedEvent {
+                        item: ExecThreadItem {
+                            id: self.next_item_id(),
+                            details: ThreadItemDetails::NativeToolResult(
+                                crate::exec_events::NativeToolResultItem {
+                                    thread_id: notification.thread_id,
+                                    turn_id: notification.turn_id,
+                                    observation,
+                                },
+                            ),
+                        },
+                    }));
+                }
+                CodexStatus::Running
+            }
             ServerNotification::ConfigWarning(notification) => {
                 let message = match notification.details {
                     Some(details) if !details.is_empty() => {

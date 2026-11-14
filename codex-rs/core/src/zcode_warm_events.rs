@@ -84,6 +84,7 @@ pub(crate) fn bridge_tool_activity_from_notification(
         _ => return None,
     };
     Some(BridgeToolActivityEvent {
+        native_result: None,
         call_id,
         tool,
         status,

@@ -657,24 +657,28 @@ async fn warm_turn_maps_tool_call_events_to_bridge_activity() {
 
     let expected = [
         BridgeToolActivityEvent {
+            native_result: None,
             call_id: "tc_1".to_string(),
             tool: "Bash".to_string(),
             status: BridgeToolActivityStatus::Started,
             detail: Some(r#"{"command":"ls /tmp"}"#.to_string()),
         },
         BridgeToolActivityEvent {
+            native_result: None,
             call_id: "tc_2".to_string(),
             tool: "Read".to_string(),
             status: BridgeToolActivityStatus::Started,
             detail: Some(r#"{"file":"/x"}"#.to_string()),
         },
         BridgeToolActivityEvent {
+            native_result: None,
             call_id: "tc_1".to_string(),
             tool: "Bash".to_string(),
             status: BridgeToolActivityStatus::Completed,
             detail: Some("out".to_string()),
         },
         BridgeToolActivityEvent {
+            native_result: None,
             call_id: "tc_2".to_string(),
             tool: "Read".to_string(),
             status: BridgeToolActivityStatus::Failed,
