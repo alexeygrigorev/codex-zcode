@@ -869,15 +869,14 @@ impl ZcodeWarmBridge {
                                 .expect("native observation mutex")
                                 .gap()
                         };
-                        if let Some(activity) = fault {
-                            if tx
+                        if let Some(activity) = fault
+                            && tx
                                 .send(Ok(codex_api::ResponseEvent::BridgeToolActivity(activity)))
                                 .await
                                 .is_err()
-                            {
-                                stop_turn(&collector_bridge, &collector_session).await;
-                                return;
-                            }
+                        {
+                            stop_turn(&collector_bridge, &collector_session).await;
+                            return;
                         }
                         continue;
                     }
@@ -918,15 +917,14 @@ impl ZcodeWarmBridge {
                         .expect("native observation mutex")
                         .observe(&notification, &collector_session, &request_id)
                 };
-                if let Some(activity) = activity {
-                    if tx
+                if let Some(activity) = activity
+                    && tx
                         .send(Ok(codex_api::ResponseEvent::BridgeToolActivity(activity)))
                         .await
                         .is_err()
-                    {
-                        stop_turn(&collector_bridge, &collector_session).await;
-                        return;
-                    }
+                {
+                    stop_turn(&collector_bridge, &collector_session).await;
+                    return;
                 }
                 match notification.get("type").and_then(serde_json::Value::as_str) {
                     Some("model.streaming") => {
