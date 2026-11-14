@@ -314,6 +314,11 @@ function handle(msg) {
 // Both input surfaces feed the same turn: tool activity, deltas, terminal
 // event — only the request/ACK envelope differs.
 function runTurn(sessionId, content) {
+  if (content === "native-modern-proof") {
+    const ev = (kind,payload) => emit({sessionId,turnId:"native-turn",type:"tool.updated",payload:{...payload,kind}});
+    ev("scheduled",{toolCallId:"modern-call",toolName:"Bash",input:{command:"printf actual-nonce"}});
+    ev("result",{toolCallId:"modern-call",result:{success:true,content:"actual-nonce",truncated:false,originalBytes:12,returnedBytes:12,perf:{detail:{kind:"command",command:{status:"completed",exitCode:0,timedOut:false}}}}});
+  }
   if (TOOL_EVENTS) {
     emit({ sessionId: sessionId, type: "tool_call_scheduled", payload: { toolCallId: "tc_1", toolName: "Bash", input: { command: "ls /tmp" } } });
     emit({ sessionId: sessionId, type: "tool_call_scheduled", payload: { toolCallId: "tc_2", toolName: "Read", input: { file: "/x" } } });
@@ -687,7 +692,18 @@ async fn warm_turn_maps_tool_call_events_to_bridge_activity() {
     ];
     for want in expected {
         match next_event(&mut rx).await {
-            ResponseEvent::BridgeToolActivity(activity) => assert_eq!(activity, want),
+            ResponseEvent::BridgeToolActivity(mut activity) => {
+                if let Some(codex_protocol::protocol::NativeToolObservation::Result(result)) =
+                    activity.native_result.take()
+                {
+                    assert_eq!(result.native_session_id, session_id);
+                    assert_eq!(result.command, "ls /tmp");
+                    assert_eq!(result.content, "out");
+                    assert_eq!(result.exit_code, None);
+                    assert!(!result.observation_complete);
+                }
+                assert_eq!(activity, want);
+            }
             other => panic!("expected BridgeToolActivity, got {other:?}"),
         }
     }
@@ -1555,4 +1571,50 @@ async fn v4_send_failure_falls_back_to_legacy_send() {
         "the rejected v4 command must fall back to session/send: {stats_text}"
     );
     bridge.kill("test end");
+}
+
+#[tokio::test]
+async fn warm_modern_native_result_is_observed_not_reexecuted() {
+    let fixture = write_fake_server();
+    let bridge = ZcodeWarmBridge::spawn(
+        &test_runtime(&fixture),
+        "/tmp",
+        WarmMode::Yolo,
+        WarmPermissionPolicy::DenyAll,
+        SessionSeed::Fresh,
+    )
+    .unwrap();
+    let session = bridge.ensure_session("/tmp").await.unwrap();
+    let stream = bridge
+        .turn(
+            &session,
+            "native-modern-proof",
+            TurnInputChannel::LegacySend,
+        )
+        .unwrap();
+    let mut rx = stream.rx_event;
+    let mut results = Vec::new();
+    while let Some(event) = rx.recv().await {
+        match event.unwrap() {
+            ResponseEvent::BridgeToolActivity(activity) => {
+                if let Some(codex_protocol::protocol::NativeToolObservation::Result(result)) =
+                    activity.native_result
+                {
+                    results.push(result);
+                }
+            }
+            ResponseEvent::OutputItemAdded(ResponseItem::FunctionCall { .. })
+            | ResponseEvent::OutputItemDone(ResponseItem::FunctionCall { .. }) => {
+                panic!("no relay")
+            }
+            ResponseEvent::Completed { .. } => break,
+            _ => {}
+        }
+    }
+    bridge.kill("test end");
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].native_session_id, session);
+    assert_eq!(results[0].native_turn_id.as_deref(), Some("native-turn"));
+    assert_eq!(results[0].content, "actual-nonce");
+    assert!(results[0].observation_complete);
 }

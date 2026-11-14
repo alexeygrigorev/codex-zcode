@@ -56,7 +56,6 @@ use crate::client::ZcodeRuntime;
 use crate::client::zcode_failure_message;
 use crate::client::zcode_stderr_tail;
 use crate::zcode_process;
-use crate::zcode_warm_events::bridge_tool_activity_from_notification;
 use crate::zcode_warm_permissions::PermissionRequest;
 use crate::zcode_warm_permissions::PermissionRequestLog;
 use crate::zcode_warm_permissions::WarmPermissionPolicy;
@@ -241,6 +240,7 @@ pub(crate) struct ZcodeWarmBridge {
     stderr_tail: Arc<StdMutex<Vec<u8>>>,
     /// Fan-out of `session/event` notification params to turn collectors.
     events: broadcast::Sender<serde_json::Value>,
+    pub(crate) native_results: Arc<StdMutex<crate::zcode_native_results::NativeResults>>,
     /// Created once per bridge; concurrent first turns share the handshake
     /// and failed attempts leave the cell empty for a retry.
     session_id: tokio::sync::OnceCell<String>,
@@ -279,12 +279,33 @@ impl std::fmt::Debug for ZcodeWarmBridge {
 
 impl ZcodeWarmBridge {
     /// Spawns the app-server child and starts its reader task.
+    #[cfg(test)]
     pub(crate) fn spawn(
         runtime: &ZcodeRuntime,
         workspace_path: &str,
         mode: WarmMode,
         permission_policy: WarmPermissionPolicy,
         resume_seed: SessionSeed,
+    ) -> io::Result<Arc<Self>> {
+        Self::spawn_observed(
+            runtime,
+            workspace_path,
+            mode,
+            permission_policy,
+            resume_seed,
+            Arc::new(StdMutex::new(
+                crate::zcode_native_results::NativeResults::default(),
+            )),
+        )
+    }
+
+    pub(crate) fn spawn_observed(
+        runtime: &ZcodeRuntime,
+        workspace_path: &str,
+        mode: WarmMode,
+        permission_policy: WarmPermissionPolicy,
+        resume_seed: SessionSeed,
+        native_results: Arc<StdMutex<crate::zcode_native_results::NativeResults>>,
     ) -> io::Result<Arc<Self>> {
         let mut command = Command::new(&runtime.node);
         command
@@ -361,6 +382,7 @@ impl ZcodeWarmBridge {
             process_group_pid,
             stderr_tail,
             events,
+            native_results,
             session_id: tokio::sync::OnceCell::new(),
             resume_seed,
             last_event_seq: AtomicU64::new(0),
@@ -834,41 +856,77 @@ impl ZcodeWarmBridge {
 
             let mut reply = String::new();
             let mut started_output = false;
-            let mut tool_names = HashMap::new();
             loop {
-                let notification =
-                    match tokio::time::timeout(collector_timeout, events.recv()).await {
-                        Ok(Ok(params)) => params,
-                        Ok(Err(broadcast::error::RecvError::Lagged(_skipped))) => continue,
-                        Ok(Err(broadcast::error::RecvError::Closed)) => {
-                            let _ = tx
-                                .send(Err(ApiError::Stream(
-                                    "ZCode warm app-server event stream closed".to_string(),
-                                )))
-                                .await;
-                            return;
-                        }
-                        Err(_elapsed) => {
-                            if let Some(bridge) = collector_bridge.upgrade() {
-                                bridge.register_failure();
-                                bridge.kill("turn events stalled");
+                let notification = match tokio::time::timeout(collector_timeout, events.recv())
+                    .await
+                {
+                    Ok(Ok(params)) => params,
+                    Ok(Err(broadcast::error::RecvError::Lagged(_skipped))) => {
+                        let fault = {
+                            send_bridge
+                                .native_results
+                                .lock()
+                                .expect("native observation mutex")
+                                .gap()
+                        };
+                        if let Some(activity) = fault {
+                            if tx
+                                .send(Ok(codex_api::ResponseEvent::BridgeToolActivity(activity)))
+                                .await
+                                .is_err()
+                            {
+                                stop_turn(&collector_bridge, &collector_session).await;
+                                return;
                             }
-                            let _ = tx
-                                .send(Err(ApiError::Stream(
-                                    "ZCode warm turn stalled: no session events before the idle \
-                                 window elapsed"
-                                        .to_string(),
-                                )))
-                                .await;
-                            return;
                         }
-                    };
+                        continue;
+                    }
+                    Ok(Err(broadcast::error::RecvError::Closed)) => {
+                        let _ = tx
+                            .send(Err(ApiError::Stream(
+                                "ZCode warm app-server event stream closed".to_string(),
+                            )))
+                            .await;
+                        return;
+                    }
+                    Err(_elapsed) => {
+                        if let Some(bridge) = collector_bridge.upgrade() {
+                            bridge.register_failure();
+                            bridge.kill("turn events stalled");
+                        }
+                        let _ = tx
+                            .send(Err(ApiError::Stream(
+                                "ZCode warm turn stalled: no session events before the idle \
+                                 window elapsed"
+                                    .to_string(),
+                            )))
+                            .await;
+                        return;
+                    }
+                };
                 if notification
                     .get("sessionId")
                     .and_then(serde_json::Value::as_str)
                     != Some(collector_session.as_str())
                 {
                     continue;
+                }
+                let activity = {
+                    send_bridge
+                        .native_results
+                        .lock()
+                        .expect("native observation mutex")
+                        .observe(&notification, &collector_session, &request_id)
+                };
+                if let Some(activity) = activity {
+                    if tx
+                        .send(Ok(codex_api::ResponseEvent::BridgeToolActivity(activity)))
+                        .await
+                        .is_err()
+                    {
+                        stop_turn(&collector_bridge, &collector_session).await;
+                        return;
+                    }
                 }
                 match notification.get("type").and_then(serde_json::Value::as_str) {
                     Some("model.streaming") => {
@@ -905,21 +963,6 @@ impl ZcodeWarmBridge {
                                 stop_turn(&collector_bridge, &collector_session).await;
                                 return;
                             }
-                        }
-                    }
-                    Some("tool_call_scheduled" | "tool_call_result" | "tool_call_error") => {
-                        // Display-only tool activity from the core's own
-                        // agent loop (issue #38): surfaced as an event, never
-                        // as a ResponseItem the ToolCallRuntime would run.
-                        if let Some(activity) =
-                            bridge_tool_activity_from_notification(&notification, &mut tool_names)
-                            && tx
-                                .send(Ok(codex_api::ResponseEvent::BridgeToolActivity(activity)))
-                                .await
-                                .is_err()
-                        {
-                            stop_turn(&collector_bridge, &collector_session).await;
-                            return;
                         }
                     }
                     Some("turn.failed") => {

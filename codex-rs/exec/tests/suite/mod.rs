@@ -9,6 +9,7 @@ mod completion_backfill;
 mod ephemeral;
 mod hooks;
 mod mcp_required_exit;
+mod native_tool_result;
 mod originator;
 mod output_schema;
 mod prompt_stdin;
