@@ -244,7 +244,6 @@ pub use installation_id::resolve_installation_id;
 pub mod compact;
 mod memory_usage;
 pub mod otel_init;
-#[cfg(test)]
 mod zcode_native_results;
 mod zcode_process;
 mod zcode_warm;

@@ -22,7 +22,6 @@
 //! goal blocked instead of leaving it active, so an unachievable objective
 //! ends its pursuit rather than re-mirroring forever (issue #53).
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use codex_api::ApiError;
@@ -42,7 +41,6 @@ use crate::zcode_warm::event_timeout;
 use crate::zcode_warm::stop_turn;
 use crate::zcode_warm::token_usage_from_turn_payload;
 use crate::zcode_warm::zcode_completed_turn_error;
-use crate::zcode_warm_events::bridge_tool_activity_from_notification;
 
 /// Env var controlling goal mirroring for warm sessions (`ZCODE_WARM_GOAL`).
 /// On by default since the live validation (issue #50); set to `0`, `false`,
@@ -204,14 +202,32 @@ pub(crate) async fn turn_mirrored(
     tokio::spawn(async move {
         let mut reply = String::new();
         let mut started_output = false;
-        let mut tool_names = HashMap::new();
         let mut turns_seen: u32 = 0;
         let mut usage = TokenUsage::default();
         let mut settle: Option<Settle> = None;
         loop {
             let notification = match tokio::time::timeout(collector_timeout, events.recv()).await {
                 Ok(Ok(params)) => params,
-                Ok(Err(broadcast::error::RecvError::Lagged(_skipped))) => continue,
+                Ok(Err(broadcast::error::RecvError::Lagged(_skipped))) => {
+                    let fault = collector_bridge.upgrade().and_then(|bridge| {
+                        bridge
+                            .native_results
+                            .lock()
+                            .expect("native observation mutex")
+                            .gap()
+                    });
+                    if let Some(activity) = fault {
+                        if tx
+                            .send(Ok(codex_api::ResponseEvent::BridgeToolActivity(activity)))
+                            .await
+                            .is_err()
+                        {
+                            stop_turn(&collector_bridge, &collector_session).await;
+                            return;
+                        }
+                    }
+                    continue;
+                }
                 Ok(Err(broadcast::error::RecvError::Closed)) => {
                     let _ = tx
                         .send(Err(ApiError::Stream(
@@ -241,6 +257,23 @@ pub(crate) async fn turn_mirrored(
                 != Some(collector_session.as_str())
             {
                 continue;
+            }
+            let activity = collector_bridge.upgrade().and_then(|bridge| {
+                bridge
+                    .native_results
+                    .lock()
+                    .expect("native observation mutex")
+                    .observe(&notification, &collector_session, &request_id)
+            });
+            if let Some(activity) = activity {
+                if tx
+                    .send(Ok(codex_api::ResponseEvent::BridgeToolActivity(activity)))
+                    .await
+                    .is_err()
+                {
+                    stop_turn(&collector_bridge, &collector_session).await;
+                    return;
+                }
             }
             match notification.get("type").and_then(serde_json::Value::as_str) {
                 Some("model.streaming") => {
@@ -277,18 +310,6 @@ pub(crate) async fn turn_mirrored(
                             stop_turn(&collector_bridge, &collector_session).await;
                             return;
                         }
-                    }
-                }
-                Some("tool_call_scheduled" | "tool_call_result" | "tool_call_error") => {
-                    if let Some(activity) =
-                        bridge_tool_activity_from_notification(&notification, &mut tool_names)
-                        && tx
-                            .send(Ok(codex_api::ResponseEvent::BridgeToolActivity(activity)))
-                            .await
-                            .is_err()
-                    {
-                        stop_turn(&collector_bridge, &collector_session).await;
-                        return;
                     }
                 }
                 Some("turn.failed") => {

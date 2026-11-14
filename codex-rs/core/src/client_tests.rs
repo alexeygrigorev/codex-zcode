@@ -2809,3 +2809,77 @@ fn zcode_db_lock_classifier_matches_sqlite_lock_stderr_only() {
     ));
     assert!(!super::zcode_stderr_is_db_lock(""));
 }
+
+#[tokio::test]
+async fn cold_native_results_observe_modern_and_legacy_without_relay() {
+    for modern in [false, true] {
+        let temp = tempfile::tempdir().expect("owned fixture");
+        let path = temp.path().join("native.cjs");
+        let script = r#"
+const emit = v => process.stdout.write(JSON.stringify(v) + "\n");
+emit({type:"session.updated",sessionId:"native-session"});
+emit({type:"model.streaming",payload:{kind:"text_delta",delta:"assistant quoted false-nonce"}});
+const modern = MODERN;
+const ev = (kind,payload) => emit({type:modern?"tool.updated":"tool_call_"+kind,sessionId:"native-session",turnId:"native-turn",payload:{...payload,...(modern?{kind}: {})}});
+ev("scheduled",{toolCallId:"call",toolName:"Bash",input:{command:"printf actual-nonce"}});
+ev("result",{toolCallId:"call",result:{success:true,content:"actual-nonce",truncated:false,originalBytes:12,returnedBytes:12,perf:{detail:{kind:"command",command:{status:"completed",exitCode:0,timedOut:false}}}}});
+emit({type:"result",response:"done"});
+"#.replace("MODERN", if modern { "true" } else { "false" });
+        std::fs::write(&path, script).expect("fixture bytes");
+        let prompt = Prompt {
+            input: vec![zcode_user_message("observe actual native result")],
+            ..Default::default()
+        };
+        let observer = Arc::new(Mutex::new(
+            crate::zcode_native_results::NativeResults::default(),
+        ));
+        for attempt in 0..2 {
+            let mut stream = super::ModelClientSession::stream_zcode_observed(
+                super::ZcodeRuntime {
+                    node: "node".to_owned(),
+                    cjs: path.to_string_lossy().into_owned(),
+                },
+                &prompt,
+                "outer-thread".to_owned(),
+                Arc::clone(&observer),
+            )
+            .await
+            .unwrap();
+            let mut results = Vec::new();
+            let mut faults = 0;
+            while let Some(event) = stream.rx_event.recv().await {
+                match event.unwrap() {
+                    ResponseEvent::BridgeToolActivity(activity) => match activity.native_result {
+                        Some(codex_protocol::protocol::NativeToolObservation::Result(result)) => {
+                            results.push(result)
+                        }
+                        Some(codex_protocol::protocol::NativeToolObservation::Invalidated {
+                            ..
+                        }) => faults += 1,
+                        None => {}
+                    },
+                    ResponseEvent::OutputItemAdded(ResponseItem::FunctionCall { .. })
+                    | ResponseEvent::OutputItemDone(ResponseItem::FunctionCall { .. }) => {
+                        panic!("native effect must never be relayed")
+                    }
+                    _ => {}
+                }
+            }
+            if attempt == 1 {
+                assert!(results.is_empty());
+                assert_eq!(
+                    faults, 1,
+                    "restarting a cold stream must not heal/replay old evidence"
+                );
+                continue;
+            }
+            assert_eq!(faults, 0);
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].content, "actual-nonce");
+            assert_eq!(results[0].command, "printf actual-nonce");
+            assert_eq!(results[0].exit_code, Some(0));
+            assert!(results[0].observation_complete);
+            assert!(!results[0].content.contains("false-nonce"));
+        }
+    }
+}

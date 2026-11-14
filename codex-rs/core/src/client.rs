@@ -1010,6 +1010,7 @@ struct ModelClientState {
     /// [`ZcodeWarmSlot::Claiming`] state and concurrent callers re-check.
     zcode_warm: StdMutex<Option<ZcodeWarmSlot>>,
     zcode_warm_spawn_failures: AtomicU32,
+    zcode_native_results: Arc<StdMutex<crate::zcode_native_results::NativeResults>>,
 }
 
 /// The warm slot's lifecycle: idle or claimed, then ready with a child.
@@ -1365,6 +1366,9 @@ impl ModelClient {
                 agent_identity_session_fallback: AgentIdentitySessionFallback::default(),
                 cached_websocket_session: StdMutex::new(WebsocketSession::default()),
                 zcode_warm: StdMutex::new(None),
+                zcode_native_results: Arc::new(StdMutex::new(
+                    crate::zcode_native_results::NativeResults::default(),
+                )),
                 zcode_warm_spawn_failures: AtomicU32::new(0),
             }),
             agent_identity_policy,
@@ -3045,17 +3049,23 @@ impl ModelClientSession {
                                 "ZCode warm bridge unavailable ({warm_error}); using \
                                  spawn-per-turn"
                             );
-                            Self::stream_zcode(
+                            Self::stream_zcode_observed(
                                 runtime,
                                 prompt,
                                 self.client.state.thread_id.to_string(),
+                                Arc::clone(&self.client.state.zcode_native_results),
                             )
                             .await?
                         }
                     }
                 } else {
-                    Self::stream_zcode(runtime, prompt, self.client.state.thread_id.to_string())
-                        .await?
+                    Self::stream_zcode_observed(
+                        runtime,
+                        prompt,
+                        self.client.state.thread_id.to_string(),
+                        Arc::clone(&self.client.state.zcode_native_results),
+                    )
+                    .await?
                 };
                 let (stream, _) = map_response_stream(
                     api_stream,
@@ -3205,12 +3215,13 @@ impl ModelClientSession {
                 .zcode_warm
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            match zcode_warm::ZcodeWarmBridge::spawn(
+            match zcode_warm::ZcodeWarmBridge::spawn_observed(
                 runtime,
                 &workspace_path,
                 zcode_warm::warm_mode_from_env(),
                 zcode_warm_permissions::WarmPermissionPolicy::from_env(),
                 resume_seed,
+                Arc::clone(&state.zcode_native_results),
             ) {
                 Ok(bridge) => {
                     *slot = Some(ZcodeWarmSlot::Ready(ZcodeWarmSlotEntry {
@@ -3323,10 +3334,28 @@ impl ModelClientSession {
     /// is failed as stalled, and stalled or aborted invocations are torn down
     /// in stages (graceful termination request, grace period, process-tree
     /// kill) so spawned shells never strand.
+    #[cfg(test)]
     async fn stream_zcode(
         runtime: ZcodeRuntime,
         prompt: &Prompt,
         thread_id: String,
+    ) -> Result<codex_api::ResponseStream> {
+        Self::stream_zcode_observed(
+            runtime,
+            prompt,
+            thread_id,
+            Arc::new(StdMutex::new(
+                crate::zcode_native_results::NativeResults::default(),
+            )),
+        )
+        .await
+    }
+
+    async fn stream_zcode_observed(
+        runtime: ZcodeRuntime,
+        prompt: &Prompt,
+        thread_id: String,
+        native_results: Arc<StdMutex<crate::zcode_native_results::NativeResults>>,
     ) -> Result<codex_api::ResponseStream> {
         use std::process::Stdio;
         use tokio::process::Command;
@@ -3690,7 +3719,29 @@ impl ModelClientSession {
                 if kind == "session.updated"
                     && let Some(id) = parsed.get("sessionId").and_then(|v| v.as_str())
                 {
-                    session_id = id.to_string();
+                    if !session_id.is_empty() && session_id != id {
+                        native_results
+                            .lock()
+                            .expect("native observation mutex")
+                            .invalidate();
+                    } else {
+                        session_id = id.to_string();
+                    }
+                }
+                let activity = {
+                    native_results
+                        .lock()
+                        .expect("native observation mutex")
+                        .observe(&parsed, &session_id, &request_id_for_stream)
+                };
+                if let Some(activity) = activity {
+                    if tx
+                        .send(Ok(ResponseEvent::BridgeToolActivity(activity)))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
                 }
                 if kind == "model.streaming" {
                     let event_kind = payload
