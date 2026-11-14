@@ -13,6 +13,7 @@ fn activity(
 ) {
     chat.handle_server_notification(
         ServerNotification::BridgeToolActivity(BridgeToolActivityNotification {
+            native_result: None,
             thread_id: "thread-1".to_string(),
             turn_id: "turn-1".to_string(),
             call_id: call_id.to_string(),

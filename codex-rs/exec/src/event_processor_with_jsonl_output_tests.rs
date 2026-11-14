@@ -142,3 +142,83 @@ fn mcp_tool_call_result_preserves_meta_in_jsonl_event() {
     );
     assert!(serialized["item"]["result"].get("meta").is_none());
 }
+
+#[test]
+fn native_result_is_owned_json_only_and_never_a_command_execution() {
+    use codex_protocol::protocol::NativeToolObservation;
+    use codex_protocol::protocol::NativeToolResult;
+    let observation = NativeToolObservation::Result(NativeToolResult {
+        native_event: "tool_call_result".to_owned(),
+        native_session_id: "native-session".to_owned(),
+        native_turn_id: Some("native-turn".to_owned()),
+        call_id: "actual-call".to_owned(),
+        tool: "Bash".to_owned(),
+        command: "printf nonce".to_owned(),
+        content: "nonce".to_owned(),
+        native_success: Some(true),
+        exit_code: Some(0),
+        status: Some("completed".to_owned()),
+        timed_out: Some(false),
+        native_truncated: Some(false),
+        native_original_bytes: Some(5),
+        native_returned_bytes: Some(5),
+        local_truncated: false,
+        observation_complete: true,
+    });
+    let activity = codex_app_server_protocol::BridgeToolActivityNotification {
+        native_result: Some(observation.clone()),
+        thread_id: "thread-1".to_owned(),
+        turn_id: "turn-1".to_owned(),
+        call_id: "actual-call".to_owned(),
+        tool: "Bash".to_owned(),
+        status: codex_app_server_protocol::BridgeToolActivityStatus::Completed,
+        detail: Some("preview".to_owned()),
+    };
+    let public = serde_json::to_value(&activity).unwrap();
+    assert_eq!(
+        public,
+        json!({"threadId":"thread-1","turnId":"turn-1","callId":"actual-call","tool":"Bash","status":"completed","detail":"preview"})
+    );
+    assert!(!format!("{activity:?}").contains("printf nonce"));
+    assert!(!format!("{activity:?}").contains("content:"));
+    let deserialized: codex_app_server_protocol::BridgeToolActivityNotification =
+        serde_json::from_value(public).unwrap();
+    assert_eq!(deserialized.native_result, None);
+    let mut processor = EventProcessorWithJsonOutput::new(/*last_message_path*/ None);
+    let collected =
+        processor.collect_thread_events(ServerNotification::BridgeToolActivity(activity));
+    assert_eq!(collected.events.len(), 1);
+    let encoded = serde_json::to_value(&collected.events[0]).unwrap();
+    assert_eq!(encoded["type"], "item.completed");
+    assert_eq!(encoded["item"]["type"], "native_tool_result");
+    assert_eq!(encoded["item"]["thread_id"], "thread-1");
+    assert_eq!(encoded["item"]["turn_id"], "turn-1");
+    assert_eq!(encoded["item"]["observation"]["content"], "nonce");
+    assert_eq!(encoded["item"]["observation"]["kind"], "result");
+    assert!(!encoded.to_string().contains("command_execution"));
+}
+
+#[test]
+fn native_stream_fault_is_explicit_owned_json_not_silent_loss() {
+    let mut processor = EventProcessorWithJsonOutput::new(/*last_message_path*/ None);
+    let collected = processor.collect_thread_events(ServerNotification::BridgeToolActivity(
+        codex_app_server_protocol::BridgeToolActivityNotification {
+            native_result: Some(
+                codex_protocol::protocol::NativeToolObservation::Invalidated {
+                    reason: "native_stream_unqualified".to_owned(),
+                },
+            ),
+            thread_id: "t".to_owned(),
+            turn_id: "u".to_owned(),
+            call_id: "native-observer".to_owned(),
+            tool: "observer".to_owned(),
+            status: codex_app_server_protocol::BridgeToolActivityStatus::Failed,
+            detail: None,
+        },
+    ));
+    let encoded = serde_json::to_value(&collected.events[0]).unwrap();
+    assert_eq!(
+        encoded["item"]["observation"],
+        json!({"kind":"invalidated","reason":"native_stream_unqualified"})
+    );
+}

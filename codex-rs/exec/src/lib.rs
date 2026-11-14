@@ -1614,6 +1614,9 @@ fn should_process_notification(
         ServerNotification::ItemStarted(notification) => {
             notification.thread_id == thread_id && notification.turn_id == turn_id
         }
+        ServerNotification::BridgeToolActivity(notification) => {
+            notification.thread_id == thread_id && notification.turn_id == turn_id
+        }
         ServerNotification::ModelRerouted(notification) => {
             notification.thread_id == thread_id && notification.turn_id == turn_id
         }

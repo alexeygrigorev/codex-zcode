@@ -423,6 +423,7 @@ pub(crate) async fn apply_bespoke_event_handling(
                 }
             };
             let notification = BridgeToolActivityNotification {
+                native_result: event.native_result,
                 thread_id: conversation_id.to_string(),
                 turn_id: event_turn_id.clone(),
                 call_id: event.call_id,

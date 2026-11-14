@@ -109,6 +109,9 @@ pub const DEFAULT_IN_PROCESS_CHANNEL_CAPACITY: usize = CHANNEL_CAPACITY;
 type PendingClientRequestResponse = std::result::Result<Result, JSONRPCErrorError>;
 
 fn server_notification_requires_delivery(notification: &ServerNotification) -> bool {
+    if let ServerNotification::BridgeToolActivity(activity) = notification {
+        return activity.native_result.is_some();
+    }
     matches!(
         notification,
         ServerNotification::TurnCompleted(_)
@@ -1062,3 +1065,7 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "in_process_native_result_tests.rs"]
+mod native_result_delivery_tests;

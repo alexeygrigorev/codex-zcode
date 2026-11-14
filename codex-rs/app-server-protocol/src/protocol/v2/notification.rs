@@ -25,6 +25,11 @@ pub enum BridgeToolActivityStatus {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct BridgeToolActivityNotification {
+    /// In-process only. Remote serialization/schema/SDK never contain tool output.
+    #[serde(skip)]
+    #[ts(skip)]
+    #[schemars(skip)]
+    pub native_result: Option<codex_protocol::protocol::NativeToolObservation>,
     pub thread_id: String,
     pub turn_id: String,
     /// The external core's id for the tool call.
@@ -106,3 +111,7 @@ pub struct ServerRequestResolvedNotification {
     pub thread_id: String,
     pub request_id: RequestId,
 }
+
+#[cfg(test)]
+#[path = "notification_native_observation_tests.rs"]
+mod native_observation_privacy_tests;
