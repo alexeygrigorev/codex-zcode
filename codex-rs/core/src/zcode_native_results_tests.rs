@@ -73,6 +73,167 @@ fn both_native_schemas_preserve_actual_matched_result_without_dispatch() {
 }
 
 #[test]
+fn api_success_never_invents_shell_success_or_output_completeness() {
+    for success in [Value::Null, json!(false), json!(true), json!("true")] {
+        let mut state = NativeResults::default();
+        observe(
+            &mut state,
+            &event(/*modern*/ true, "scheduled", "call", Value::Null),
+        );
+        let observed = result(
+            observe(
+                &mut state,
+                &event(
+                    true,
+                    "result",
+                    "call",
+                    json!({"success":success,"content":"nonce"}),
+                ),
+            )
+            .unwrap(),
+        );
+        assert_eq!(observed.native_success, success.as_bool());
+        assert_eq!(observed.exit_code, None);
+        assert_eq!(observed.status, None);
+        assert_eq!(observed.timed_out, None);
+        assert!(!observed.observation_complete);
+    }
+}
+
+#[test]
+fn shell_failure_timeout_and_native_truncation_remain_explicit() {
+    let mut state = NativeResults::default();
+    observe(
+        &mut state,
+        &event(/*modern*/ true, "scheduled", "call", Value::Null),
+    );
+    let mut native = returned();
+    native["perf"]["detail"]["command"]["exitCode"] = json!(7);
+    native["perf"]["detail"]["command"]["status"] = json!("timed_out");
+    native["perf"]["detail"]["command"]["timedOut"] = json!(true);
+    native["truncated"] = json!(true);
+    let observed = result(
+        observe(
+            &mut state,
+            &event(/*modern*/ true, "result", "call", native),
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        (
+            observed.native_success,
+            observed.exit_code,
+            observed.timed_out
+        ),
+        (Some(true), Some(7), Some(true))
+    );
+    assert!(!observed.observation_complete);
+}
+
+#[test]
+fn utf8_and_total_budget_are_bounded_and_never_heal() {
+    let mut state = NativeResults::default();
+    for index in 0..4 {
+        let id = index.to_string();
+        observe(
+            &mut state,
+            &event(/*modern*/ true, "scheduled", &id, Value::Null),
+        );
+        let mut native = returned();
+        native["content"] = json!("x".repeat(MAX_CONTENT));
+        native["originalBytes"] = json!(MAX_CONTENT);
+        native["returnedBytes"] = json!(MAX_CONTENT);
+        let observed =
+            result(observe(&mut state, &event(/*modern*/ true, "result", &id, native)).unwrap());
+        assert!(observed.observation_complete);
+    }
+    observe(
+        &mut state,
+        &event(/*modern*/ true, "scheduled", "overflow", Value::Null),
+    );
+    let mut native = returned();
+    native["content"] = json!("🦀".repeat(MAX_CONTENT));
+    let observed = result(
+        observe(
+            &mut state,
+            &event(/*modern*/ true, "result", "overflow", native),
+        )
+        .unwrap(),
+    );
+    assert_eq!(observed.content, "");
+    assert!(observed.local_truncated);
+    assert!(!observed.observation_complete);
+    assert!(matches!(
+        state.gap().unwrap().native_result,
+        Some(NativeToolObservation::Invalidated { .. })
+    ));
+    assert!(
+        observe(
+            &mut state,
+            &event(/*modern*/ true, "scheduled", "new", Value::Null)
+        )
+        .unwrap()
+        .native_result
+        .is_none()
+    );
+    assert!(state.invalid);
+    assert_eq!(utf8_prefix("xx🦀", 5), 2);
+}
+
+#[test]
+fn duplicate_orphan_foreign_turn_session_and_cross_collector_cannot_be_proof() {
+    for attack in [
+        "duplicate",
+        "orphan",
+        "session",
+        "turn",
+        "collector",
+        "rename",
+    ] {
+        let mut state = NativeResults::default();
+        if attack != "orphan" {
+            observe(
+                &mut state,
+                &event(/*modern*/ true, "scheduled", "call", Value::Null),
+            );
+        }
+        let mut native = event(/*modern*/ true, "result", "call", returned());
+        match attack {
+            "duplicate" => {
+                observe(&mut state, &native);
+            }
+            "session" => native["sessionId"] = json!("foreign"),
+            "turn" => native["turnId"] = json!("foreign"),
+            "rename" => native["payload"]["toolName"] = json!("Read"),
+            _ => {}
+        }
+        let observed = if attack == "collector" {
+            state.observe(&native, "native-session", "later-outer-turn")
+        } else {
+            observe(&mut state, &native)
+        }
+        .unwrap();
+        assert!(
+            matches!(
+                observed.native_result,
+                Some(NativeToolObservation::Invalidated { .. })
+            ),
+            "{attack}"
+        );
+        assert!(
+            observe(
+                &mut state,
+                &event(/*modern*/ true, "scheduled", "later", Value::Null)
+            )
+            .unwrap()
+            .native_result
+            .is_none()
+        );
+        assert!(state.invalid);
+    }
+}
+
+#[test]
 fn call_cap_lag_and_missing_native_turn_fail_closed() {
     let mut state = NativeResults::default();
     for index in 0..MAX_CALLS {
@@ -111,6 +272,68 @@ fn call_cap_lag_and_missing_native_turn_fail_closed() {
 }
 
 #[test]
+fn internal_event_serialization_and_debug_do_not_leak_native_payload() {
+    let mut state = NativeResults::default();
+    observe(
+        &mut state,
+        &event(/*modern*/ true, "scheduled", "call", Value::Null),
+    );
+    let activity = observe(
+        &mut state,
+        &event(/*modern*/ true, "result", "call", returned()),
+    )
+    .unwrap();
+    let public = serde_json::to_value(&activity).unwrap();
+    assert!(public.get("native_result").is_none());
+    let encoded = serde_json::to_value(codex_protocol::protocol::EventMsg::BridgeToolActivity(
+        activity.clone(),
+    ))
+    .unwrap();
+    assert!(!encoded.to_string().contains("native_session_id"));
+    assert!(!format!("{activity:?}").contains("printf 'actual-nonce'"));
+}
+
+#[test]
+fn missing_boolean_or_numeric_metadata_never_becomes_complete_output() {
+    for (path, bad) in [
+        ("/truncated", json!("false")),
+        ("/returnedBytes", json!(true)),
+        ("/originalBytes", Value::Null),
+    ] {
+        let mut state = NativeResults::default();
+        observe(
+            &mut state,
+            &event(/*modern*/ true, "scheduled", "call", Value::Null),
+        );
+        let mut native = returned();
+        *native.pointer_mut(path).unwrap() = bad;
+        let observed = result(
+            observe(
+                &mut state,
+                &event(/*modern*/ true, "result", "call", native),
+            )
+            .unwrap(),
+        );
+        assert!(!observed.observation_complete, "{path}");
+    }
+    let mut state = NativeResults::default();
+    observe(
+        &mut state,
+        &event(/*modern*/ true, "scheduled", "call", Value::Null),
+    );
+    let mut native = returned();
+    native["perf"]["detail"]["command"]["exitCode"] = json!(false);
+    let observed = result(
+        observe(
+            &mut state,
+            &event(/*modern*/ true, "result", "call", native),
+        )
+        .unwrap(),
+    );
+    assert_eq!(observed.exit_code, None);
+}
+
+#[test]
 fn malformed_modern_kind_cannot_hide_between_schedule_and_matching_result() {
     for kind in [
         None,
@@ -144,6 +367,27 @@ fn malformed_modern_kind_cannot_hide_between_schedule_and_matching_result() {
             .is_none()
         );
         assert!(state.invalid);
+    }
+}
+
+#[test]
+fn documented_nonproof_native_activity_does_not_poison_a_real_return() {
+    for kind in ["started", "progress", "batch"] {
+        let mut state = NativeResults::default();
+        observe(
+            &mut state,
+            &event(/*modern*/ true, "scheduled", "call", Value::Null),
+        );
+        let activity = json!({"type":"tool.updated","sessionId":"native-session","turnId":"native-turn","payload":{"kind":kind,"toolCallId":"call"}});
+        assert!(observe(&mut state, &activity).is_none());
+        let actual = result(
+            observe(
+                &mut state,
+                &event(/*modern*/ true, "result", "call", returned()),
+            )
+            .unwrap(),
+        );
+        assert!(actual.observation_complete);
     }
 }
 
