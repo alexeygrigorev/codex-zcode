@@ -3734,14 +3734,13 @@ impl ModelClientSession {
                         .expect("native observation mutex")
                         .observe(&parsed, &session_id, &request_id_for_stream)
                 };
-                if let Some(activity) = activity {
-                    if tx
+                if let Some(activity) = activity
+                    && tx
                         .send(Ok(ResponseEvent::BridgeToolActivity(activity)))
                         .await
                         .is_err()
-                    {
-                        break;
-                    }
+                {
+                    break;
                 }
                 if kind == "model.streaming" {
                     let event_kind = payload
