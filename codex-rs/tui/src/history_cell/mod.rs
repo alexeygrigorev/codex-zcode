@@ -104,7 +104,6 @@ const RAW_DIFF_SUMMARY_WIDTH: usize = 10_000;
 
 mod approvals;
 mod base;
-#[cfg(test)]
 mod bridge_native;
 mod exec;
 mod hook_cell;
@@ -123,6 +122,7 @@ mod startup_warnings;
 
 pub(crate) use approvals::*;
 pub(crate) use base::*;
+pub(crate) use bridge_native::BridgeNativeHistory;
 pub(crate) use exec::*;
 pub(crate) use hook_cell::HookCell;
 pub(crate) use hook_cell::new_active_hook_cell;
