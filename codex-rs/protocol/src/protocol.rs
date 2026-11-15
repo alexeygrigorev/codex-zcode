@@ -1989,7 +1989,8 @@ pub enum BridgeToolActivityStatus {
 /// model-visible history.
 #[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema, PartialEq, Eq)]
 pub struct BridgeToolActivityEvent {
-    /// Rust-only owned exec output; never remote API, history or debug output.
+    /// Rust-only owned native observation for exec/local UI; never remote API,
+    /// model-visible history or debug output.
     #[serde(skip)]
     #[ts(skip)]
     #[schemars(skip)]

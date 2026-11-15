@@ -107,3 +107,80 @@ async fn bridge_tool_activity_running_row_renders() {
         .expect("render bridge tool status");
     assert_chatwidget_snapshot!("bridge_tool_activity_row", terminal.backend());
 }
+
+#[tokio::test]
+async fn genuine_in_process_native_return_inserts_ui_history_without_execution_request() {
+    use codex_protocol::protocol::NativeToolObservation;
+    use codex_protocol::protocol::NativeToolResult;
+    let (mut chat, mut events, mut ops) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(codex_protocol::ThreadId::new());
+    chat.turn_lifecycle.last_turn_id = Some("owned-turn".to_owned());
+    while events.try_recv().is_ok() {}
+    while ops.try_recv().is_ok() {}
+    let content = "native-only-marker".to_owned();
+    chat.on_bridge_tool_activity(BridgeToolActivityNotification {
+        native_result: Some(NativeToolObservation::Result(NativeToolResult {
+            native_event: "tool_call_result".to_owned(),
+            native_session_id: "native-session".to_owned(),
+            native_turn_id: Some("native-turn".to_owned()),
+            call_id: "owned-call".to_owned(),
+            tool: "Bash".to_owned(),
+            command: "python3 .local/h7_0123456789ab_01.py".to_owned(),
+            native_original_bytes: Some(content.len() as u64),
+            native_returned_bytes: Some(content.len() as u64),
+            content,
+            native_success: Some(true),
+            exit_code: Some(0),
+            status: Some("completed".to_owned()),
+            timed_out: Some(false),
+            native_truncated: Some(false),
+            local_truncated: false,
+            observation_complete: true,
+        })),
+        thread_id: chat.thread_id().unwrap().to_string(),
+        turn_id: "owned-turn".to_owned(),
+        call_id: "owned-call".to_owned(),
+        tool: "Bash".to_owned(),
+        status: AppServerBridgeToolActivityStatus::Completed,
+        detail: Some("preview-must-not-replace-return".to_owned()),
+    });
+    let mut native_cells = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let AppEvent::InsertHistoryCell(cell) = event {
+            let text = cell
+                .raw_lines()
+                .into_iter()
+                .map(|line| {
+                    line.spans
+                        .into_iter()
+                        .map(|span| span.content.into_owned())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            if text.starts_with("External native Bash:") {
+                native_cells.push(text);
+            }
+        }
+    }
+    assert_eq!(native_cells.len(), 1);
+    let snapshot = native_cells[0].replace(&chat.thread_id().unwrap().to_string(), "THREAD");
+    insta::assert_snapshot!("bridge_native_actual_notification_history", snapshot, @r"
+External native Bash: matched terminal return
+  Thread: THREAD / turn: owned-turn
+  Native session: native-session / turn: native-turn
+  Call: owned-call
+  Command: python3 .local/h7_0123456789ab_01.py
+  Status: completed / exit: 0 / success: true / timeout: false
+  Truncation: native=false local=false / observation_complete=true
+  Serialized bytes: original=18 returned=18
+  Native returned text (not reconstructed stdout):
+    | native-only-marker
+");
+    assert!(native_cells[0].contains("    | native-only-marker"));
+    assert!(!native_cells[0].contains("preview-must-not-replace-return"));
+    assert!(
+        ops.try_recv().is_err(),
+        "rendering must not schedule core execution"
+    );
+}

@@ -33,6 +33,8 @@ pub(super) struct StatusCopySource {
 
 #[derive(Default)]
 pub(super) struct TranscriptState {
+    /// Local native return history; loss and finite caps never reset per turn.
+    pub(super) bridge_native: crate::history_cell::BridgeNativeHistory,
     pub(super) active_cell: Option<Box<dyn HistoryCell>>,
     /// Monotonic-ish counter used to invalidate transcript overlay caching.
     pub(super) active_cell_revision: u64,
