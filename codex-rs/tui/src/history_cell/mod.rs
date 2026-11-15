@@ -104,6 +104,8 @@ const RAW_DIFF_SUMMARY_WIDTH: usize = 10_000;
 
 mod approvals;
 mod base;
+#[cfg(test)]
+mod bridge_native;
 mod exec;
 mod hook_cell;
 mod markdown_render_cache;
