@@ -462,7 +462,7 @@ External native Bash: UNQUALIFIED return
         .chunks(16)
         .map(|row| {
             row.iter()
-                .map(|cell| cell.symbol())
+                .map(ratatui::buffer::Cell::symbol)
                 .collect::<String>()
                 .trim_end()
                 .to_owned()
