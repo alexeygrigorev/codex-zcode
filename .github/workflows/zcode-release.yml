@@ -193,8 +193,8 @@ jobs:
       - name: Test native bridge TUI regressions
         run: |
           set -o pipefail
-          just test -p codex-tui --features codex-core/bedrock --cargo-profile dev-small --build-jobs 2 --test-threads 2 \
-            -E 'test(bridge_native) | test(bridge_tool_activity)' 2>&1 | tee ci-evidence/native-bridge-tui-tests.log
+          just test -p codex-core -p codex-tui --features codex-core/bedrock --cargo-profile dev-small --build-jobs 2 --test-threads 2 \
+            -E 'binary_id(codex-tui) & (test(bridge_native) | test(bridge_tool_activity))' 2>&1 | tee ci-evidence/native-bridge-tui-tests.log
           cp codex-rs/target/nextest/local/junit.xml ci-evidence/native-bridge-tui-junit.xml
 
       - name: Test changed runtime project
