@@ -415,7 +415,7 @@ fn native_return_ui_snapshots_and_narrow_wrapped_body_boundary() {
         .observe(Some("thread"), Some("turn"), &notification(result()))
         .unwrap();
     // Snapshot expectations are hand-authored, UNVERIFIED until required CI.
-    insta::assert_snapshot!("bridge_native_qualified", text(&cell), @r"
+    insta::assert_snapshot!("bridge_native_qualified", &text(&cell), @r"
 External native Bash: matched terminal return
   Thread: thread / turn: turn
   Native session: native-session / turn: native-turn
@@ -428,7 +428,7 @@ External native Bash: matched terminal return
     | AC10_WORK_V2 actual-return
 ");
     let warning = history.fault().unwrap();
-    insta::assert_snapshot!("bridge_native_retained_after_loss", text(&cell), @r"
+    insta::assert_snapshot!("bridge_native_retained_after_loss", &text(&cell), @r"
 External native Bash: UNQUALIFIED return
   Thread: thread / turn: turn
   Native session: native-session / turn: native-turn
@@ -440,7 +440,7 @@ External native Bash: UNQUALIFIED return
   Native returned text (not reconstructed stdout):
     | AC10_WORK_V2 actual-return
 ");
-    insta::assert_snapshot!("bridge_native_loss", text(&warning), @"External native observation: UNQUALIFIED (stream loss, duplicate or limit)");
+    insta::assert_snapshot!("bridge_native_loss", &text(&warning), @"External native observation: UNQUALIFIED (stream loss, duplicate or limit)");
     // Real cell-derived command and returned body, not assistant/display preview.
     let mut value = result();
     value.command = "abcdefghijklmnop".to_owned();
@@ -469,7 +469,7 @@ External native Bash: UNQUALIFIED return
         })
         .collect::<Vec<_>>()
         .join("\n");
-    insta::assert_snapshot!("bridge_native_narrow_boundaries", rows, @r"
+    insta::assert_snapshot!("bridge_native_narrow_boundaries", &rows, @r"
       Command:
     abcdefghijklmnop
         | body body
