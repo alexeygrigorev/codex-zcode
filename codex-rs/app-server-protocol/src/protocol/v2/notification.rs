@@ -19,8 +19,9 @@ pub enum BridgeToolActivityStatus {
 }
 
 /// Live status of one tool call executing inside a bridged external agent
-/// core (the ZCode warm bridge). No model-visible thread item is created.
-/// A Rust-only native return may be retained by the owned local UI.
+/// core (the ZCode warm bridge). Display only: the tool ran on the far side
+/// of the bridge, so it has no matching item in the thread history.
+// Rust-only native returns may be retained by the owned local UI.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
