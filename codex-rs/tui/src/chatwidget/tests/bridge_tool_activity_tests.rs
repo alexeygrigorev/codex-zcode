@@ -165,7 +165,7 @@ async fn genuine_in_process_native_return_inserts_ui_history_without_execution_r
     }
     assert_eq!(native_cells.len(), 1);
     let snapshot = native_cells[0].replace(&chat.thread_id().unwrap().to_string(), "THREAD");
-    insta::assert_snapshot!("bridge_native_actual_notification_history", snapshot, @r"
+    insta::assert_snapshot!("bridge_native_actual_notification_history", &snapshot, @r"
 External native Bash: matched terminal return
   Thread: THREAD / turn: owned-turn
   Native session: native-session / turn: native-turn
