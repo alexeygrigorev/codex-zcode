@@ -267,6 +267,12 @@ const ZCODE_TOOL_ARGS_PERSIST_CAP: usize = 128 * 1024;
 /// keeping the last few KiB turns "exit status: 1" into an actionable error.
 pub(crate) const ZCODE_STDERR_TAIL_CAP: usize = 8 * 1024;
 
+#[path = "zcode_phase_diagnostics.rs"]
+mod zcode_phase_diagnostics;
+use self::zcode_phase_diagnostics::ZcodeBridgeDiagnostics;
+use self::zcode_phase_diagnostics::ZcodeDiagnosticBranch;
+use self::zcode_phase_diagnostics::ZcodeDiagnosticPhase;
+
 /// Wire note bounding the model's final replies.
 ///
 /// The provider aborts the whole turn when a single reply exceeds its output
@@ -1136,6 +1142,7 @@ pub struct ModelClientSession {
     /// appends, or continuation requests), and must not send it between different turns.
     /// An auth ownership change clears it so the new owner gets fresh routing state.
     turn_state: Arc<OnceLock<String>>,
+    zcode_bridge_diagnostics: OnceLock<Arc<ZcodeBridgeDiagnostics>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1443,6 +1450,7 @@ impl ModelClient {
             client: self.clone(),
             websocket_session,
             turn_state: Arc::new(OnceLock::new()),
+            zcode_bridge_diagnostics: OnceLock::new(),
         }
     }
 
@@ -3028,6 +3036,10 @@ impl ModelClientSession {
                 .await
             }
             WireApi::Zcode => {
+                let diagnostics = Arc::clone(
+                    self.zcode_bridge_diagnostics
+                        .get_or_init(|| Arc::new(ZcodeBridgeDiagnostics::from_env())),
+                );
                 let inference_trace_attempt = inference_trace.start_attempt();
                 let runtime = ZcodeRuntime::from_env(&model_info.slug);
                 // Goal bookkeeping turns exist purely to record a status
@@ -3042,28 +3054,42 @@ impl ModelClientSession {
                         .load(Ordering::Relaxed)
                         < zcode_warm::ZCODE_WARM_MAX_CONSECUTIVE_FAILURES
                 {
-                    match Self::stream_zcode_warm(&self.client.state, &runtime, prompt).await {
+                    match Self::stream_zcode_warm(
+                        &self.client.state,
+                        &runtime,
+                        prompt,
+                        Arc::clone(&diagnostics),
+                    )
+                    .await
+                    {
                         Ok(stream) => stream,
                         Err(warm_error) => {
+                            diagnostics.emit(
+                                ZcodeDiagnosticBranch::Warm,
+                                ZcodeDiagnosticPhase::WarmFallback,
+                                None,
+                            );
                             warn!(
                                 "ZCode warm bridge unavailable ({warm_error}); using \
                                  spawn-per-turn"
                             );
-                            Self::stream_zcode_observed(
+                            Self::stream_zcode_with_diagnostics(
                                 runtime,
                                 prompt,
                                 self.client.state.thread_id.to_string(),
                                 Arc::clone(&self.client.state.zcode_native_results),
+                                Arc::clone(&diagnostics),
                             )
                             .await?
                         }
                     }
                 } else {
-                    Self::stream_zcode_observed(
+                    Self::stream_zcode_with_diagnostics(
                         runtime,
                         prompt,
                         self.client.state.thread_id.to_string(),
                         Arc::clone(&self.client.state.zcode_native_results),
+                        Arc::clone(&diagnostics),
                     )
                     .await?
                 };
@@ -3089,7 +3115,13 @@ impl ModelClientSession {
         state: &ModelClientState,
         runtime: &ZcodeRuntime,
         prompt: &Prompt,
+        diagnostics: Arc<ZcodeBridgeDiagnostics>,
     ) -> std::result::Result<codex_api::ResponseStream, String> {
+        diagnostics.emit(
+            ZcodeDiagnosticBranch::Warm,
+            ZcodeDiagnosticPhase::BranchSelected,
+            None,
+        );
         let workspace_path = std::env::current_dir()
             .unwrap_or_default()
             .to_string_lossy()
@@ -3122,7 +3154,14 @@ impl ModelClientSession {
                 }
             };
             match decision {
-                Decision::Reuse(bridge) => break bridge,
+                Decision::Reuse(bridge) => {
+                    diagnostics.emit(
+                        ZcodeDiagnosticBranch::Warm,
+                        ZcodeDiagnosticPhase::ChildReused,
+                        None,
+                    );
+                    break bridge;
+                }
                 Decision::Wait => {
                     tokio::time::sleep(Duration::from_millis(20)).await;
                     continue 'claim;
@@ -3183,13 +3222,25 @@ impl ModelClientSession {
             // releases the checkout. Guards are not held across the wait
             // below; the Claiming state keeps concurrent callers away.
             drop(evicted);
+            diagnostics.emit(
+                ZcodeDiagnosticBranch::Warm,
+                ZcodeDiagnosticPhase::PermitWait,
+                None,
+            );
             let checkout = match zcode_process::acquire_zcode_session(
                 &workspace_path,
                 &state.thread_id.to_string(),
             )
             .await
             {
-                Ok(checkout) => checkout,
+                Ok(checkout) => {
+                    diagnostics.emit(
+                        ZcodeDiagnosticBranch::Warm,
+                        ZcodeDiagnosticPhase::PermitAcquired,
+                        None,
+                    );
+                    checkout
+                }
                 Err(e) => {
                     *state
                         .zcode_warm
@@ -3228,6 +3279,12 @@ impl ModelClientSession {
                         bridge: Arc::clone(&bridge),
                         checkout: Some(checkout),
                     }));
+                    drop(slot);
+                    diagnostics.emit(
+                        ZcodeDiagnosticBranch::Warm,
+                        ZcodeDiagnosticPhase::ChildSpawned,
+                        None,
+                    );
                     break bridge;
                 }
                 // `checkout` drops here, releasing the claim's reservation.
@@ -3242,6 +3299,11 @@ impl ModelClientSession {
         };
         let turned = async {
             let session_id = bridge.ensure_session(&workspace_path).await?;
+            diagnostics.emit(
+                ZcodeDiagnosticBranch::Warm,
+                ZcodeDiagnosticPhase::WarmSessionReturned,
+                None,
+            );
             let content = zcode_warm_turn_content(&prompt.input);
             let channel = crate::zcode_warm_v4_send::channel_from_env();
             // A goal-active prompt can hand its turn to the core's own goal
@@ -3271,6 +3333,11 @@ impl ModelClientSession {
                     }
                     None => bridge.turn(&session_id, &content, channel)?,
                 };
+            diagnostics.emit(
+                ZcodeDiagnosticBranch::Warm,
+                ZcodeDiagnosticPhase::WarmStreamCreated,
+                None,
+            );
             Ok((stream, session_id))
         }
         .await;
@@ -3351,12 +3418,35 @@ impl ModelClientSession {
         .await
     }
 
+    #[cfg(test)]
     async fn stream_zcode_observed(
         runtime: ZcodeRuntime,
         prompt: &Prompt,
         thread_id: String,
         native_results: Arc<StdMutex<crate::zcode_native_results::NativeResults>>,
     ) -> Result<codex_api::ResponseStream> {
+        Self::stream_zcode_with_diagnostics(
+            runtime,
+            prompt,
+            thread_id,
+            native_results,
+            Arc::new(ZcodeBridgeDiagnostics::from_env()),
+        )
+        .await
+    }
+
+    async fn stream_zcode_with_diagnostics(
+        runtime: ZcodeRuntime,
+        prompt: &Prompt,
+        thread_id: String,
+        native_results: Arc<StdMutex<crate::zcode_native_results::NativeResults>>,
+        diagnostics: Arc<ZcodeBridgeDiagnostics>,
+    ) -> Result<codex_api::ResponseStream> {
+        diagnostics.emit(
+            ZcodeDiagnosticBranch::Spawn,
+            ZcodeDiagnosticPhase::BranchSelected,
+            None,
+        );
         use std::process::Stdio;
         use tokio::process::Command;
         use tokio::sync::mpsc;
@@ -3469,9 +3559,21 @@ impl ModelClientSession {
             // session wait here instead of minting a second headless process.
             // Different sessions in the same checkout are independent by
             // design; running them in parallel is supported.
+            diagnostics.emit(
+                ZcodeDiagnosticBranch::Spawn,
+                ZcodeDiagnosticPhase::PermitWait,
+                None,
+            );
             let _workspace_session =
                 match zcode_process::acquire_zcode_session(&cwd, &thread_id).await {
-                    Ok(permit) => permit,
+                    Ok(permit) => {
+                        diagnostics.emit(
+                            ZcodeDiagnosticBranch::Spawn,
+                            ZcodeDiagnosticPhase::PermitAcquired,
+                            None,
+                        );
+                        permit
+                    }
                     Err(e) => {
                         let _ = tx
                             .send(Err(ApiError::Stream(format!(
@@ -3548,7 +3650,14 @@ impl ModelClientSession {
                 #[cfg(unix)]
                 command.process_group(0);
                 let mut child = match command.spawn() {
-                    Ok(child) => child,
+                    Ok(child) => {
+                        diagnostics.emit(
+                            ZcodeDiagnosticBranch::Spawn,
+                            ZcodeDiagnosticPhase::ChildSpawned,
+                            None,
+                        );
+                        child
+                    }
                     Err(e) => {
                         let _ = tx
                             .send(Err(ApiError::Stream(format!(
@@ -3614,9 +3723,23 @@ impl ModelClientSession {
                         // Stdout closed before the first line; only the exit
                         // status can tell a startup failure from a clean
                         // empty stream, so wait for it here.
-                        _ => StartupSignal::Exit(child.wait().await),
+                        _ => {
+                            diagnostics.emit(ZcodeDiagnosticBranch::Spawn, ZcodeDiagnosticPhase::StdoutClosedOrReadError, None);
+                            diagnostics.emit(ZcodeDiagnosticBranch::Spawn, ZcodeDiagnosticPhase::ChildWaitPending, None);
+                            // Diagnostic only: preserve the existing unbounded EOF wait (S2).
+                            let status = child.wait().await;
+                            if status.is_ok() {
+                                diagnostics.emit(ZcodeDiagnosticBranch::Spawn, ZcodeDiagnosticPhase::ChildWaitSettled, None);
+                            }
+                            StartupSignal::Exit(status)
+                        },
                     },
-                    status = child.wait() => StartupSignal::Exit(status),
+                    status = child.wait() => {
+                        if status.is_ok() {
+                            diagnostics.emit(ZcodeDiagnosticBranch::Spawn, ZcodeDiagnosticPhase::ChildWaitSettled, None);
+                        }
+                        StartupSignal::Exit(status)
+                    },
                     idle = zcode_process::idle_elapsed(idle_timeout) => {
                         StartupSignal::Stalled(idle)
                     }
@@ -3631,7 +3754,19 @@ impl ModelClientSession {
                         // startup exits, so fail the turn instead.
                         warn!("ZCode startup produced no stream output for {idle:?}; terminating");
                         let _ = tx.send(Err(zcode_stall_error(idle))).await;
-                        let _ = zcode_process::dispose_and_wait_once(&mut child).await;
+                        diagnostics.emit(
+                            ZcodeDiagnosticBranch::Spawn,
+                            ZcodeDiagnosticPhase::ChildWaitPending,
+                            None,
+                        );
+                        let status = zcode_process::dispose_and_wait_once(&mut child).await;
+                        if status.is_ok() {
+                            diagnostics.emit(
+                                ZcodeDiagnosticBranch::Spawn,
+                                ZcodeDiagnosticPhase::ChildWaitSettled,
+                                None,
+                            );
+                        }
                         drop(prompt_guard);
                         return;
                     }
@@ -3688,6 +3823,7 @@ impl ModelClientSession {
             // The startup race above may have consumed the first line; replay
             // it before reading the rest of the stream.
             let mut pending_line = first_line;
+            let mut first_inner_frame = false;
             // Set when the stream went silent past the idle window; the turn
             // is failed and the child torn down below.
             let mut stalled: Option<Duration> = None;
@@ -3695,7 +3831,14 @@ impl ModelClientSession {
                 Some(line) => Some(line),
                 None => match zcode_process::next_stream_line(&mut lines, idle_timeout).await {
                     zcode_process::ZcodeStreamLine::Line(line) => Some(line),
-                    zcode_process::ZcodeStreamLine::Eof => None,
+                    zcode_process::ZcodeStreamLine::Eof => {
+                        diagnostics.emit(
+                            ZcodeDiagnosticBranch::Spawn,
+                            ZcodeDiagnosticPhase::StdoutClosedOrReadError,
+                            None,
+                        );
+                        None
+                    }
                     zcode_process::ZcodeStreamLine::Stalled(idle) => {
                         stalled = Some(idle);
                         None
@@ -3716,6 +3859,14 @@ impl ModelClientSession {
                 };
                 let payload = parsed.get("payload");
                 let kind = parsed.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                if !first_inner_frame {
+                    diagnostics.emit(
+                        ZcodeDiagnosticBranch::Spawn,
+                        ZcodeDiagnosticPhase::FirstInnerFrame,
+                        Some(kind),
+                    );
+                    first_inner_frame = true;
+                }
                 if kind == "session.updated"
                     && let Some(id) = parsed.get("sessionId").and_then(|v| v.as_str())
                 {
@@ -3988,6 +4139,11 @@ impl ModelClientSession {
                     }
                 }
                 if kind == "session.error" || kind == "turn.failed" {
+                    diagnostics.emit(
+                        ZcodeDiagnosticBranch::Spawn,
+                        ZcodeDiagnosticPhase::TerminalEvent,
+                        Some(kind),
+                    );
                     failed = Some(
                         payload
                             .and_then(zcode_failure_message)
@@ -3997,6 +4153,11 @@ impl ModelClientSession {
                     break;
                 }
                 if kind == "result" {
+                    diagnostics.emit(
+                        ZcodeDiagnosticBranch::Spawn,
+                        ZcodeDiagnosticPhase::TerminalEvent,
+                        Some(kind),
+                    );
                     result_response = parsed
                         .get("response")
                         .and_then(|v| v.as_str())
@@ -4071,10 +4232,39 @@ impl ModelClientSession {
             let status = match startup_status {
                 Some(status) => status,
                 None if stalled.is_some() || aborted => {
-                    zcode_process::dispose_and_wait_once(&mut child).await
+                    diagnostics.emit(
+                        ZcodeDiagnosticBranch::Spawn,
+                        ZcodeDiagnosticPhase::ChildWaitPending,
+                        None,
+                    );
+                    let status = zcode_process::dispose_and_wait_once(&mut child).await;
+                    if status.is_ok() {
+                        diagnostics.emit(
+                            ZcodeDiagnosticBranch::Spawn,
+                            ZcodeDiagnosticPhase::ChildWaitSettled,
+                            None,
+                        );
+                    }
+                    status
                 }
                 // The stream ended on its own; the child is on its way out.
-                None => child.wait().await,
+                None => {
+                    diagnostics.emit(
+                        ZcodeDiagnosticBranch::Spawn,
+                        ZcodeDiagnosticPhase::ChildWaitPending,
+                        None,
+                    );
+                    // Diagnostic only: failed.is_some() is deliberately NOT a teardown condition (S1).
+                    let status = child.wait().await;
+                    if status.is_ok() {
+                        diagnostics.emit(
+                            ZcodeDiagnosticBranch::Spawn,
+                            ZcodeDiagnosticPhase::ChildWaitSettled,
+                            None,
+                        );
+                    }
+                    status
+                }
             };
             if stalled.is_some() {
                 // The stall error already went out above; skip the

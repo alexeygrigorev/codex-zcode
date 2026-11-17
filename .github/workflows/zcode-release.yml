@@ -173,6 +173,37 @@ jobs:
           ln -s zcodex "$CARGO_TARGET_DIR/dev-small/codex"
           echo "CARGO_BIN_EXE_codex=$CARGO_TARGET_DIR/dev-small/zcodex" >> "$GITHUB_ENV"
 
+      - name: Test opt-in ZCode phase diagnostics (exact five)
+        run: |
+          set -euo pipefail
+          rm -f codex-rs/target/nextest/local/junit.xml
+          just test -p codex-core --features codex-core/bedrock --cargo-profile dev-small --build-jobs 2 --test-threads 2 \
+            -E 'binary_id(codex-core) & (test(=client::zcode_phase_diagnostics::tests::zcode_bridge_diagnostics_default_off_and_non_one_flags_emit_nothing) | test(=client::zcode_phase_diagnostics::tests::zcode_bridge_diagnostics_enabled_has_exact_closed_schema) | test(=client::zcode_phase_diagnostics::tests::zcode_bridge_diagnostics_warm_fallback_shares_one_sixteen_record_budget) | test(=client::zcode_phase_diagnostics::tests::zcode_bridge_diagnostics_unknown_frame_never_echoes_payload_or_secrets) | test(=client::zcode_phase_diagnostics::tests::zcode_bridge_diagnostics_child_wait_is_not_descendant_or_provider_success))' 2>&1 | tee ci-evidence/zcode-phase-diagnostics-tests.log
+          cp codex-rs/target/nextest/local/junit.xml ci-evidence/zcode-phase-diagnostics-junit.xml
+          python3 - <<'PY_GUARD'
+          import collections
+          import json
+          import pathlib
+          import xml.etree.ElementTree as ET
+
+          expected = ['client::zcode_phase_diagnostics::tests::zcode_bridge_diagnostics_default_off_and_non_one_flags_emit_nothing', 'client::zcode_phase_diagnostics::tests::zcode_bridge_diagnostics_enabled_has_exact_closed_schema', 'client::zcode_phase_diagnostics::tests::zcode_bridge_diagnostics_warm_fallback_shares_one_sixteen_record_budget', 'client::zcode_phase_diagnostics::tests::zcode_bridge_diagnostics_unknown_frame_never_echoes_payload_or_secrets', 'client::zcode_phase_diagnostics::tests::zcode_bridge_diagnostics_child_wait_is_not_descendant_or_provider_success']
+          path = pathlib.Path('ci-evidence/zcode-phase-diagnostics-junit.xml')
+          root = ET.parse(path).getroot()
+          cases = list(root.iter('testcase'))
+          actual = [case.attrib.get('name') for case in cases]
+          assert collections.Counter(actual) == collections.Counter(expected), (actual, expected)
+          assert len(cases) == 5
+          rejected = {'failure', 'error', 'skipped', 'flakyFailure', 'flakyError', 'rerunFailure', 'rerunError'}
+          assert not any(node.tag in rejected for node in root.iter())
+          for node in root.iter():
+              for field in ('failures', 'errors', 'skipped', 'disabled'):
+                  if field in node.attrib:
+                      assert int(node.attrib[field]) == 0, (field, node.attrib[field])
+          pathlib.Path('ci-evidence/zcode-phase-diagnostics-result.json').write_text(
+              json.dumps({'tests': 5, 'passed': 5, 'skipped': 0, 'names': actual}, sort_keys=True) + '\n'
+          )
+          PY_GUARD
+
       # Run the previously failing PR62 tests and the unified-exec producer
       # regressions first, so their evidence exists before the long suites.
       # This only selects tests. When it passes, the unchanged suites below run
@@ -216,6 +247,63 @@ jobs:
         run: |
           just fmt
           git diff --exit-code
+
+      # CI-only diagnostic artifact: reuse the validated executable; never build or publish a release here.
+      - name: Stage validated diagnostic CLI artifact
+        run: |
+          set -euo pipefail
+          mkdir ci-diagnostics
+          bin="$CARGO_TARGET_DIR/dev-small/zcodex"
+          test -f "$bin" && test ! -L "$bin"
+          install -m 0755 "$bin" ci-diagnostics/zcodex
+          rustc -vV > ci-diagnostics/RUSTC.txt
+          cp ci-evidence/rust.txt ci-diagnostics/CARGO.txt
+          cp ci-evidence/nextest.txt ci-diagnostics/NEXTEST.txt
+          python3 - <<'PY_ARTIFACT'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import re
+          import subprocess
+
+          binary = pathlib.Path('ci-diagnostics/zcodex')
+          with binary.open('rb') as stream:
+              header = stream.read(20)
+          assert header[:6] == b'\x7fELF\x02\x01' and int.from_bytes(header[18:20], 'little') == 62
+          source = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          tree = subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], text=True).strip()
+          assert re.fullmatch('[0-9a-f]{40}', source) and re.fullmatch('[0-9a-f]{40}', tree)
+          assert source == os.environ['GITHUB_SHA']
+          with binary.open('rb') as stream:
+              binary_sha256 = hashlib.file_digest(stream, 'sha256').hexdigest()
+          metadata = {
+              'schema_version': 1,
+              'purpose': 'CI-only opt-in phase-diagnostic binary; no release or adoption authority',
+              'source_commit': source,
+              'source_tree': tree,
+              'event': os.environ['GITHUB_EVENT_NAME'],
+              'run_id': os.environ['GITHUB_RUN_ID'],
+              'run_attempt': os.environ['GITHUB_RUN_ATTEMPT'],
+              'platform': 'linux-amd64',
+              'cargo_profile': 'dev-small',
+              'binary_size': binary.stat().st_size,
+              'binary_sha256': binary_sha256,
+              'rustc_metadata': 'RUSTC.txt',
+              'cargo_metadata': 'CARGO.txt',
+              'nextest_metadata': 'NEXTEST.txt',
+          }
+          pathlib.Path('ci-diagnostics/SOURCE.json').write_text(json.dumps(metadata, indent=2, sort_keys=True) + '\n')
+          PY_ARTIFACT
+          (cd ci-diagnostics && sha256sum zcodex SOURCE.json RUSTC.txt CARGO.txt NEXTEST.txt > SHA256SUMS)
+
+      - name: Upload CI-only Linux AMD64 diagnostic binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: zcodex-phase-diagnostics-linux-amd64-${{ github.sha }}
+          path: ci-diagnostics
+          retention-days: 3
+          if-no-files-found: error
 
       - name: Retain actual validation evidence and any suggested fixes
         if: always()
