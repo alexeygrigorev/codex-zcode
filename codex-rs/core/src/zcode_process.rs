@@ -76,9 +76,7 @@ fn zcode_startup_timeout_from_values(
             Ok(0) => idle_timeout,
             Ok(secs) => Some(Duration::from_secs(secs)),
             Err(_) => {
-                warn!(
-                    "invalid {STARTUP_TIMEOUT_ENV_VAR}={value:?}; using the default startup timeout"
-                );
+                warn!("invalid {STARTUP_TIMEOUT_ENV_VAR}; using the default startup timeout");
                 Some(DEFAULT_ZCODE_STARTUP_TIMEOUT)
             }
         },
