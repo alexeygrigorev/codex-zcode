@@ -464,11 +464,14 @@ async fn wait_for_first_output_bounds_stdout_eof_while_child_stays_live() {
     let stdout = child.stdout.take().expect("stdout is piped");
     let stderr = child.stderr.take().expect("stderr is piped");
     let mut stderr_lines = BufReader::new(stderr).lines();
-    let ready = stderr_lines
-        .next_line()
-        .await
-        .expect("readiness line")
-        .expect("line is present");
+    let ready = tokio::time::timeout(Duration::from_secs(5), stderr_lines.next_line()).await;
+    let ready = match ready {
+        Ok(Ok(Some(line))) if line == "ready" => line,
+        other => {
+            let _ = dispose_and_wait_once(&mut child).await;
+            panic!("expected bounded stderr readiness line, got {other:?}");
+        }
+    };
     assert_eq!(ready, "ready");
     drop(stderr_lines);
     let mut lines = BufReader::new(stdout).lines();
