@@ -3716,9 +3716,24 @@ impl ModelClientSession {
                 });
                 let mut lines = BufReader::new(stdout).lines();
 
-                let signal =
-                    zcode_process::wait_for_first_output(&mut child, &mut lines, startup_timeout)
-                        .await;
+                let signal = zcode_process::wait_for_first_output(
+                    &mut child,
+                    &mut lines,
+                    startup_timeout,
+                    || {
+                        diagnostics.emit(
+                            ZcodeDiagnosticBranch::Spawn,
+                            ZcodeDiagnosticPhase::StdoutClosedOrReadError,
+                            None,
+                        );
+                        diagnostics.emit(
+                            ZcodeDiagnosticBranch::Spawn,
+                            ZcodeDiagnosticPhase::ChildWaitPending,
+                            None,
+                        );
+                    },
+                )
+                .await;
                 match signal {
                     zcode_process::ZcodeStartupSignal::FirstLine(line) => {
                         break (child, lines, stderr_tail, Some(line), None);
@@ -3748,22 +3763,7 @@ impl ModelClientSession {
                         drop(prompt_guard);
                         return;
                     }
-                    zcode_process::ZcodeStartupSignal::Exit {
-                        status,
-                        stdout_closed,
-                    } => {
-                        if stdout_closed {
-                            diagnostics.emit(
-                                ZcodeDiagnosticBranch::Spawn,
-                                ZcodeDiagnosticPhase::StdoutClosedOrReadError,
-                                None,
-                            );
-                            diagnostics.emit(
-                                ZcodeDiagnosticBranch::Spawn,
-                                ZcodeDiagnosticPhase::ChildWaitPending,
-                                None,
-                            );
-                        }
+                    zcode_process::ZcodeStartupSignal::Exit(status) => {
                         if status.is_ok() {
                             diagnostics.emit(
                                 ZcodeDiagnosticBranch::Spawn,
