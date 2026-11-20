@@ -796,6 +796,14 @@ fn zcode_stall_error(idle: Duration) -> ApiError {
     ))
 }
 
+/// Builds the fixed safe diagnostic error surfaced when ZCode produces no first
+/// stdout line before the pre-first-output startup timeout elapses.
+fn zcode_startup_stall_error(timeout: Duration) -> ApiError {
+    ApiError::Stream(format!(
+        "ZCode startup stalled: no first output for {timeout:?} (code=zcode_startup_no_first_output); terminating the process tree"
+    ))
+}
+
 /// Builds the token usage Codex records for one completed ZCode invocation.
 ///
 /// The wire resends the entire flattened transcript on every invocation and
@@ -3617,8 +3625,10 @@ impl ModelClientSession {
             let mut db_lock_attempts: u32 = 0;
             // Inactivity bound for the NDJSON stream; a silent child is
             // either running a long tool or wedged, and past the window it
-            // is presumed wedged.
+            // is presumed wedged. Startup before the first line uses a
+            // tighter bound so silent stalls fail inside caller budgets.
             let idle_timeout = zcode_process::zcode_idle_timeout();
+            let startup_timeout = zcode_process::zcode_startup_timeout(idle_timeout);
             let (mut child, mut lines, stderr_tail, first_line, startup_status) = 'startup: loop {
                 let mut command = Command::new(&runtime.node);
                 command
@@ -3706,54 +3716,22 @@ impl ModelClientSession {
                 });
                 let mut lines = BufReader::new(stdout).lines();
 
-                // Race the first stdout line against an early exit: any
-                // first line means startup succeeded, while exiting with no
-                // output at all is the startup-failure shape. `biased` keeps
-                // the line branch winning when both are ready so buffered
-                // output is never skipped.
-                enum StartupSignal {
-                    FirstLine(String),
-                    Exit(std::io::Result<std::process::ExitStatus>),
-                    Stalled(Duration),
-                }
-                let signal = tokio::select! {
-                    biased;
-                    first_line = lines.next_line() => match first_line {
-                        Ok(Some(line)) => StartupSignal::FirstLine(line),
-                        // Stdout closed before the first line; only the exit
-                        // status can tell a startup failure from a clean
-                        // empty stream, so wait for it here.
-                        _ => {
-                            diagnostics.emit(ZcodeDiagnosticBranch::Spawn, ZcodeDiagnosticPhase::StdoutClosedOrReadError, None);
-                            diagnostics.emit(ZcodeDiagnosticBranch::Spawn, ZcodeDiagnosticPhase::ChildWaitPending, None);
-                            // Diagnostic only: preserve the existing unbounded EOF wait (S2).
-                            let status = child.wait().await;
-                            if status.is_ok() {
-                                diagnostics.emit(ZcodeDiagnosticBranch::Spawn, ZcodeDiagnosticPhase::ChildWaitSettled, None);
-                            }
-                            StartupSignal::Exit(status)
-                        },
-                    },
-                    status = child.wait() => {
-                        if status.is_ok() {
-                            diagnostics.emit(ZcodeDiagnosticBranch::Spawn, ZcodeDiagnosticPhase::ChildWaitSettled, None);
-                        }
-                        StartupSignal::Exit(status)
-                    },
-                    idle = zcode_process::idle_elapsed(idle_timeout) => {
-                        StartupSignal::Stalled(idle)
-                    }
-                };
+                let signal =
+                    zcode_process::wait_for_first_output(&mut child, &mut lines, startup_timeout)
+                        .await;
                 match signal {
-                    StartupSignal::FirstLine(line) => {
+                    zcode_process::ZcodeStartupSignal::FirstLine(line) => {
                         break (child, lines, stderr_tail, Some(line), None);
                     }
-                    StartupSignal::Stalled(idle) => {
+                    zcode_process::ZcodeStartupSignal::Stalled(timeout) => {
                         // A child that produces neither output nor an exit is
                         // wedged; the DB-lock respawn loop is only for quick
-                        // startup exits, so fail the turn instead.
-                        warn!("ZCode startup produced no stream output for {idle:?}; terminating");
-                        let _ = tx.send(Err(zcode_stall_error(idle))).await;
+                        // startup exits, so fail the turn with a fixed safe
+                        // diagnostic code and tear down the owned process tree.
+                        warn!(
+                            "ZCode startup produced no first output for {timeout:?} (code=zcode_startup_no_first_output); terminating"
+                        );
+                        let _ = tx.send(Err(zcode_startup_stall_error(timeout))).await;
                         diagnostics.emit(
                             ZcodeDiagnosticBranch::Spawn,
                             ZcodeDiagnosticPhase::ChildWaitPending,
@@ -3770,7 +3748,29 @@ impl ModelClientSession {
                         drop(prompt_guard);
                         return;
                     }
-                    StartupSignal::Exit(status) => {
+                    zcode_process::ZcodeStartupSignal::Exit {
+                        status,
+                        stdout_closed,
+                    } => {
+                        if stdout_closed {
+                            diagnostics.emit(
+                                ZcodeDiagnosticBranch::Spawn,
+                                ZcodeDiagnosticPhase::StdoutClosedOrReadError,
+                                None,
+                            );
+                            diagnostics.emit(
+                                ZcodeDiagnosticBranch::Spawn,
+                                ZcodeDiagnosticPhase::ChildWaitPending,
+                                None,
+                            );
+                        }
+                        if status.is_ok() {
+                            diagnostics.emit(
+                                ZcodeDiagnosticBranch::Spawn,
+                                ZcodeDiagnosticPhase::ChildWaitSettled,
+                                None,
+                            );
+                        }
                         // stderr can still be in flight when the child is
                         // reaped; give the drain task until stderr EOFs
                         // (right after exit, unless a nested process
