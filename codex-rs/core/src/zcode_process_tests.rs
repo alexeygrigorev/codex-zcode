@@ -454,11 +454,23 @@ async fn wait_for_first_output_stalls_on_silent_child_and_cleans_up() {
 async fn wait_for_first_output_bounds_stdout_eof_while_child_stays_live() {
     let mut child = test_command()
         .arg("-c")
-        .arg("trap '' TERM; exec 1>&-; sleep 30")
+        // Close stdout and prove the trap + EOF are live via stderr before
+        // starting the bounded wait, avoiding shell-startup races under load.
+        .arg("trap '' TERM; exec 1>&-; echo ready >&2; sleep 30")
         .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("spawn eof-while-live test child");
     let stdout = child.stdout.take().expect("stdout is piped");
+    let stderr = child.stderr.take().expect("stderr is piped");
+    let mut stderr_lines = BufReader::new(stderr).lines();
+    let ready = stderr_lines
+        .next_line()
+        .await
+        .expect("readiness line")
+        .expect("line is present");
+    assert_eq!(ready, "ready");
+    drop(stderr_lines);
     let mut lines = BufReader::new(stdout).lines();
     let eof_observed = Arc::new(AtomicBool::new(false));
     let eof_flag = Arc::clone(&eof_observed);
