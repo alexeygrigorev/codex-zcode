@@ -32,10 +32,9 @@ pub(crate) const DEFAULT_ZCODE_STREAM_IDLE_TIMEOUT: Duration = Duration::from_se
 /// How long startup may stay silent before the child emits its first NDJSON
 /// stdout line.
 ///
-/// Before the first line, no tool command is running yet; bounding this phase
-/// to 45 seconds ensures silent startup stalls fail and clean up inside a
-/// 120-second caller capture budget while preserving the 15-minute idle bound
-/// once output begins.
+/// Bounding the pre-first-output phase to 45 seconds ensures silent startup
+/// stalls fail and clean up inside a 120-second caller capture budget while
+/// preserving the 15-minute idle bound once output begins.
 pub(crate) const DEFAULT_ZCODE_STARTUP_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// Grace period between asking the child to shut down and force-killing the
@@ -64,6 +63,9 @@ pub(crate) fn zcode_startup_timeout(idle_timeout: Option<Duration>) -> Option<Du
 
 /// Pure core of [`zcode_startup_timeout`] so tests avoid mutating the process
 /// environment.
+///
+/// Setting `ZCODE_STARTUP_TIMEOUT_SECS=0` disables the tighter startup limit and
+/// falls back to `idle_timeout` so any finite stream idle bound is retained.
 fn zcode_startup_timeout_from_values(
     value: Option<&str>,
     idle_timeout: Option<Duration>,
@@ -71,7 +73,7 @@ fn zcode_startup_timeout_from_values(
     let startup = match value {
         None => Some(DEFAULT_ZCODE_STARTUP_TIMEOUT),
         Some(value) => match value.trim().parse::<u64>() {
-            Ok(0) => None,
+            Ok(0) => idle_timeout,
             Ok(secs) => Some(Duration::from_secs(secs)),
             Err(_) => {
                 warn!(
@@ -84,7 +86,7 @@ fn zcode_startup_timeout_from_values(
     match (startup, idle_timeout) {
         (Some(startup), Some(idle)) => Some(startup.min(idle)),
         (Some(startup), None) => Some(startup),
-        (None, _) => None,
+        (None, idle) => idle,
     }
 }
 
@@ -104,18 +106,6 @@ fn zcode_idle_timeout_from_value(value: Option<&str>) -> Option<Duration> {
             }
         },
     }
-}
-
-/// Future that resolves once the idle window elapses, or never resolves when
-/// the timeout is disabled. Yields the enforced window so stall reporting can
-/// include it.
-pub(crate) async fn idle_elapsed(idle_timeout: Option<Duration>) -> Duration {
-    let Some(idle_timeout) = idle_timeout else {
-        std::future::pending::<()>().await;
-        unreachable!("pending futures never resolve");
-    };
-    tokio::time::sleep(idle_timeout).await;
-    idle_timeout
 }
 
 pub(crate) use codex_file_system::ZcodeSessionPermit;
@@ -202,46 +192,66 @@ fn local_thread_title(prompt: &str) -> String {
 }
 
 /// Outcome of racing the child's first stdout line against exit and the
-/// pre-first-output startup timeout.
+/// pre-first-output startup deadline.
 #[derive(Debug)]
 pub(crate) enum ZcodeStartupSignal {
     FirstLine(String),
-    Exit {
-        status: io::Result<ExitStatus>,
-        stdout_closed: bool,
-    },
+    Exit(io::Result<ExitStatus>),
     Stalled(Duration),
 }
 
 /// Races the child's first stdout line against an early exit or a bounded
-/// pre-first-output startup timeout.
+/// pre-first-output startup deadline.
 ///
-/// `biased` keeps the line branch winning when both line and exit are ready so
-/// buffered output is never skipped.
+/// If stdout closes or errors while the child is still running, `on_stdout_closed`
+/// runs immediately and the wait for `child.wait()` continues under the same
+/// absolute startup deadline. `biased` keeps the line branch winning when both
+/// line and exit are ready so buffered output is never skipped.
 pub(crate) async fn wait_for_first_output<R>(
     child: &mut Child,
     lines: &mut tokio::io::Lines<R>,
     startup_timeout: Option<Duration>,
+    on_stdout_closed: impl FnOnce(),
 ) -> ZcodeStartupSignal
 where
     R: tokio::io::AsyncBufRead + Unpin,
 {
-    tokio::select! {
-        biased;
-        first_line = lines.next_line() => match first_line {
-            Ok(Some(line)) => ZcodeStartupSignal::FirstLine(line),
-            // Stdout closed before the first line; only the exit status can
-            // tell a startup failure from a clean empty stream.
-            _ => ZcodeStartupSignal::Exit {
-                status: child.wait().await,
-                stdout_closed: true,
+    let mut on_stdout_closed = Some(on_stdout_closed);
+    let mut stdout_closed = false;
+    let deadline = startup_timeout.map(|timeout| tokio::time::Instant::now() + timeout);
+    let sleep = async {
+        match (startup_timeout, deadline) {
+            (Some(timeout), Some(deadline)) => {
+                tokio::time::sleep_until(deadline).await;
+                timeout
+            }
+            _ => {
+                std::future::pending::<()>().await;
+                unreachable!("pending futures never resolve");
+            }
+        }
+    };
+    tokio::pin!(sleep);
+
+    loop {
+        tokio::select! {
+            biased;
+            first_line = lines.next_line(), if !stdout_closed => match first_line {
+                Ok(Some(line)) => return ZcodeStartupSignal::FirstLine(line),
+                _ => {
+                    stdout_closed = true;
+                    if let Some(cb) = on_stdout_closed.take() {
+                        cb();
+                    }
+                }
             },
-        },
-        status = child.wait() => ZcodeStartupSignal::Exit {
-            status,
-            stdout_closed: false,
-        },
-        timeout = idle_elapsed(startup_timeout) => ZcodeStartupSignal::Stalled(timeout),
+            status = child.wait() => {
+                return ZcodeStartupSignal::Exit(status);
+            }
+            timeout = &mut sleep => {
+                return ZcodeStartupSignal::Stalled(timeout);
+            }
+        }
     }
 }
 

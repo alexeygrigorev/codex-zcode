@@ -403,8 +403,9 @@ fn startup_timeout_fits_caller_budget_and_preserves_post_start_idle() {
     );
     assert_eq!(
         zcode_startup_timeout_from_values(Some("0"), Some(DEFAULT_ZCODE_STREAM_IDLE_TIMEOUT)),
-        None
+        Some(DEFAULT_ZCODE_STREAM_IDLE_TIMEOUT)
     );
+    assert_eq!(zcode_startup_timeout_from_values(Some("0"), None), None);
     assert_eq!(
         zcode_startup_timeout_from_values(Some("bad"), Some(DEFAULT_ZCODE_STREAM_IDLE_TIMEOUT)),
         Some(DEFAULT_ZCODE_STARTUP_TIMEOUT)
@@ -427,17 +428,67 @@ async fn wait_for_first_output_stalls_on_silent_child_and_cleans_up() {
     let mut lines = BufReader::new(stdout).lines();
 
     let started = Instant::now();
-    let signal =
-        wait_for_first_output(&mut child, &mut lines, Some(Duration::from_millis(100))).await;
+    let signal = tokio::time::timeout(
+        Duration::from_secs(5),
+        wait_for_first_output(
+            &mut child,
+            &mut lines,
+            Some(Duration::from_millis(100)),
+            || {},
+        ),
+    )
+    .await;
+    let status = dispose_and_wait_once(&mut child)
+        .await
+        .expect("dispose silent child");
+    let signal = signal.expect("silent startup must respect startup deadline");
     assert!(
         matches!(signal, ZcodeStartupSignal::Stalled(d) if d == Duration::from_millis(100)),
         "expected startup stall, got {signal:?}"
     );
     assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(!status.success());
+}
 
+#[tokio::test]
+async fn wait_for_first_output_bounds_stdout_eof_while_child_stays_live() {
+    let mut child = test_command()
+        .arg("-c")
+        .arg("trap '' TERM; exec 1>&-; sleep 30")
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn eof-while-live test child");
+    let stdout = child.stdout.take().expect("stdout is piped");
+    let mut lines = BufReader::new(stdout).lines();
+    let eof_observed = Arc::new(AtomicBool::new(false));
+    let eof_flag = Arc::clone(&eof_observed);
+
+    let started = Instant::now();
+    let signal = tokio::time::timeout(
+        Duration::from_secs(5),
+        wait_for_first_output(
+            &mut child,
+            &mut lines,
+            Some(Duration::from_millis(100)),
+            move || {
+                eof_flag.store(true, Ordering::SeqCst);
+            },
+        ),
+    )
+    .await;
     let status = dispose_and_wait_once(&mut child)
         .await
-        .expect("dispose silent child");
+        .expect("dispose eof-while-live child");
+    let signal = signal.expect("stdout EOF while live must remain bounded by startup deadline");
+    assert!(
+        eof_observed.load(Ordering::SeqCst),
+        "stdout EOF callback must fire when EOF occurs"
+    );
+    assert!(
+        matches!(signal, ZcodeStartupSignal::Stalled(d) if d == Duration::from_millis(100)),
+        "expected startup stall after stdout EOF, got {signal:?}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(5));
     assert!(!status.success());
 }
 
@@ -452,7 +503,8 @@ async fn wait_for_first_output_returns_first_line_and_preserves_post_start_idle(
     let stdout = child.stdout.take().expect("stdout is piped");
     let mut lines = BufReader::new(stdout).lines();
 
-    let signal = wait_for_first_output(&mut child, &mut lines, Some(Duration::from_secs(2))).await;
+    let signal =
+        wait_for_first_output(&mut child, &mut lines, Some(Duration::from_secs(2)), || {}).await;
     assert!(
         matches!(signal, ZcodeStartupSignal::FirstLine(ref line) if line == "first"),
         "expected first line, got {signal:?}"
@@ -484,9 +536,10 @@ async fn wait_for_first_output_reports_normal_and_error_child_exit() {
         let mut lines = BufReader::new(stdout).lines();
 
         let signal =
-            wait_for_first_output(&mut child, &mut lines, Some(Duration::from_secs(2))).await;
+            wait_for_first_output(&mut child, &mut lines, Some(Duration::from_secs(2)), || {})
+                .await;
         match signal {
-            ZcodeStartupSignal::Exit { status, .. } => {
+            ZcodeStartupSignal::Exit(status) => {
                 let status = status.expect("exit status");
                 assert_eq!(status.code(), Some(expected_code));
             }
