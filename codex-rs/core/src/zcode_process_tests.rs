@@ -11,12 +11,16 @@ use tokio::io::AsyncBufReadExt;
 use tokio::io::BufReader;
 use tokio::process::Command;
 
+use super::DEFAULT_ZCODE_STARTUP_TIMEOUT;
 use super::DEFAULT_ZCODE_STREAM_IDLE_TIMEOUT;
+use super::ZcodeStartupSignal;
 use super::ZcodeStreamLine;
 use super::dispose_and_wait_once;
 use super::next_stream_line;
 use super::side_request_reply;
+use super::wait_for_first_output;
 use super::zcode_idle_timeout_from_value;
+use super::zcode_startup_timeout_from_values;
 use codex_file_system::acquire_zcode_session_in;
 
 /// A private lock directory so gate tests never touch the real Codex home
@@ -380,4 +384,113 @@ async fn next_stream_line_reports_a_stall_when_nothing_arrives() {
     dispose_and_wait_once(&mut child)
         .await
         .expect("dispose test child");
+}
+
+#[test]
+fn startup_timeout_fits_caller_budget_and_preserves_post_start_idle() {
+    assert!(DEFAULT_ZCODE_STARTUP_TIMEOUT < Duration::from_secs(120));
+    assert_eq!(
+        zcode_startup_timeout_from_values(None, Some(DEFAULT_ZCODE_STREAM_IDLE_TIMEOUT)),
+        Some(DEFAULT_ZCODE_STARTUP_TIMEOUT)
+    );
+    assert_eq!(
+        zcode_startup_timeout_from_values(None, Some(Duration::from_secs(10))),
+        Some(Duration::from_secs(10))
+    );
+    assert_eq!(
+        zcode_startup_timeout_from_values(Some("25"), Some(DEFAULT_ZCODE_STREAM_IDLE_TIMEOUT)),
+        Some(Duration::from_secs(25))
+    );
+    assert_eq!(
+        zcode_startup_timeout_from_values(Some("0"), Some(DEFAULT_ZCODE_STREAM_IDLE_TIMEOUT)),
+        None
+    );
+    assert_eq!(
+        zcode_startup_timeout_from_values(Some("bad"), Some(DEFAULT_ZCODE_STREAM_IDLE_TIMEOUT)),
+        Some(DEFAULT_ZCODE_STARTUP_TIMEOUT)
+    );
+    assert_eq!(
+        zcode_idle_timeout_from_value(None),
+        Some(DEFAULT_ZCODE_STREAM_IDLE_TIMEOUT)
+    );
+}
+
+#[tokio::test]
+async fn wait_for_first_output_stalls_on_silent_child_and_cleans_up() {
+    let mut child = test_command()
+        .arg("-c")
+        .arg("trap '' TERM; sleep 30")
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn silent test child");
+    let stdout = child.stdout.take().expect("stdout is piped");
+    let mut lines = BufReader::new(stdout).lines();
+
+    let started = Instant::now();
+    let signal =
+        wait_for_first_output(&mut child, &mut lines, Some(Duration::from_millis(100))).await;
+    assert!(
+        matches!(signal, ZcodeStartupSignal::Stalled(d) if d == Duration::from_millis(100)),
+        "expected startup stall, got {signal:?}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(5));
+
+    let status = dispose_and_wait_once(&mut child)
+        .await
+        .expect("dispose silent child");
+    assert!(!status.success());
+}
+
+#[tokio::test]
+async fn wait_for_first_output_returns_first_line_and_preserves_post_start_idle() {
+    let mut child = test_command()
+        .arg("-c")
+        .arg("echo first; sleep 0.25; echo second")
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn streaming test child");
+    let stdout = child.stdout.take().expect("stdout is piped");
+    let mut lines = BufReader::new(stdout).lines();
+
+    let signal = wait_for_first_output(&mut child, &mut lines, Some(Duration::from_secs(2))).await;
+    assert!(
+        matches!(signal, ZcodeStartupSignal::FirstLine(ref line) if line == "first"),
+        "expected first line, got {signal:?}"
+    );
+
+    assert_eq!(
+        next_stream_line(&mut lines, Some(Duration::from_millis(50))).await,
+        ZcodeStreamLine::Stalled(Duration::from_millis(50))
+    );
+    assert_eq!(
+        next_stream_line(&mut lines, Some(Duration::from_secs(2))).await,
+        ZcodeStreamLine::Line("second".to_string())
+    );
+    let status = child.wait().await.expect("child wait succeeds");
+    assert!(status.success());
+}
+
+#[tokio::test]
+async fn wait_for_first_output_reports_normal_and_error_child_exit() {
+    for (cmd, expected_code) in [("exit 0", 0), ("echo private_stderr >&2; exit 7", 7)] {
+        let mut child = test_command()
+            .arg("-c")
+            .arg(cmd)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn exiting test child");
+        let stdout = child.stdout.take().expect("stdout is piped");
+        let mut lines = BufReader::new(stdout).lines();
+
+        let signal =
+            wait_for_first_output(&mut child, &mut lines, Some(Duration::from_secs(2))).await;
+        match signal {
+            ZcodeStartupSignal::Exit { status, .. } => {
+                let status = status.expect("exit status");
+                assert_eq!(status.code(), Some(expected_code));
+            }
+            other => panic!("expected Exit, got {other:?}"),
+        }
+    }
 }

@@ -29,11 +29,21 @@ use codex_utils_pty::process_group::terminate_process_group;
 /// instead of matching the desktop host's 3-minute per-RPC bound.
 pub(crate) const DEFAULT_ZCODE_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
+/// How long startup may stay silent before the child emits its first NDJSON
+/// stdout line.
+///
+/// Before the first line, no tool command is running yet; bounding this phase
+/// to 45 seconds ensures silent startup stalls fail and clean up inside a
+/// 120-second caller capture budget while preserving the 15-minute idle bound
+/// once output begins.
+pub(crate) const DEFAULT_ZCODE_STARTUP_TIMEOUT: Duration = Duration::from_secs(45);
+
 /// Grace period between asking the child to shut down and force-killing the
 /// process tree.
 const TEARDOWN_GRACE_PERIOD: Duration = Duration::from_secs(2);
 
 const STREAM_IDLE_TIMEOUT_ENV_VAR: &str = "ZCODE_STREAM_IDLE_TIMEOUT_SECS";
+const STARTUP_TIMEOUT_ENV_VAR: &str = "ZCODE_STARTUP_TIMEOUT_SECS";
 
 /// Resolves the stream idle timeout from `ZCODE_STREAM_IDLE_TIMEOUT_SECS`.
 ///
@@ -41,6 +51,41 @@ const STREAM_IDLE_TIMEOUT_ENV_VAR: &str = "ZCODE_STREAM_IDLE_TIMEOUT_SECS";
 /// (the turn is then bounded only by the child exiting).
 pub(crate) fn zcode_idle_timeout() -> Option<Duration> {
     zcode_idle_timeout_from_value(std::env::var(STREAM_IDLE_TIMEOUT_ENV_VAR).ok().as_deref())
+}
+
+/// Resolves the pre-first-output startup timeout from
+/// `ZCODE_STARTUP_TIMEOUT_SECS`, capped by `idle_timeout` when both are set.
+pub(crate) fn zcode_startup_timeout(idle_timeout: Option<Duration>) -> Option<Duration> {
+    zcode_startup_timeout_from_values(
+        std::env::var(STARTUP_TIMEOUT_ENV_VAR).ok().as_deref(),
+        idle_timeout,
+    )
+}
+
+/// Pure core of [`zcode_startup_timeout`] so tests avoid mutating the process
+/// environment.
+fn zcode_startup_timeout_from_values(
+    value: Option<&str>,
+    idle_timeout: Option<Duration>,
+) -> Option<Duration> {
+    let startup = match value {
+        None => Some(DEFAULT_ZCODE_STARTUP_TIMEOUT),
+        Some(value) => match value.trim().parse::<u64>() {
+            Ok(0) => None,
+            Ok(secs) => Some(Duration::from_secs(secs)),
+            Err(_) => {
+                warn!(
+                    "invalid {STARTUP_TIMEOUT_ENV_VAR}={value:?}; using the default startup timeout"
+                );
+                Some(DEFAULT_ZCODE_STARTUP_TIMEOUT)
+            }
+        },
+    };
+    match (startup, idle_timeout) {
+        (Some(startup), Some(idle)) => Some(startup.min(idle)),
+        (Some(startup), None) => Some(startup),
+        (None, _) => None,
+    }
 }
 
 /// Pure core of [`zcode_idle_timeout`] so tests avoid mutating the process
@@ -153,6 +198,50 @@ fn local_thread_title(prompt: &str) -> String {
         "New task".to_string()
     } else {
         title
+    }
+}
+
+/// Outcome of racing the child's first stdout line against exit and the
+/// pre-first-output startup timeout.
+#[derive(Debug)]
+pub(crate) enum ZcodeStartupSignal {
+    FirstLine(String),
+    Exit {
+        status: io::Result<ExitStatus>,
+        stdout_closed: bool,
+    },
+    Stalled(Duration),
+}
+
+/// Races the child's first stdout line against an early exit or a bounded
+/// pre-first-output startup timeout.
+///
+/// `biased` keeps the line branch winning when both line and exit are ready so
+/// buffered output is never skipped.
+pub(crate) async fn wait_for_first_output<R>(
+    child: &mut Child,
+    lines: &mut tokio::io::Lines<R>,
+    startup_timeout: Option<Duration>,
+) -> ZcodeStartupSignal
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    tokio::select! {
+        biased;
+        first_line = lines.next_line() => match first_line {
+            Ok(Some(line)) => ZcodeStartupSignal::FirstLine(line),
+            // Stdout closed before the first line; only the exit status can
+            // tell a startup failure from a clean empty stream.
+            _ => ZcodeStartupSignal::Exit {
+                status: child.wait().await,
+                stdout_closed: true,
+            },
+        },
+        status = child.wait() => ZcodeStartupSignal::Exit {
+            status,
+            stdout_closed: false,
+        },
+        timeout = idle_elapsed(startup_timeout) => ZcodeStartupSignal::Stalled(timeout),
     }
 }
 
